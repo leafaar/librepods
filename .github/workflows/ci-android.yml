@@ -39,6 +39,8 @@ jobs:
         run: echo "${{ secrets.RELEASE_KEYSTORE_FILE }}" | base64 --decode > android/release.keystore
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Accept Licenses
         run: yes | sdkmanager --licenses
       - name: Install NDK
