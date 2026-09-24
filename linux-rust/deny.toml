@@ -1,0 +1,48 @@
+# cargo deny check: RustSec advisories, licenses, banned crates and sources.
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+yanked = "deny"
+# Each ignore is transitive through iced and has no fix we can pick up yet.
+# Review them when iced is updated.
+ignore = [
+    # lru 0.16 (via iced_wgpu -> cryoglyph): pop() is not panic-safe if a key's
+    # Drop panics. cryoglyph's keys are plain glyph ids whose Drop cannot panic;
+    # the fix is in lru 0.18.2, which cryoglyph does not allow yet.
+    { id = "RUSTSEC-2026-0253", reason = "via iced_wgpu/cryoglyph, keys cannot panic on drop" },
+    # paste is unmaintained; it is a build-time proc macro reached through image's
+    # default formats (exr, rav1e), which iced's image feature enables.
+    { id = "RUSTSEC-2024-0436", reason = "build-time only, via image default formats from iced" },
+    # ttf-parser is unmaintained; iced's text stack (cosmic-text, fontdb) needs it.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, required by iced's font stack, no alternative yet" },
+]
+
+[licenses]
+# Everything here is compatible with the GPL-3.0 the app ships under.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# The GUI stack pulls several major versions of the same crates; report them
+# without failing the build.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
