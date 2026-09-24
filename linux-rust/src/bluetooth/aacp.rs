@@ -1,3 +1,4 @@
+use crate::bluetooth::eq::{self, CustomEq};
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::utils::get_devices_path;
@@ -335,6 +336,7 @@ pub enum AACPEvent {
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
     StemPress(StemPressType, StemPressBudType),
+    CustomEq(CustomEq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -361,6 +363,8 @@ pub struct AACPManagerState {
     pub airpods_mac: Option<Address>,
     /// When set, recv_thread forwards raw 0x58 audio SDUs here (hi-res mic).
     pub audio_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Last custom EQ the AirPods reported, for a window opened after it arrived.
+    pub custom_eq: Option<CustomEq>,
 }
 
 impl AACPManagerState {
@@ -385,6 +389,7 @@ impl AACPManagerState {
             devices,
             airpods_mac: None,
             audio_tx: None,
+            custom_eq: None,
         }
     }
 }
@@ -1121,6 +1126,18 @@ impl AACPManager {
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
             }
+            opcodes::CUSTOM_EQ => {
+                let Some(custom_eq) = eq::parse(payload) else {
+                    warn!("Ignoring malformed custom EQ packet: {}", hex::encode(packet));
+                    return;
+                };
+                info!("Received custom EQ: {:?}", custom_eq);
+                let mut state = self.state.lock().await;
+                state.custom_eq = Some(custom_eq);
+                if let Some(ref tx) = state.event_tx {
+                    let _ = tx.send(AACPEvent::CustomEq(custom_eq));
+                }
+            }
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
     }
@@ -1149,6 +1166,10 @@ impl AACPManager {
     /// Stop the proprietary hi-res microphone stream (0x58 STOP).
     pub async fn send_stop_audio(&self) -> Result<()> {
         self.send_packet(&AACP_STOP_AUDIO).await
+    }
+
+    pub async fn send_custom_eq(&self, custom_eq: &CustomEq) -> Result<()> {
+        self.send_data_packet(&custom_eq.to_packet()).await
     }
 
     pub async fn send_notification_request(&self) -> Result<()> {
