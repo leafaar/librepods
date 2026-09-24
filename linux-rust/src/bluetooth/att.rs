@@ -1,21 +1,17 @@
 use {
-    bluer::{
-        Address, AddressType, Error, Result,
-        l2cap::{SeqPacket, Socket, SocketAddr},
-    },
+    crate::bluetooth::l2cap::{self, ConnectError},
+    bluer::Address,
     hex,
     std::{collections::HashMap, sync::Arc},
     tokio::{
         sync::{Mutex, mpsc},
         task::JoinSet,
-        time::{Duration, Instant, sleep},
+        time::{Duration, Instant},
     },
     tracing::{debug, error, info},
 };
 
 const PSM_ATT: u16 = 0x001F;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 const OPCODE_ERROR_RESPONSE: u8 = 0x01;
 const OPCODE_READ_REQUEST: u8 = 0x0A;
@@ -30,45 +26,30 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ATTHandles {
-    AirPodsTransparency = 0x18,
-    AirPodsLoudSoundReduction = 0x1B,
-    AirPodsHearingAid = 0x2A,
     NothingEverything = 0x8002,
-    NothingEverythingRead = 0x8005, // for some reason, and not the same as the write handle
+    /// Nothing earbuds notify on this handle, not on the one written to.
+    NothingEverythingRead = 0x8005,
 }
 
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ATTCCCDHandles {
-    Transparency = ATTHandles::AirPodsTransparency as u16 + 1,
-    LoudSoundReduction = ATTHandles::AirPodsLoudSoundReduction as u16 + 1,
-    HearingAid = ATTHandles::AirPodsHearingAid as u16 + 1,
+/// Why an ATT request got no successful response.
+#[derive(Debug, thiserror::Error)]
+pub enum AttError {
+    #[error("ATT channel is not connected")]
+    NotConnected,
+    #[error("ATT send channel closed")]
+    SendChannelClosed,
+    #[error("ATT response channel closed")]
+    ResponseChannelClosed,
+    #[error("no response to ATT request {request:#04x} within {RESPONSE_TIMEOUT:?}")]
+    Timeout { request: u8 },
+    #[error("ATT request {request:#04x} failed with error {code:#04x}")]
+    ErrorResponse { request: u8, code: u8 },
 }
 
-impl From<ATTHandles> for ATTCCCDHandles {
-    fn from(handle: ATTHandles) -> Self {
-        match handle {
-            ATTHandles::AirPodsTransparency => ATTCCCDHandles::Transparency,
-            ATTHandles::AirPodsLoudSoundReduction => ATTCCCDHandles::LoudSoundReduction,
-            ATTHandles::AirPodsHearingAid => ATTCCCDHandles::HearingAid,
-            ATTHandles::NothingEverything => panic!("No CCCD for NothingEverything handle"), // we don't request it
-            ATTHandles::NothingEverythingRead => panic!("No CCD for NothingEverythingRead handle"), // it sends notifications without CCCD
-        }
-    }
-}
-
+#[derive(Default)]
 struct ATTManagerState {
     sender: Option<mpsc::Sender<Vec<u8>>>,
     listeners: HashMap<u16, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
-}
-
-impl ATTManagerState {
-    fn new() -> Self {
-        ATTManagerState {
-            sender: None,
-            listeners: HashMap::new(),
-        }
-    }
 }
 
 /// What a PDU received while a request is outstanding means for that request.
@@ -114,79 +95,38 @@ impl ATTManager {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         ATTManager {
-            state: Arc::new(Mutex::new(ATTManagerState::new())),
+            state: Arc::new(Mutex::new(ATTManagerState::default())),
             response_rx: Arc::new(Mutex::new(rx)),
             response_tx: tx,
             tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
-    pub async fn connect(&mut self, addr: Address) -> Result<()> {
-        info!(
-            "ATTManager connecting to {} on PSM {:#06X}...",
-            addr, PSM_ATT
-        );
-        let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM_ATT);
-
-        let socket = Socket::new_seq_packet()?;
-        let seq_packet_result =
-            tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target_sa)).await;
-        let seq_packet = match seq_packet_result {
-            Ok(Ok(s)) => Arc::new(s),
-            Ok(Err(e)) => {
-                error!("L2CAP connect failed: {}", e);
-                return Err(e.into());
-            },
-            Err(_) => {
-                error!("L2CAP connect timed out");
-                return Err(Error::from(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timeout",
-                )));
-            },
-        };
-
-        // Wait for connection to be fully established
-        let start = Instant::now();
-        loop {
-            match seq_packet.peer_addr() {
-                Ok(peer) if peer.cid != 0 => break,
-                Ok(_) => {},
-                Err(e) => {
-                    if e.raw_os_error() == Some(107) {
-                        // ENOTCONN
-                        error!("Peer has disconnected during connection setup.");
-                        return Err(e.into());
-                    }
-                    error!("Error getting peer address: {}", e);
-                },
-            }
-            if start.elapsed() >= CONNECT_TIMEOUT {
-                error!("Timed out waiting for L2CAP connection to be fully established.");
-                return Err(Error::from(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timeout",
-                )));
-            }
-            sleep(POLL_INTERVAL).await;
-        }
-
-        info!("L2CAP connection established with {}", addr);
+    pub async fn connect(&mut self, addr: Address) -> Result<(), ConnectError> {
+        info!("ATTManager connecting to {addr} on PSM {PSM_ATT:#06X}...");
+        let seq_packet = Arc::new(l2cap::connect_seq_packet(addr, PSM_ATT).await?);
 
         let (tx, rx) = mpsc::channel(128);
-        let state = ATTManagerState::new();
-        {
-            let mut s = self.state.lock().await;
-            *s = state;
-            s.sender = Some(tx);
-        }
+        self.attach_transport(tx).await;
 
         let manager_clone = self.clone();
         let mut tasks = self.tasks.lock().await;
-        tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
+        let recv_socket = seq_packet.clone();
+        tasks.spawn(async move {
+            recv_thread(&manager_clone, &recv_socket).await;
+        });
         tasks.spawn(send_thread(rx, seq_packet));
 
         Ok(())
+    }
+
+    /// Route outgoing PDUs to `tx` and forget the listeners of any earlier
+    /// connection. The socket's send task drains `tx`; tests read it directly.
+    async fn attach_transport(&self, tx: mpsc::Sender<Vec<u8>>) {
+        *self.state.lock().await = ATTManagerState {
+            sender: Some(tx),
+            listeners: HashMap::new(),
+        };
     }
 
     pub async fn register_listener(&self, handle: ATTHandles, tx: mpsc::UnboundedSender<Vec<u8>>) {
@@ -194,62 +134,32 @@ impl ATTManager {
         state.listeners.entry(handle as u16).or_default().push(tx);
     }
 
-    pub async fn enable_notifications(&self, handle: ATTHandles) -> Result<()> {
-        self.write_cccd(handle.into(), &[0x01, 0x00]).await
-    }
-
-    pub async fn read(&self, handle: ATTHandles) -> Result<Vec<u8>> {
-        let lsb = (handle as u16 & 0xFF) as u8;
-        let msb = ((handle as u16 >> 8) & 0xFF) as u8;
-        let pdu = vec![OPCODE_READ_REQUEST, lsb, msb];
-        self.request(&pdu).await
-    }
-
-    pub async fn write(&self, handle: ATTHandles, value: &[u8]) -> Result<()> {
-        let lsb = (handle as u16 & 0xFF) as u8;
-        let msb = ((handle as u16 >> 8) & 0xFF) as u8;
+    pub async fn write(&self, handle: ATTHandles, value: &[u8]) -> Result<(), AttError> {
+        let [lsb, msb] = (handle as u16).to_le_bytes();
         let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];
         pdu.extend_from_slice(value);
-        self.request(&pdu).await?;
+        self.request(OPCODE_WRITE_REQUEST, &pdu).await?;
         Ok(())
     }
 
-    async fn write_cccd(&self, handle: ATTCCCDHandles, value: &[u8]) -> Result<()> {
-        let lsb = (handle as u16 & 0xFF) as u8;
-        let msb = ((handle as u16 >> 8) & 0xFF) as u8;
-        let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];
-        pdu.extend_from_slice(value);
-        self.request(&pdu).await?;
-        Ok(())
-    }
-
-    async fn send_packet(&self, data: &[u8]) -> Result<()> {
+    async fn send_packet(&self, data: &[u8]) -> Result<(), AttError> {
         // Clone the sender and release the lock before awaiting, so a full
         // channel cannot block the receive loop behind this mutex.
         let sender = self.state.lock().await.sender.clone();
-        if let Some(sender) = sender {
-            sender.send(data.to_vec()).await.map_err(|e| {
-                error!("Failed to send packet to channel: {}", e);
-                Error::from(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "L2CAP send channel closed",
-                ))
-            })
-        } else {
+        let Some(sender) = sender else {
             error!("Cannot send packet, sender is not available.");
-            Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "L2CAP stream not connected",
-            )))
-        }
+            return Err(AttError::NotConnected);
+        };
+        sender.send(data.to_vec()).await.map_err(|e| {
+            error!("Failed to send packet to channel: {e}");
+            AttError::SendChannelClosed
+        })
     }
 
-    /// Send a request PDU and wait for its response, returned without the
-    /// opcode. An Error Response for the request is returned as an error.
-    async fn request(&self, pdu: &[u8]) -> Result<Vec<u8>> {
-        let request_opcode = *pdu
-            .first()
-            .expect("read and write build their PDU starting with the opcode");
+    /// Send a request PDU starting with `request_opcode` and wait for its
+    /// response, returned without the opcode. An Error Response for the
+    /// request is returned as an error.
+    async fn request(&self, request_opcode: u8, pdu: &[u8]) -> Result<Vec<u8>, AttError> {
         let mut rx = self.response_rx.lock().await;
         // Responses still queued answer requests that already gave up.
         while let Ok(stale) = rx.try_recv() {
@@ -262,26 +172,20 @@ impl ATTManager {
         loop {
             let resp = match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(resp)) => resp,
-                Ok(None) => {
-                    return Err(Error::from(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Response channel closed",
-                    )));
-                },
+                Ok(None) => return Err(AttError::ResponseChannelClosed),
                 Err(_) => {
-                    return Err(Error::from(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Response timeout",
-                    )));
+                    return Err(AttError::Timeout {
+                        request: request_opcode,
+                    });
                 },
             };
             match match_response(request_opcode, &resp) {
                 ResponseMatch::Response(value) => return Ok(value.to_vec()),
                 ResponseMatch::Error(code) => {
-                    return Err(Error::from(std::io::Error::other(format!(
-                        "ATT error {:#04x} for request {:#04x}",
-                        code, request_opcode
-                    ))));
+                    return Err(AttError::ErrorResponse {
+                        request: request_opcode,
+                        code,
+                    });
                 },
                 ResponseMatch::Unrelated => {
                     debug!("Ignoring unrelated PDU: {}", hex::encode(&resp));
@@ -289,9 +193,44 @@ impl ATTManager {
             }
         }
     }
+
+    /// Handle one PDU from the server: notifications and indications go to the
+    /// listeners of their handle, everything else to the waiting request.
+    async fn handle_pdu(&self, data: &[u8]) {
+        match data {
+            // Notification or indication: opcode, 2-byte handle, value.
+            [
+                opcode @ (OPCODE_HANDLE_VALUE_NTF | OPCODE_HANDLE_VALUE_IND),
+                lsb,
+                msb,
+                value @ ..,
+            ] => {
+                if *opcode == OPCODE_HANDLE_VALUE_IND {
+                    // The server sends no further indication until this one
+                    // is confirmed.
+                    if let Err(e) = self.send_packet(&[OPCODE_HANDLE_VALUE_CFM]).await {
+                        error!("Failed to confirm indication: {e}");
+                    }
+                }
+                let handle = u16::from_le_bytes([*lsb, *msb]);
+                let state = self.state.lock().await;
+                if let Some(listeners) = state.listeners.get(&handle) {
+                    for listener in listeners {
+                        let _ = listener.send(value.to_vec());
+                    }
+                }
+            },
+            // Empty, or a notification too short to carry a handle.
+            [] | [OPCODE_HANDLE_VALUE_NTF | OPCODE_HANDLE_VALUE_IND, ..] => {},
+            // A response; request() matches it to what it sent.
+            _ => {
+                let _ = self.response_tx.send(data.to_vec());
+            },
+        }
+    }
 }
 
-async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
+async fn recv_thread(manager: &ATTManager, sp: &bluer::l2cap::SeqPacket) {
     let mut buf = vec![0u8; 1024];
     loop {
         match sp.recv(&mut buf).await {
@@ -302,48 +241,21 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
             Ok(n) => {
                 let data = &buf[..n];
                 debug!("Received {} bytes: {}", n, hex::encode(data));
-                if data.is_empty() {
-                    continue;
-                }
-                if data[0] == OPCODE_HANDLE_VALUE_NTF || data[0] == OPCODE_HANDLE_VALUE_IND {
-                    // Notification or indication: opcode, 2-byte handle, value.
-                    if data.len() < 3 {
-                        continue;
-                    }
-                    if data[0] == OPCODE_HANDLE_VALUE_IND {
-                        // The server sends no further indication until this
-                        // one is confirmed.
-                        if let Err(e) = manager.send_packet(&[OPCODE_HANDLE_VALUE_CFM]).await {
-                            error!("Failed to confirm indication: {}", e);
-                        }
-                    }
-                    let handle = (data[1] as u16) | ((data[2] as u16) << 8);
-                    let value = data[3..].to_vec();
-                    let state = manager.state.lock().await;
-                    if let Some(listeners) = state.listeners.get(&handle) {
-                        for listener in listeners {
-                            let _ = listener.send(value.clone());
-                        }
-                    }
-                } else {
-                    // A response; request() matches it to what it sent.
-                    let _ = manager.response_tx.send(data.to_vec());
-                }
+                manager.handle_pdu(data).await;
             },
             Err(e) => {
-                error!("read error: {}", e);
+                error!("read error: {e}");
                 break;
             },
         }
     }
-    let mut state = manager.state.lock().await;
-    state.sender = None;
+    manager.state.lock().await.sender = None;
 }
 
-async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
+async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<bluer::l2cap::SeqPacket>) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = sp.send(&data).await {
-            error!("Failed to send data: {}", e);
+            error!("Failed to send data: {e}");
             break;
         }
         debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
@@ -354,6 +266,14 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manager whose outgoing PDUs land in the returned receiver.
+    async fn connected_manager() -> (ATTManager, mpsc::Receiver<Vec<u8>>) {
+        let manager = ATTManager::new();
+        let (tx, rx) = mpsc::channel(16);
+        manager.attach_transport(tx).await;
+        (manager, rx)
+    }
 
     #[test]
     fn read_response_returns_value() {
@@ -411,5 +331,195 @@ mod tests {
             match_response(OPCODE_READ_REQUEST, &[]),
             ResponseMatch::Unrelated
         );
+    }
+
+    #[test]
+    fn requests_other_than_read_and_write_match_nothing() {
+        assert_eq!(
+            match_response(OPCODE_HANDLE_VALUE_CFM, &[OPCODE_WRITE_RESPONSE]),
+            ResponseMatch::Unrelated
+        );
+    }
+
+    #[tokio::test]
+    async fn write_sends_the_handle_little_endian_and_returns_on_write_response() {
+        let (manager, mut sent) = connected_manager().await;
+
+        let write = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .write(ATTHandles::NothingEverything, &[0xAA, 0xBB])
+                    .await
+            }
+        });
+        let pdu = sent.recv().await.unwrap();
+        manager.handle_pdu(&[OPCODE_WRITE_RESPONSE]).await;
+
+        assert_eq!(pdu, [OPCODE_WRITE_REQUEST, 0x02, 0x80, 0xAA, 0xBB]);
+        assert!(write.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_skips_a_late_read_response_and_takes_its_own() {
+        let (manager, mut sent) = connected_manager().await;
+
+        let write = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write(ATTHandles::NothingEverything, &[0x01]).await }
+        });
+        sent.recv().await.unwrap();
+        manager.handle_pdu(&[OPCODE_READ_RESPONSE, 0x42]).await;
+        manager.handle_pdu(&[OPCODE_WRITE_RESPONSE]).await;
+
+        assert!(write.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_returns_the_error_code_of_an_error_response() {
+        let (manager, mut sent) = connected_manager().await;
+
+        let write = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write(ATTHandles::NothingEverything, &[0x01]).await }
+        });
+        sent.recv().await.unwrap();
+        manager
+            .handle_pdu(&[
+                OPCODE_ERROR_RESPONSE,
+                OPCODE_WRITE_REQUEST,
+                0x02,
+                0x80,
+                0x03,
+            ])
+            .await;
+
+        let err = write.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AttError::ErrorResponse {
+                    request: OPCODE_WRITE_REQUEST,
+                    code: 0x03
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_drops_responses_queued_before_it_was_sent() {
+        let (manager, mut sent) = connected_manager().await;
+        // A response to an earlier request that already timed out.
+        manager.handle_pdu(&[OPCODE_WRITE_RESPONSE]).await;
+
+        let write = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.write(ATTHandles::NothingEverything, &[0x01]).await }
+        });
+        sent.recv().await.unwrap();
+        manager
+            .handle_pdu(&[
+                OPCODE_ERROR_RESPONSE,
+                OPCODE_WRITE_REQUEST,
+                0x02,
+                0x80,
+                0x0E,
+            ])
+            .await;
+
+        assert!(matches!(
+            write.await.unwrap(),
+            Err(AttError::ErrorResponse { code: 0x0E, .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_times_out_without_a_response() {
+        let (manager, _sent) = connected_manager().await;
+        let start = Instant::now();
+
+        let result = manager.write(ATTHandles::NothingEverything, &[0x01]).await;
+
+        assert!(matches!(
+            result,
+            Err(AttError::Timeout {
+                request: OPCODE_WRITE_REQUEST
+            })
+        ));
+        assert_eq!(start.elapsed(), RESPONSE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn write_without_a_connection_fails_with_not_connected() {
+        let manager = ATTManager::new();
+
+        let result = manager.write(ATTHandles::NothingEverything, &[0x01]).await;
+
+        assert!(matches!(result, Err(AttError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn write_after_the_socket_task_ended_fails_with_channel_closed() {
+        let (manager, sent) = connected_manager().await;
+        drop(sent);
+
+        let result = manager.write(ATTHandles::NothingEverything, &[0x01]).await;
+
+        assert!(matches!(result, Err(AttError::SendChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn notification_reaches_the_listeners_of_its_handle_only() {
+        let (manager, mut sent) = connected_manager().await;
+        let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        manager
+            .register_listener(ATTHandles::NothingEverythingRead, read_tx)
+            .await;
+        manager
+            .register_listener(ATTHandles::NothingEverything, write_tx)
+            .await;
+
+        manager
+            .handle_pdu(&[OPCODE_HANDLE_VALUE_NTF, 0x05, 0x80, 0x55, 0x20])
+            .await;
+
+        assert_eq!(read_rx.try_recv().unwrap(), [0x55, 0x20]);
+        assert!(write_rx.try_recv().is_err());
+        // Notifications are not confirmed.
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn indication_is_confirmed_and_delivered() {
+        let (manager, mut sent) = connected_manager().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager
+            .register_listener(ATTHandles::NothingEverythingRead, tx)
+            .await;
+
+        manager
+            .handle_pdu(&[OPCODE_HANDLE_VALUE_IND, 0x05, 0x80, 0x01])
+            .await;
+
+        assert_eq!(sent.try_recv().unwrap(), [OPCODE_HANDLE_VALUE_CFM]);
+        assert_eq!(rx.try_recv().unwrap(), [0x01]);
+    }
+
+    #[tokio::test]
+    async fn truncated_notification_is_dropped() {
+        let (manager, mut sent) = connected_manager().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager
+            .register_listener(ATTHandles::NothingEverythingRead, tx)
+            .await;
+
+        manager.handle_pdu(&[OPCODE_HANDLE_VALUE_IND, 0x05]).await;
+        manager.handle_pdu(&[]).await;
+
+        assert!(rx.try_recv().is_err());
+        assert!(sent.try_recv().is_err());
+        assert!(manager.response_rx.lock().await.try_recv().is_err());
     }
 }

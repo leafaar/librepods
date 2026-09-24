@@ -23,7 +23,7 @@ use {
         utils::{DevicesStore, ensure_device_registered},
     },
     anyhow::Context as _,
-    bluer::{Adapter, Address, InternalErrorKind},
+    bluer::{Adapter, Address},
     clap::Parser,
     dbus::{
         Message,
@@ -37,7 +37,7 @@ use {
         RwLock,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
-    tracing::{debug, error, info, warn},
+    tracing::{error, info, warn},
 };
 
 const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
@@ -272,15 +272,9 @@ async fn set_up_connected_managed_devices(
 ) {
     let devices = match find_other_managed_devices(adapter, managed_devices_mac.to_vec()).await {
         Ok(devices) => devices,
+        // "None found" is Ok(vec![]); an Err is a real lookup failure.
         Err(e) => {
-            debug!("type of error: {:?}", e.kind);
-            if e.kind
-                == bluer::ErrorKind::Internal(InternalErrorKind::Io(std::io::ErrorKind::NotFound))
-            {
-                info!("No other managed devices found.");
-            } else {
-                error!("Error finding other managed devices: {}", e);
-            }
+            error!("Error finding other managed devices: {}", e);
             return;
         },
     };

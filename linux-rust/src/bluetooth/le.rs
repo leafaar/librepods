@@ -181,6 +181,70 @@ async fn connect_airpods(attempts: &ConnectAttempts, airpods_mac: &str) {
     }
 }
 
+/// Maps advertising addresses to the public MAC of the paired AirPods they
+/// belong to, by checking each new address against every known IRK.
+struct AddressResolver {
+    known: KnownKeys,
+    verified: HashMap<Address, String>,
+    failed: HashSet<Address>,
+}
+
+impl AddressResolver {
+    async fn load() -> Self {
+        Self {
+            known: load_keys().await,
+            verified: HashMap::new(),
+            failed: HashSet::new(),
+        }
+    }
+
+    /// The public MAC of the AirPods advertising from `addr`, if they are
+    /// ours. Reloads the keys first when devices.json changed.
+    async fn resolve(&mut self, addr: Address) -> Option<String> {
+        if let Some(airpods_mac) = self.verified.get(&addr) {
+            return Some(airpods_mac.clone());
+        }
+        let modified = devices_file_modified().await;
+        if modified != self.known.modified {
+            self.known = load_keys().await;
+            self.verified.clear();
+            self.failed.clear();
+            info!(
+                "Devices file changed, loaded LE keys for {} AirPods",
+                self.known.keys.len()
+            );
+        }
+        if self.failed.contains(&addr) {
+            return None;
+        }
+        debug!("Checking RPA for device: {addr}");
+        let found = self
+            .known
+            .keys
+            .iter()
+            .find(|(_, keys)| verify_rpa(addr, &keys.irk))
+            .map(|(airpods_mac, _)| airpods_mac.clone());
+        let Some(airpods_mac) = found else {
+            if self.failed.len() >= MAX_CACHED_ADDRESSES {
+                self.failed.clear();
+            }
+            self.failed.insert(addr);
+            debug!("Device {addr} did not match any of our irks");
+            return None;
+        };
+        info!("Matched our device ({addr}) with the irk for {airpods_mac}");
+        if self.verified.len() >= MAX_CACHED_ADDRESSES {
+            self.verified.clear();
+        }
+        self.verified.insert(addr, airpods_mac.clone());
+        Some(airpods_mac)
+    }
+
+    fn enc_key(&self, airpods_mac: &str) -> Option<[u8; 16]> {
+        self.known.keys.get(airpods_mac).and_then(|k| k.enc_key)
+    }
+}
+
 pub async fn start_le_monitor(
     tray_handle: Option<ksni::Handle<MyTray>>,
     ui_tx: UnboundedSender<BluetoothUIMessage>,
@@ -189,9 +253,7 @@ pub async fn start_le_monitor(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    let mut known = load_keys().await;
-    let mut verified_macs: HashMap<Address, String> = HashMap::new();
-    let mut failed_macs: HashSet<Address> = HashSet::new();
+    let mut resolver = AddressResolver::load().await;
     // One advertisement listener per address. BlueZ reports DeviceFound again
     // for an address it already reported, and each report used to add a
     // listener.
@@ -236,53 +298,11 @@ pub async fn start_le_monitor(
         if listeners.get(&addr).is_some_and(|l| !l.is_finished()) {
             continue;
         }
-
-        let airpods_mac = if let Some(airpods_mac) = verified_macs.get(&addr) {
-            airpods_mac.clone()
-        } else {
-            let modified = devices_file_modified().await;
-            if modified != known.modified {
-                known = load_keys().await;
-                verified_macs.clear();
-                failed_macs.clear();
-                info!(
-                    "Devices file changed, loaded LE keys for {} AirPods",
-                    known.keys.len()
-                );
-            }
-            if failed_macs.contains(&addr) {
-                continue;
-            }
-            debug!("Checking RPA for device: {}", addr);
-            let found = known
-                .keys
-                .iter()
-                .find(|(_, keys)| verify_rpa(addr, &keys.irk))
-                .map(|(airpods_mac, _)| airpods_mac.clone());
-            let Some(airpods_mac) = found else {
-                if failed_macs.len() >= MAX_CACHED_ADDRESSES {
-                    failed_macs.clear();
-                }
-                failed_macs.insert(addr);
-                debug!("Device {} did not match any of our irks", addr);
-                continue;
-            };
-            info!(
-                "Matched our device ({}) with the irk for {}",
-                addr, airpods_mac
-            );
-            if verified_macs.len() >= MAX_CACHED_ADDRESSES {
-                verified_macs.clear();
-            }
-            verified_macs.insert(addr, airpods_mac.clone());
-            airpods_mac
+        let Some(airpods_mac) = resolver.resolve(addr).await else {
+            continue;
         };
-
-        let Some(enc_key) = known.keys.get(&airpods_mac).and_then(|k| k.enc_key) else {
-            debug!(
-                "No advertisement key for {}, not listening to {}",
-                airpods_mac, addr
-            );
+        let Some(enc_key) = resolver.enc_key(&airpods_mac) else {
+            debug!("No advertisement key for {airpods_mac}, not listening to {addr}");
             continue;
         };
 
@@ -294,7 +314,7 @@ pub async fn start_le_monitor(
         let events = match events {
             Ok(events) => events,
             Err(e) => {
-                warn!("Cannot listen to advertisements from {}: {}", addr, e);
+                warn!("Cannot listen to advertisements from {addr}: {e}");
                 continue;
             },
         };
@@ -312,6 +332,127 @@ pub async fn start_le_monitor(
     }
 
     Ok(())
+}
+
+/// Battery of one component as advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdvertisedBattery {
+    level: u8,
+    charging: bool,
+}
+
+impl AdvertisedBattery {
+    /// Level in the low seven bits, charging in the high bit; 0xFF when the
+    /// component is not connected.
+    fn decode(byte: u8) -> Option<Self> {
+        (byte != 0xFF).then_some(Self {
+            level: byte & 0x7F,
+            charging: byte & 0x80 != 0,
+        })
+    }
+
+    fn status(self) -> BatteryStatus {
+        if self.charging {
+            BatteryStatus::Charging
+        } else {
+            BatteryStatus::NotCharging
+        }
+    }
+
+    /// Tray level and status of a component that may not be connected.
+    fn tray_entry(battery: Option<Self>) -> (Option<u8>, Option<BatteryStatus>) {
+        match battery {
+            Some(b) => (Some(b.level), Some(b.status())),
+            None => (None, Some(BatteryStatus::Disconnected)),
+        }
+    }
+
+    fn describe(battery: Option<Self>) -> String {
+        match battery {
+            Some(b) => format!("{}% (charging: {})", b.level, b.charging),
+            None => "disconnected".to_string(),
+        }
+    }
+}
+
+/// What one advertisement says about the buds and the case.
+#[derive(Debug, PartialEq, Eq)]
+struct AdvertisedStatus {
+    left: Option<AdvertisedBattery>,
+    right: Option<AdvertisedBattery>,
+    case: Option<AdvertisedBattery>,
+    left_in_ear: bool,
+    right_in_ear: bool,
+}
+
+impl AdvertisedStatus {
+    /// Decode the status byte of the advertisement and the batteries from
+    /// its decrypted payload. Which bud comes first in both depends on which
+    /// one is primary and whether it sits in the case.
+    fn decode(status: u8, decrypted: &[u8; 16]) -> Self {
+        let primary_left = (status >> 5) & 0x01 == 1;
+        let this_in_case = (status >> 6) & 0x01 == 1;
+        let xor_factor = primary_left ^ this_in_case;
+        let (left_in_ear_bit, right_in_ear_bit) = if xor_factor {
+            (0x02, 0x08)
+        } else {
+            (0x08, 0x02)
+        };
+        let (left_index, right_index) = if primary_left { (1, 2) } else { (2, 1) };
+        Self {
+            left: AdvertisedBattery::decode(decrypted[left_index]),
+            right: AdvertisedBattery::decode(decrypted[right_index]),
+            case: AdvertisedBattery::decode(decrypted[3]),
+            left_in_ear: status & left_in_ear_bit != 0,
+            right_in_ear: status & right_in_ear_bit != 0,
+        }
+    }
+
+    fn update_tray(&self, tray: &mut MyTray) {
+        (tray.battery_l, tray.battery_l_status) = AdvertisedBattery::tray_entry(self.left);
+        (tray.battery_r, tray.battery_r_status) = AdvertisedBattery::tray_entry(self.right);
+        (tray.battery_c, tray.battery_c_status) = AdvertisedBattery::tray_entry(self.case);
+    }
+
+    /// The connected components, for the window. Over AACP the case reports
+    /// itself as disconnected whenever the buds are outside it, so the
+    /// advertisement is where its level comes from.
+    fn battery_info(&self) -> Vec<BatteryInfo> {
+        [
+            (BatteryComponent::Left, self.left),
+            (BatteryComponent::Right, self.right),
+            (BatteryComponent::Case, self.case),
+        ]
+        .into_iter()
+        .filter_map(|(component, battery)| {
+            battery.map(|b| BatteryInfo {
+                component,
+                level: b.level,
+                status: b.status(),
+            })
+        })
+        .collect()
+    }
+}
+
+/// Connect the AirPods unless their autoConnect preference is off.
+async fn auto_connect(connect_attempts: &ConnectAttempts, airpods_mac: &str) {
+    let preferences: HashMap<String, HashMap<String, bool>> =
+        std::fs::read_to_string(get_preferences_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    let auto_connect = preferences
+        .get(airpods_mac)
+        .and_then(|prefs| prefs.get("autoConnect"))
+        .copied()
+        .unwrap_or(true);
+    debug!("Auto-connect preference for {airpods_mac}: {auto_connect}");
+    if auto_connect {
+        connect_airpods(connect_attempts, airpods_mac).await;
+    } else {
+        info!("Auto-connect is disabled for {airpods_mac}, not attempting to connect.");
+    }
 }
 
 async fn watch_advertisements(
@@ -332,162 +473,30 @@ async fn watch_advertisements(
         if apple_data.len() <= 20 {
             continue;
         }
-        let last_16: [u8; 16] = apple_data[apple_data.len() - 16..]
-            .try_into()
-            .expect("slice is 16 bytes long");
-        let decrypted = decrypt(&enc_key, &last_16);
+        let Some(encrypted) = apple_data.last_chunk::<16>() else {
+            continue;
+        };
+        let decrypted = decrypt(&enc_key, encrypted);
         debug!(
             "Decrypted data from airpods_mac {}: {}",
             airpods_mac,
             hex::encode(decrypted)
         );
 
-        let connection_state = apple_data[10] as usize;
-        debug!("Connection state: {}", connection_state);
+        let connection_state = apple_data[10];
+        debug!("Connection state: {connection_state}");
         if connection_state == 0x00 {
-            let pref_path = get_preferences_path();
-            let preferences: HashMap<String, HashMap<String, bool>> =
-                std::fs::read_to_string(&pref_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-            let auto_connect = preferences
-                .get(&airpods_mac)
-                .and_then(|prefs| prefs.get("autoConnect"))
-                .copied()
-                .unwrap_or(true);
-            debug!(
-                "Auto-connect preference for {}: {}",
-                airpods_mac, auto_connect
-            );
-            if auto_connect {
-                connect_airpods(&connect_attempts, &airpods_mac).await;
-            } else {
-                info!(
-                    "Auto-connect is disabled for {}, not attempting to connect.",
-                    airpods_mac
-                );
-            }
+            auto_connect(&connect_attempts, &airpods_mac).await;
         }
 
-        let status = apple_data[5] as usize;
-        let primary_left = (status >> 5) & 0x01 == 1;
-        let this_in_case = (status >> 6) & 0x01 == 1;
-        let xor_factor = primary_left ^ this_in_case;
-        let is_left_in_ear = if xor_factor {
-            (status & 0x02) != 0
-        } else {
-            (status & 0x08) != 0
-        };
-        let is_right_in_ear = if xor_factor {
-            (status & 0x08) != 0
-        } else {
-            (status & 0x02) != 0
-        };
-        let is_flipped = !primary_left;
-
-        let left_byte_index = if is_flipped { 2 } else { 1 };
-        let right_byte_index = if is_flipped { 1 } else { 2 };
-
-        let left_byte = decrypted[left_byte_index] as i32;
-        let right_byte = decrypted[right_byte_index] as i32;
-        let case_byte = decrypted[3] as i32;
-
-        let (left_battery, left_charging) = if left_byte == 0xff {
-            (0, false)
-        } else {
-            (left_byte & 0x7F, (left_byte & 0x80) != 0)
-        };
-        let (right_battery, right_charging) = if right_byte == 0xff {
-            (0, false)
-        } else {
-            (right_byte & 0x7F, (right_byte & 0x80) != 0)
-        };
-        let (case_battery, case_charging) = if case_byte == 0xff {
-            (0, false)
-        } else {
-            (case_byte & 0x7F, (case_byte & 0x80) != 0)
-        };
-
+        let status = AdvertisedStatus::decode(apple_data[5], &decrypted);
         if let Some(handle) = &tray_handle {
             handle
-                .update(|tray: &mut MyTray| {
-                    tray.battery_l = if left_byte == 0xff {
-                        None
-                    } else {
-                        Some(left_battery as u8)
-                    };
-                    tray.battery_l_status = if left_byte == 0xff {
-                        Some(BatteryStatus::Disconnected)
-                    } else if left_charging {
-                        Some(BatteryStatus::Charging)
-                    } else {
-                        Some(BatteryStatus::NotCharging)
-                    };
-                    tray.battery_r = if right_byte == 0xff {
-                        None
-                    } else {
-                        Some(right_battery as u8)
-                    };
-                    tray.battery_r_status = if right_byte == 0xff {
-                        Some(BatteryStatus::Disconnected)
-                    } else if right_charging {
-                        Some(BatteryStatus::Charging)
-                    } else {
-                        Some(BatteryStatus::NotCharging)
-                    };
-                    tray.battery_c = if case_byte == 0xff {
-                        None
-                    } else {
-                        Some(case_battery as u8)
-                    };
-                    tray.battery_c_status = if case_byte == 0xff {
-                        Some(BatteryStatus::Disconnected)
-                    } else if case_charging {
-                        Some(BatteryStatus::Charging)
-                    } else {
-                        Some(BatteryStatus::NotCharging)
-                    };
-                })
+                .update(|tray: &mut MyTray| status.update_tray(tray))
                 .await;
         }
 
-        // The tray is not the only consumer: the window shows the
-        // case level too, and over AACP the case reports itself as
-        // disconnected whenever the buds are outside it.
-        let battery_info = [
-            (
-                BatteryComponent::Left,
-                left_byte,
-                left_battery,
-                left_charging,
-            ),
-            (
-                BatteryComponent::Right,
-                right_byte,
-                right_battery,
-                right_charging,
-            ),
-            (
-                BatteryComponent::Case,
-                case_byte,
-                case_battery,
-                case_charging,
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, raw, _, _)| *raw != 0xff)
-        .map(|(component, _, level, charging)| BatteryInfo {
-            component,
-            level: level as u8,
-            status: if charging {
-                BatteryStatus::Charging
-            } else {
-                BatteryStatus::NotCharging
-            },
-        })
-        .collect::<Vec<_>>();
-
+        let battery_info = status.battery_info();
         if !battery_info.is_empty() {
             let _ = ui_tx.send(BluetoothUIMessage::AACPUIEvent(
                 airpods_mac.clone(),
@@ -497,23 +506,11 @@ async fn watch_advertisements(
 
         debug!(
             "Battery status: Left: {}, Right: {}, Case: {}, InEar: L:{} R:{}",
-            if left_byte == 0xff {
-                "disconnected".to_string()
-            } else {
-                format!("{}% (charging: {})", left_battery, left_charging)
-            },
-            if right_byte == 0xff {
-                "disconnected".to_string()
-            } else {
-                format!("{}% (charging: {})", right_battery, right_charging)
-            },
-            if case_byte == 0xff {
-                "disconnected".to_string()
-            } else {
-                format!("{}% (charging: {})", case_battery, case_charging)
-            },
-            is_left_in_ear,
-            is_right_in_ear
+            AdvertisedBattery::describe(status.left),
+            AdvertisedBattery::describe(status.right),
+            AdvertisedBattery::describe(status.case),
+            status.left_in_ear,
+            status.right_in_ear
         );
     }
 }
@@ -601,5 +598,90 @@ mod tests {
         drop(first);
 
         assert!(attempts.begin("AA:BB:CC:DD:EE:FF").is_some());
+    }
+
+    #[test]
+    fn advertised_battery_splits_level_and_charging_bit() {
+        // 0xB7 is the charging bit (0x80) plus 55.
+        assert_eq!(
+            AdvertisedBattery::decode(0xB7),
+            Some(AdvertisedBattery {
+                level: 55,
+                charging: true
+            })
+        );
+        assert_eq!(
+            AdvertisedBattery::decode(100),
+            Some(AdvertisedBattery {
+                level: 100,
+                charging: false
+            })
+        );
+        assert_eq!(AdvertisedBattery::decode(0xFF), None);
+    }
+
+    fn decrypted(first: u8, second: u8, case: u8) -> [u8; 16] {
+        let mut data = [0u8; 16];
+        data[1] = first;
+        data[2] = second;
+        data[3] = case;
+        data
+    }
+
+    #[test]
+    fn advertised_status_with_left_primary_reads_left_first() {
+        // Primary left (bit 5), not in the case: left in ear is bit 1. 0xA8 is
+        // the charging bit plus 40.
+        let status = AdvertisedStatus::decode(0x20 | 0x02, &decrypted(90, 0xA8, 0xFF));
+
+        assert_eq!(
+            status,
+            AdvertisedStatus {
+                left: Some(AdvertisedBattery {
+                    level: 90,
+                    charging: false
+                }),
+                right: Some(AdvertisedBattery {
+                    level: 40,
+                    charging: true
+                }),
+                case: None,
+                left_in_ear: true,
+                right_in_ear: false,
+            }
+        );
+    }
+
+    #[test]
+    fn advertised_status_with_right_primary_swaps_the_buds() {
+        // Primary right and in the case: left in ear is still bit 1.
+        let status = AdvertisedStatus::decode(0x40 | 0x02, &decrypted(10, 20, 30));
+
+        assert_eq!(status.left.map(|b| b.level), Some(20));
+        assert_eq!(status.right.map(|b| b.level), Some(10));
+        assert_eq!(status.case.map(|b| b.level), Some(30));
+        assert!(status.left_in_ear);
+        assert!(!status.right_in_ear);
+    }
+
+    #[test]
+    fn battery_info_leaves_out_disconnected_components() {
+        let status = AdvertisedStatus::decode(0x20, &decrypted(0xFF, 0x85, 60));
+
+        assert_eq!(
+            status.battery_info(),
+            vec![
+                BatteryInfo {
+                    component: BatteryComponent::Right,
+                    level: 5,
+                    status: BatteryStatus::Charging,
+                },
+                BatteryInfo {
+                    component: BatteryComponent::Case,
+                    level: 60,
+                    status: BatteryStatus::NotCharging,
+                },
+            ]
+        );
     }
 }

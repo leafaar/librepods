@@ -1,35 +1,48 @@
 use {
     bluer::Adapter,
-    std::io::Error,
-    tracing::{debug, warn},
+    tracing::{debug, info, warn},
+    uuid::Uuid,
 };
 
-pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<bluer::Device> {
-    let target_uuid = uuid::Uuid::parse_str("74ec2172-0bad-4d01-8f77-997b2be0722a").unwrap();
+/// The AACP service UUID that AirPods advertise over SDP.
+const AIRPODS_SERVICE_UUID: Uuid = Uuid::from_u128(0x74ec_2172_0bad_4d01_8f77_997b_2be0_722a);
 
-    let addrs = adapter.device_addresses().await?;
+/// Why no connected AirPods were returned.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DiscoveryError {
+    #[error("listing the adapter's devices failed")]
+    ListDevices(#[source] bluer::Error),
+    #[error("no connected AirPods found")]
+    NoAirPods,
+}
+
+pub(crate) async fn find_connected_airpods(
+    adapter: &Adapter,
+) -> Result<bluer::Device, DiscoveryError> {
+    let addrs = adapter
+        .device_addresses()
+        .await
+        .map_err(DiscoveryError::ListDevices)?;
     for addr in addrs {
         let device = match adapter.device(addr) {
             Ok(device) => device,
             Err(e) => {
-                warn!("Skipping device {}: {}", addr, e);
+                warn!("Skipping device {addr}: {e}");
                 continue;
             },
         };
         if device.is_connected().await.unwrap_or(false)
             && let Ok(uuids) = device.uuids().await
             && let Some(uuids) = uuids
-            && uuids.iter().any(|u| *u == target_uuid)
+            && uuids.contains(&AIRPODS_SERVICE_UUID)
         {
             return Ok(device);
         }
     }
-    Err(bluer::Error::from(Error::new(
-        std::io::ErrorKind::NotFound,
-        "No connected AirPods found",
-    )))
+    Err(DiscoveryError::NoAirPods)
 }
 
+/// The connected devices among `managed_macs`, possibly none.
 pub async fn find_other_managed_devices(
     adapter: &Adapter,
     managed_macs: Vec<String>,
@@ -41,24 +54,20 @@ pub async fn find_other_managed_devices(
         let device = match adapter.device(addr) {
             Ok(device) => device,
             Err(e) => {
-                warn!("Skipping device {}: {}", addr, e);
+                warn!("Skipping device {addr}: {e}");
                 continue;
             },
         };
         let device_mac = device.address().to_string();
         let connected = device.is_connected().await.unwrap_or(false);
-        debug!("Checking device: {}, connected: {}", device_mac, connected);
+        debug!("Checking device: {device_mac}, connected: {connected}");
         if connected && managed_macs.contains(&device_mac) {
-            debug!("Found managed device: {}", device_mac);
+            debug!("Found managed device: {device_mac}");
             devices.push(device);
         }
     }
-    if !devices.is_empty() {
-        return Ok(devices);
+    if devices.is_empty() {
+        info!("No other managed devices found.");
     }
-    debug!("No other managed devices found");
-    Err(bluer::Error::from(Error::new(
-        std::io::ErrorKind::NotFound,
-        "No other managed devices found",
-    )))
+    Ok(devices)
 }

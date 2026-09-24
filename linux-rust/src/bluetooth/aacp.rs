@@ -1,20 +1,22 @@
 use {
     crate::{
-        bluetooth::eq::{self, CustomEq},
+        audio::hires_mic::{HiResMic, MicStatus},
+        bluetooth::{
+            eq::{self, CustomEq},
+            l2cap::{self, ConnectError},
+        },
         devices::{
             airpods::AirPodsInformation,
             enums::{DeviceData, DeviceInformation, DeviceType},
         },
-        utils::get_devices_path,
+        utils::{AppSettings, StorageError, get_devices_path, update_devices_file},
     },
-    bluer::{
-        Address, AddressType, Error, Result,
-        l2cap::{SeqPacket, Socket, SocketAddr},
-    },
+    bluer::{Address, l2cap::SeqPacket},
     serde::{Deserialize, Serialize},
     serde_json,
     std::{
         collections::HashMap,
+        io,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -24,15 +26,15 @@ use {
     tokio::{
         sync::{Mutex, Notify, mpsc},
         task::{AbortHandle, JoinSet},
-        time::{Instant, sleep},
+        time::sleep,
     },
     tracing::{debug, error, info, warn},
 };
 
 const PSM: u16 = 0x1001;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const HEADER_BYTES: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
+/// Longest wait for the state lock before a send gives up.
+const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// L2CAP recv buffer. 0x58 hi-res audio SDUs can exceed 1 KB; SOCK_SEQPACKET
 /// silently truncates an undersized buffer, so this must comfortably exceed the
@@ -70,9 +72,6 @@ pub mod opcodes {
     pub const AUDIO_SOURCE: u8 = 0x0E;
     pub const SMART_ROUTING: u8 = 0x10;
     pub const SMART_ROUTING_RESP: u8 = 0x11;
-    pub const SEND_CONNECTED_MAC: u8 = 0x14;
-    pub const HEADTRACKING: u8 = 0x17;
-    pub const TIPI_3: u8 = 0x0C;
     pub const CUSTOM_EQ: u8 = 0x63;
 }
 
@@ -204,7 +203,7 @@ impl std::fmt::Display for ControlCommandIdentifiers {
             ControlCommandIdentifiers::AutomaticConnectionConfig => "Automatic Connection Config",
             ControlCommandIdentifiers::OwnsConnection => "Owns Connection",
         };
-        write!(f, "{}", name)
+        f.write_str(name)
     }
 }
 
@@ -228,19 +227,19 @@ impl ProximityKeyType {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StemPressType {
-    SinglePress = 0x05,
-    DoublePress = 0x06,
-    TriplePress = 0x07,
-    LongPress = 0x08,
+    Single = 0x05,
+    Double = 0x06,
+    Triple = 0x07,
+    Long = 0x08,
 }
 
 impl StemPressType {
     fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0x05 => Some(Self::SinglePress),
-            0x06 => Some(Self::DoublePress),
-            0x07 => Some(Self::TriplePress),
-            0x08 => Some(Self::LongPress),
+            0x05 => Some(Self::Single),
+            0x06 => Some(Self::Double),
+            0x07 => Some(Self::Triple),
+            0x08 => Some(Self::Long),
             _ => None,
         }
     }
@@ -280,6 +279,18 @@ pub enum BatteryComponent {
     Case = 8,
 }
 
+impl BatteryComponent {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::Headphone),
+            0x02 => Some(Self::Right),
+            0x04 => Some(Self::Left),
+            0x08 => Some(Self::Case),
+            _ => None,
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryStatus {
@@ -291,6 +302,16 @@ pub enum BatteryStatus {
 }
 
 impl BatteryStatus {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::Charging),
+            0x02 => Some(Self::NotCharging),
+            0x04 => Some(Self::Disconnected),
+            0x05 => Some(Self::OptimizedCharging),
+            _ => None,
+        }
+    }
+
     pub fn is_charging(self) -> bool {
         matches!(self, Self::Charging | Self::OptimizedCharging)
     }
@@ -303,6 +324,18 @@ pub enum EarDetectionStatus {
     OutOfEar = 0x01,
     InCase = 0x02,
     Disconnected = 0x03,
+}
+
+impl EarDetectionStatus {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::InEar),
+            0x01 => Some(Self::OutOfEar),
+            0x02 => Some(Self::InCase),
+            0x03 => Some(Self::Disconnected),
+            _ => None,
+        }
+    }
 }
 
 impl AudioSourceType {
@@ -343,18 +376,382 @@ pub enum AACPEvent {
     ControlCommand(ControlCommandStatus),
     EarDetection(Vec<EarDetectionStatus>, Vec<EarDetectionStatus>),
     ConversationalAwareness(u8),
-    ProximityKeys(Vec<(u8, Vec<u8>)>),
-    AudioSource(AudioSource),
     ConnectedDevices(Vec<ConnectedDevice>, Vec<ConnectedDevice>),
     OwnershipToFalseRequest,
     StemPress(StemPressType, StemPressBudType),
     CustomEq(CustomEq),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AirPodsLEKeys {
     pub irk: String,
     pub enc_key: String,
+}
+
+/// Why an AACP packet was not handed to the connection.
+#[derive(Debug, thiserror::Error)]
+pub enum AacpError {
+    #[error("AACP channel is not connected")]
+    NotConnected,
+    #[error("AACP send channel closed")]
+    SendChannelClosed,
+    #[error("AACP state lock held for over {STATE_LOCK_TIMEOUT:?}, packet not sent")]
+    StateBusy,
+    #[error("invalid MAC address {0:?}")]
+    InvalidMac(String),
+    #[error("name is {0} bytes long, at most 255 fit in the rename packet")]
+    NameTooLong(usize),
+    #[error("smart routing body is {0} bytes, more than its 16-bit length holds")]
+    BodyTooLong(usize),
+}
+
+/// Where device records (AirPods information and LE keys) are kept between
+/// runs.
+pub(crate) trait DeviceStore: Send + Sync {
+    fn load(&self) -> HashMap<String, DeviceData>;
+    fn save(&self, mac: String, data: DeviceData) -> Result<(), StorageError>;
+}
+
+/// devices.json in the app's data directory.
+struct DevicesFile;
+
+impl DeviceStore for DevicesFile {
+    fn load(&self) -> HashMap<String, DeviceData> {
+        std::fs::read_to_string(get_devices_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, mac: String, data: DeviceData) -> Result<(), StorageError> {
+        update_devices_file(|devices| {
+            devices.insert(mac, data);
+        })
+    }
+}
+
+/// A device record changed by a received packet, to be written to the store.
+#[derive(Debug)]
+struct DeviceUpdate {
+    mac: String,
+    data: DeviceData,
+}
+
+/// One message from the AirPods, decoded from its bytes.
+#[derive(Debug)]
+enum Incoming {
+    BatteryInfo(Vec<BatteryInfo>),
+    ControlCommand(ControlCommandStatus),
+    EarDetection(Vec<EarDetectionStatus>),
+    ConversationAwareness(u8),
+    Information(Box<AirPodsInformation>),
+    ProximityKeys(Vec<(u8, Vec<u8>)>),
+    StemPress(StemPressType, StemPressBudType),
+    AudioSource(AudioSource),
+    ConnectedDevices(Vec<ConnectedDevice>),
+    OwnershipToFalse,
+    CustomEq(CustomEq),
+}
+
+/// Decode one AACP packet, header included. Malformed and unhandled packets
+/// are logged and give `None`.
+fn parse_packet(packet: &[u8]) -> Option<Incoming> {
+    if !packet.starts_with(&HEADER_BYTES) {
+        debug!(
+            "Received packet does not start with expected header: {}",
+            hex::encode(packet)
+        );
+        return None;
+    }
+    let Some(payload @ [opcode, ..]) = packet.get(HEADER_BYTES.len()..) else {
+        debug!("Received packet too short: {}", hex::encode(packet));
+        return None;
+    };
+    match *opcode {
+        opcodes::BATTERY_INFO => parse_battery_info(payload).map(Incoming::BatteryInfo),
+        opcodes::CONTROL_COMMAND => parse_control_command(payload).map(Incoming::ControlCommand),
+        opcodes::EAR_DETECTION => parse_ear_detection(payload).map(Incoming::EarDetection),
+        opcodes::CONVERSATION_AWARENESS => {
+            parse_conversation_awareness(packet).map(Incoming::ConversationAwareness)
+        },
+        opcodes::INFORMATION => {
+            parse_information(payload).map(|info| Incoming::Information(Box::new(info)))
+        },
+        opcodes::PROXIMITY_KEYS_RSP => parse_proximity_keys(payload).map(Incoming::ProximityKeys),
+        opcodes::STEM_PRESS => {
+            parse_stem_press(payload).map(|(press, bud)| Incoming::StemPress(press, bud))
+        },
+        opcodes::AUDIO_SOURCE => parse_audio_source(payload).map(Incoming::AudioSource),
+        opcodes::CONNECTED_DEVICES => {
+            parse_connected_devices(payload).map(Incoming::ConnectedDevices)
+        },
+        opcodes::SMART_ROUTING_RESP => {
+            parse_smart_routing_response(payload).then_some(Incoming::OwnershipToFalse)
+        },
+        opcodes::EQ_DATA => {
+            debug!("Received EQ Data");
+            None
+        },
+        opcodes::CUSTOM_EQ => {
+            let custom_eq = eq::parse(payload);
+            if custom_eq.is_none() {
+                warn!(
+                    "Ignoring malformed custom EQ packet: {}",
+                    hex::encode(packet)
+                );
+            }
+            custom_eq.map(Incoming::CustomEq)
+        },
+        _ => {
+            debug!("Received unknown packet with opcode {opcode:#04x}");
+            None
+        },
+    }
+}
+
+/// Opcode, 0x00, count, then per component: component, 0x01, level, status,
+/// 0x01. Entries with an unknown component or status are skipped.
+fn parse_battery_info(payload: &[u8]) -> Option<Vec<BatteryInfo>> {
+    let Some(&count) = payload.get(2) else {
+        error!("Battery Info packet too short: {}", hex::encode(payload));
+        return None;
+    };
+    let Some(entries) = payload.get(3..3 + usize::from(count) * 5) else {
+        error!(
+            "Battery Info packet length mismatch: {}",
+            hex::encode(payload)
+        );
+        return None;
+    };
+    Some(
+        entries
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .copied()
+            .filter_map(parse_battery_entry)
+            .collect(),
+    )
+}
+
+fn parse_battery_entry([component, _, level, status, _]: [u8; 5]) -> Option<BatteryInfo> {
+    let Some(component) = BatteryComponent::from_u8(component) else {
+        error!("Unknown battery component: {component:#04x}");
+        return None;
+    };
+    let Some(status) = BatteryStatus::from_u8(status) else {
+        error!("Unknown battery status: {status:#04x}");
+        return None;
+    };
+    Some(BatteryInfo {
+        component,
+        level,
+        status,
+    })
+}
+
+/// Opcode, 0x00, identifier, four value bytes. The value is reported with its
+/// trailing zero bytes trimmed, keeping at least one byte.
+fn parse_control_command(payload: &[u8]) -> Option<ControlCommandStatus> {
+    let &[_, _, identifier_byte, v0, v1, v2, v3, ..] = payload else {
+        error!("Control Command packet too short: {}", hex::encode(payload));
+        return None;
+    };
+    let value_bytes = [v0, v1, v2, v3];
+    let value = match value_bytes.iter().rposition(|&b| b != 0) {
+        Some(i) => value_bytes[..=i].to_vec(),
+        None => vec![0],
+    };
+    let Some(identifier) = ControlCommandIdentifiers::from_u8(identifier_byte) else {
+        error!("Unknown Control Command identifier: {identifier_byte:#04x}");
+        return None;
+    };
+    Some(ControlCommandStatus { identifier, value })
+}
+
+/// Opcode, 0x00, primary bud status, secondary bud status. An unknown status
+/// reads as out of ear.
+fn parse_ear_detection(payload: &[u8]) -> Option<Vec<EarDetectionStatus>> {
+    let &[_, _, primary, secondary, ..] = payload else {
+        error!("Ear Detection packet too short: {}", hex::encode(payload));
+        return None;
+    };
+    let status = |byte: u8| {
+        EarDetectionStatus::from_u8(byte).unwrap_or_else(|| {
+            error!("Unknown ear detection status: {byte:#04x}");
+            EarDetectionStatus::OutOfEar
+        })
+    };
+    Some(vec![status(primary), status(secondary)])
+}
+
+/// Exactly 10 bytes with the header; the status is the last one.
+fn parse_conversation_awareness(packet: &[u8]) -> Option<u8> {
+    if let [.., status] = *packet
+        && packet.len() == 10
+    {
+        info!("Received Conversation Awareness: {status}");
+        return Some(status);
+    }
+    info!(
+        "Received Conversation Awareness packet with unexpected length: {}",
+        packet.len()
+    );
+    None
+}
+
+/// Opcode, 0x00 and two more bytes, then zero separated strings. The first
+/// two strings are not part of the information; the rest are its fields in
+/// order, and missing ones are empty.
+fn parse_information(payload: &[u8]) -> Option<AirPodsInformation> {
+    if payload.len() < 6 {
+        error!("Information packet too short: {}", hex::encode(payload));
+        return None;
+    }
+    let data = &payload[4..];
+    let first_zero = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    // Lossy, not skipped: the fields are positional, so dropping one bad
+    // string would shift every field after it.
+    let mut strings = data[first_zero..]
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    if strings.next().is_none() {
+        error!(
+            "Information packet has no strings: {}",
+            hex::encode(payload)
+        );
+        return None;
+    }
+    let mut field = || strings.next().unwrap_or_default();
+    Some(AirPodsInformation {
+        name: field(),
+        model_number: field(),
+        manufacturer: field(),
+        serial_number: field(),
+        version1: field(),
+        version2: field(),
+        hardware_revision: field(),
+        updater_identifier: field(),
+        left_serial_number: field(),
+        right_serial_number: field(),
+        version3: field(),
+        le_keys: AirPodsLEKeys::default(),
+    })
+}
+
+/// Opcode, 0x00, key count, then per key: type, 0x00, length, 0x00, key.
+/// A key that runs past the end drops the whole packet.
+fn parse_proximity_keys(payload: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    if payload.len() < 4 {
+        error!(
+            "Proximity Keys Response packet too short: {}",
+            hex::encode(payload)
+        );
+        return None;
+    }
+    let key_count = payload[2];
+    debug!("Proximity Keys Response contains {key_count} keys.");
+    let mut offset = 3;
+    let mut keys = Vec::new();
+    for _ in 0..key_count {
+        let Some(&[key_type, _, key_length, _]) = payload.get(offset..offset + 4) else {
+            error!(
+                "Proximity Keys Response packet too short while parsing keys: {}",
+                hex::encode(payload)
+            );
+            return None;
+        };
+        offset += 4;
+        let key_end = offset + usize::from(key_length);
+        let Some(key_data) = payload.get(offset..key_end) else {
+            error!(
+                "Proximity Keys Response packet too short for key data: {}",
+                hex::encode(payload)
+            );
+            return None;
+        };
+        keys.push((key_type, key_data.to_vec()));
+        offset = key_end;
+    }
+    info!(
+        "Received Proximity Keys Response: {:?}",
+        keys.iter()
+            .map(|(kt, kd)| (kt, hex::encode(kd)))
+            .collect::<Vec<_>>()
+    );
+    Some(keys)
+}
+
+/// Opcode, 0x00, press type, bud.
+fn parse_stem_press(payload: &[u8]) -> Option<(StemPressType, StemPressBudType)> {
+    let &[_, _, press, bud, ..] = payload else {
+        error!("Stem Press packet too short: {}", hex::encode(payload));
+        return None;
+    };
+    let press_type = StemPressType::from_u8(press);
+    let bud_type = StemPressBudType::from_u8(bud);
+    if let (Some(press), Some(bud)) = (press_type, bud_type) {
+        info!("Received Stem Press: {press:?} on {bud:?}");
+        Some((press, bud))
+    } else {
+        error!("Invalid Stem Press packet - type: {press_type:?}, bud: {bud_type:?}");
+        None
+    }
+}
+
+/// Opcode, 0x00, the source MAC least significant byte first, source type.
+fn parse_audio_source(payload: &[u8]) -> Option<AudioSource> {
+    let &[_, _, m0, m1, m2, m3, m4, m5, typ, ..] = payload else {
+        error!("Audio Source packet too short: {}", hex::encode(payload));
+        return None;
+    };
+    Some(AudioSource {
+        mac: format!("{m5:02X}:{m4:02X}:{m3:02X}:{m2:02X}:{m1:02X}:{m0:02X}"),
+        r#type: AudioSourceType::from_u8(typ).unwrap_or(AudioSourceType::None),
+    })
+}
+
+/// Opcode, 0x00, count, two bytes, then per device: MAC most significant
+/// byte first and two info bytes.
+fn parse_connected_devices(payload: &[u8]) -> Option<Vec<ConnectedDevice>> {
+    let Some(&count) = payload.get(2) else {
+        error!(
+            "Connected Devices packet too short: {}",
+            hex::encode(payload)
+        );
+        return None;
+    };
+    let Some(entries) = payload.get(5..5 + usize::from(count) * 8) else {
+        error!(
+            "Connected Devices packet length mismatch: {}",
+            hex::encode(payload)
+        );
+        return None;
+    };
+    let devices = entries
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&[m0, m1, m2, m3, m4, m5, info1, info2]| ConnectedDevice {
+            mac: format!("{m0:02X}:{m1:02X}:{m2:02X}:{m3:02X}:{m4:02X}:{m5:02X}"),
+            info1,
+            info2,
+            r#type: None,
+        })
+        .collect();
+    Some(devices)
+}
+
+/// Whether a smart routing response asks this host to give up ownership.
+fn parse_smart_routing_response(payload: &[u8]) -> bool {
+    let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or_default());
+    info!("Received Smart Routing Response: {packet_string}");
+    let give_up = packet_string.contains("SetOwnershipToFalse");
+    if give_up {
+        info!("Received OwnershipToFalse request");
+    }
+    give_up
 }
 
 pub struct AACPManagerState {
@@ -380,11 +777,7 @@ pub struct AACPManagerState {
 }
 
 impl AACPManagerState {
-    fn new() -> Self {
-        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    fn new(devices: HashMap<String, DeviceData>) -> Self {
         AACPManagerState {
             sender: None,
             control_command_status_list: Vec::new(),
@@ -404,39 +797,210 @@ impl AACPManagerState {
             custom_eq: None,
         }
     }
+
+    fn emit(&self, event: AACPEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Update the state from one decoded message and emit its event. Returns
+    /// the device record to persist when the message changed one.
+    fn apply(&mut self, incoming: Incoming) -> Option<DeviceUpdate> {
+        match incoming {
+            Incoming::BatteryInfo(batteries) => {
+                self.battery_info.clone_from(&batteries);
+                self.emit(AACPEvent::BatteryInfo(batteries));
+                info!("Received Battery Info: {:?}", self.battery_info);
+            },
+            Incoming::ControlCommand(status) => {
+                info!(
+                    "Received Control Command: {:?}, value: {}",
+                    status.identifier,
+                    hex::encode(&status.value)
+                );
+                self.record_control_command(status);
+            },
+            Incoming::EarDetection(statuses) => self.apply_ear_detection(statuses),
+            Incoming::ConversationAwareness(status) => {
+                self.conversational_awareness_status = status;
+                self.emit(AACPEvent::ConversationalAwareness(status));
+            },
+            Incoming::Information(info) => return self.apply_information(*info),
+            Incoming::ProximityKeys(keys) => return self.apply_proximity_keys(&keys),
+            Incoming::StemPress(press, bud) => self.emit(AACPEvent::StemPress(press, bud)),
+            Incoming::AudioSource(audio_source) => {
+                self.audio_source = Some(audio_source);
+                info!("Received Audio Source: {:?}", self.audio_source);
+            },
+            Incoming::ConnectedDevices(devices) => {
+                self.old_connected_devices =
+                    std::mem::replace(&mut self.connected_devices, devices.clone());
+                self.emit(AACPEvent::ConnectedDevices(
+                    self.old_connected_devices.clone(),
+                    devices,
+                ));
+                info!("Received Connected Devices: {:?}", self.connected_devices);
+            },
+            Incoming::OwnershipToFalse => self.emit(AACPEvent::OwnershipToFalseRequest),
+            Incoming::CustomEq(custom_eq) => {
+                info!("Received custom EQ: {custom_eq:?}");
+                self.custom_eq = Some(custom_eq);
+                self.emit(AACPEvent::CustomEq(custom_eq));
+            },
+        }
+        None
+    }
+
+    /// Store a control command value, tell its subscribers and emit it.
+    fn record_control_command(&mut self, status: ControlCommandStatus) {
+        let identifier = status.identifier;
+        if let Some(existing) = self
+            .control_command_status_list
+            .iter_mut()
+            .find(|s| s.identifier == identifier)
+        {
+            existing.value.clone_from(&status.value);
+        } else {
+            self.control_command_status_list.push(status.clone());
+        }
+        if identifier == ControlCommandIdentifiers::OwnsConnection {
+            self.owns = status.value.first().is_some_and(|&b| b != 0);
+        }
+        if let Some(subscribers) = self.control_command_subscribers.get(&identifier) {
+            for sub in subscribers {
+                let _ = sub.send(status.value.clone());
+            }
+        }
+        self.emit(AACPEvent::ControlCommand(status));
+    }
+
+    fn apply_ear_detection(&mut self, statuses: Vec<EarDetectionStatus>) {
+        self.old_ear_detection_status =
+            std::mem::replace(&mut self.ear_detection_status, statuses.clone());
+        if self.event_tx.is_some() {
+            debug!(
+                "Sending Ear Detection event: old: {:?}, new: {:?}",
+                self.old_ear_detection_status, statuses
+            );
+            self.emit(AACPEvent::EarDetection(
+                self.old_ear_detection_status.clone(),
+                statuses,
+            ));
+        }
+        info!(
+            "Received Ear Detection Status: {:?}",
+            self.ear_detection_status
+        );
+    }
+
+    /// Store the information in the record of the connected AirPods, if it
+    /// has one.
+    fn apply_information(&mut self, mut info: AirPodsInformation) -> Option<DeviceUpdate> {
+        let update = if let Some(mac) = self.airpods_mac
+            && let Some(device_data) = self.devices.get_mut(&mac.to_string())
+        {
+            // The LE keys come from a separate response; this packet must
+            // not wipe the ones already stored.
+            if let Some(DeviceInformation::AirPods(old)) = &device_data.information {
+                info.le_keys = old.le_keys.clone();
+            }
+            device_data.name.clone_from(&info.name);
+            device_data.information = Some(DeviceInformation::AirPods(info.clone()));
+            Some(DeviceUpdate {
+                mac: mac.to_string(),
+                data: device_data.clone(),
+            })
+        } else {
+            None
+        };
+        info!("Received Information: {info:?}");
+        update
+    }
+
+    /// Store the IRK and encryption key in the record of the connected
+    /// AirPods, creating the record when the keys arrive first.
+    fn apply_proximity_keys(&mut self, keys: &[(u8, Vec<u8>)]) -> Option<DeviceUpdate> {
+        let mac = self.airpods_mac?.to_string();
+        let device_data = self.devices.entry(mac.clone()).or_insert(DeviceData {
+            name: mac.clone(),
+            type_: DeviceType::AirPods,
+            information: None,
+        });
+        // The keys may arrive before the information packet; start an empty
+        // record for them instead of dropping them.
+        if !matches!(device_data.information, Some(DeviceInformation::AirPods(_))) {
+            device_data.information =
+                Some(DeviceInformation::AirPods(AirPodsInformation::default()));
+        }
+        if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
+            for (key_type, key_data) in keys {
+                match ProximityKeyType::from_u8(*key_type) {
+                    Some(ProximityKeyType::Irk) => info.le_keys.irk = hex::encode(key_data),
+                    Some(ProximityKeyType::EncKey) => {
+                        info.le_keys.enc_key = hex::encode(key_data);
+                    },
+                    None => {},
+                }
+            }
+        }
+        Some(DeviceUpdate {
+            mac,
+            data: device_data.clone(),
+        })
+    }
+
+    /// Forget everything read from a connection that has ended.
+    fn reset_connection(&mut self) {
+        self.sender = None;
+        self.audio_tx = None;
+        self.owns = false;
+        self.connected_devices.clear();
+        self.control_command_status_list.clear();
+        self.ear_detection_status.clear();
+        self.battery_info.clear();
+    }
 }
 
 #[derive(Clone)]
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
+    store: Arc<dyn DeviceStore>,
     tasks: Arc<Mutex<JoinSet<()>>>,
     /// Tasks that serve this connection (event handling, subscribers, the
     /// playback listener). They hold clones of the manager, so they never end on
     /// their own; recv_thread aborts them when the link goes away.
     connection_tasks: Arc<std::sync::Mutex<Vec<AbortHandle>>>,
     hires_enabled: Arc<AtomicBool>,
-    hires_mic: Arc<Mutex<Option<crate::audio::hires_mic::HiResMic>>>,
+    hires_mic: Arc<Mutex<Option<HiResMic>>>,
     /// Wakes the hi-res monitor so it re-polls promptly when the feature is
     /// toggled, instead of waiting out the poll interval.
     hires_wake: Arc<Notify>,
-    mic_status: crate::audio::hires_mic::MicStatus,
+    mic_status: MicStatus,
     /// Handle to the long-lived backend runtime, so the hi-res monitor task
     /// survives even when armed from a throwaway runtime (the UI toggle thread).
     runtime: tokio::runtime::Handle,
 }
 
 impl AACPManager {
+    /// A manager backed by devices.json and the saved app settings. Must be
+    /// called inside the backend runtime, whose handle it keeps.
     pub fn new() -> Self {
+        Self::with_deps(Arc::new(DevicesFile), AppSettings::load().hires_mic_enabled)
+    }
+
+    /// A manager that keeps device records in `store`, with the hi-res
+    /// microphone feature initially `hires_enabled`.
+    pub(crate) fn with_deps(store: Arc<dyn DeviceStore>, hires_enabled: bool) -> Self {
         AACPManager {
-            state: Arc::new(Mutex::new(AACPManagerState::new())),
+            state: Arc::new(Mutex::new(AACPManagerState::new(store.load()))),
+            store,
             tasks: Arc::new(Mutex::new(JoinSet::new())),
             connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
-            hires_enabled: Arc::new(AtomicBool::new(
-                crate::utils::AppSettings::load().hires_mic_enabled,
-            )),
+            hires_enabled: Arc::new(AtomicBool::new(hires_enabled)),
             hires_mic: Arc::new(Mutex::new(None)),
             hires_wake: Arc::new(Notify::new()),
-            mic_status: crate::audio::hires_mic::MicStatus::new(),
+            mic_status: MicStatus::new(),
             runtime: tokio::runtime::Handle::current(),
         }
     }
@@ -453,7 +1017,7 @@ impl AACPManager {
 
     pub async fn set_conversation_detection(&self, enabled: bool) {
         let value = if enabled { 0x01 } else { 0x02 };
-        info!("[aacp] setting conversation detection to {}", enabled);
+        info!("[aacp] setting conversation detection to {enabled}");
         if let Err(e) = self
             .send_control_command(
                 ControlCommandIdentifiers::ConversationDetectConfig,
@@ -461,41 +1025,19 @@ impl AACPManager {
             )
             .await
         {
-            warn!("[aacp] failed to set conversation detection: {}", e);
+            warn!("[aacp] failed to set conversation detection: {e}");
             return;
         }
         // AirPods don't echo this back, so record it in our own status list
         // (the source of truth for conversation_detection_enabled) and push it
         // to the UI and to the subscribers (the tray checkmark) ourselves.
-        let mut state = self.state.lock().await;
-        if let Some(existing) = state
-            .control_command_status_list
-            .iter_mut()
-            .find(|s| s.identifier == ControlCommandIdentifiers::ConversationDetectConfig)
-        {
-            existing.value = vec![value];
-        } else {
-            state
-                .control_command_status_list
-                .push(ControlCommandStatus {
-                    identifier: ControlCommandIdentifiers::ConversationDetectConfig,
-                    value: vec![value],
-                });
-        }
-        if let Some(subscribers) = state
-            .control_command_subscribers
-            .get(&ControlCommandIdentifiers::ConversationDetectConfig)
-        {
-            for sub in subscribers {
-                let _ = sub.send(vec![value]);
-            }
-        }
-        if let Some(ref tx) = state.event_tx {
-            let _ = tx.send(AACPEvent::ControlCommand(ControlCommandStatus {
+        self.state
+            .lock()
+            .await
+            .record_control_command(ControlCommandStatus {
                 identifier: ControlCommandIdentifiers::ConversationDetectConfig,
                 value: vec![value],
-            }));
-        }
+            });
     }
 
     /// Whether battery or ear detection status has arrived on this connection.
@@ -563,16 +1105,17 @@ impl AACPManager {
             return;
         }
         let mut guard = self.hires_mic.lock().await;
-        if guard.as_ref().is_some_and(|m| m.is_running()) {
+        if guard.as_ref().is_some_and(HiResMic::is_running) {
             return;
         }
         let addr = self.state.lock().await.airpods_mac.map(|a| a.to_string());
         let Some(addr) = addr else {
             return;
         };
-        match crate::audio::hires_mic::HiResMic::start(self, addr, self.mic_status.clone()).await {
-            Some(mic) => *guard = Some(mic),
-            None => error!("Failed to start hi-res microphone"),
+        if let Some(mic) = HiResMic::start(self, addr, self.mic_status.clone()).await {
+            *guard = Some(mic);
+        } else {
+            error!("Failed to start hi-res microphone");
         }
     }
 
@@ -586,119 +1129,53 @@ impl AACPManager {
     }
 
     /// Open the AACP channel and start the send/receive tasks.
-    pub async fn connect(&mut self, addr: Address) -> Result<()> {
-        info!("AACPManager connecting to {} on PSM {:#06X}...", addr, PSM);
-        let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM);
+    pub async fn connect(&mut self, addr: Address) -> Result<(), ConnectError> {
+        info!("AACPManager connecting to {addr} on PSM {PSM:#06X}...");
+        self.state.lock().await.airpods_mac = Some(addr);
 
-        {
-            let mut state = self.state.lock().await;
-            state.airpods_mac = Some(addr);
-        }
-
-        let socket = match Socket::new_seq_packet() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to create L2CAP socket: {}", e);
-                return Err(Error::from(e));
-            },
-        };
-
-        let seq_packet =
-            match tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(target_sa)).await {
-                Ok(Ok(s)) => Arc::new(s),
-                Ok(Err(e)) => {
-                    error!("L2CAP connect failed: {}", e);
-                    return Err(Error::from(e));
-                },
-                Err(_) => {
-                    error!("L2CAP connect timed out");
-                    return Err(connect_error(
-                        std::io::ErrorKind::TimedOut,
-                        "L2CAP connect timed out",
-                    ));
-                },
-            };
-
-        // Wait for connection to be fully established
-        let start = Instant::now();
-        loop {
-            match seq_packet.peer_addr() {
-                Ok(peer) if peer.cid != 0 => break,
-                Ok(_) => { /* still waiting */ },
-                Err(e) => {
-                    if e.raw_os_error() == Some(107) {
-                        // ENOTCONN
-                        error!("Peer has disconnected during connection setup.");
-                        return Err(Error::from(e));
-                    }
-                    error!("Error getting peer address: {}", e);
-                },
-            }
-            if start.elapsed() >= CONNECT_TIMEOUT {
-                error!("Timed out waiting for L2CAP connection to be fully established.");
-                return Err(connect_error(
-                    std::io::ErrorKind::TimedOut,
-                    "L2CAP connection setup timed out",
-                ));
-            }
-            sleep(POLL_INTERVAL).await;
-        }
-
-        info!("L2CAP connection established with {}", addr);
+        let seq_packet = Arc::new(l2cap::connect_seq_packet(addr, PSM).await?);
 
         let (tx, rx) = mpsc::channel(128);
+        self.attach_transport(tx).await;
 
         let manager_clone = self.clone();
-        {
-            let mut state = self.state.lock().await;
-            state.sender = Some(tx);
-        }
-
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
         Ok(())
     }
 
-    async fn send_packet(&self, data: &[u8]) -> Result<()> {
+    /// Route outgoing packets to `tx`. `connect` passes the channel its send
+    /// task drains; tests pass their own and read what was sent.
+    pub(crate) async fn attach_transport(&self, tx: mpsc::Sender<Vec<u8>>) {
+        self.state.lock().await.sender = Some(tx);
+    }
+
+    async fn send_packet(&self, data: &[u8]) -> Result<(), AacpError> {
         // The sender is cloned and the lock released before awaiting. Holding
         // the state mutex across a full channel blocks every other task,
         // including the receive loop, and the manager stops responding
         // entirely. The timeout turns a stuck mutex into a logged error
         // instead of a hang with no diagnosis.
-        let sender = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.state.lock(),
-        )
+        let Ok(sender) = tokio::time::timeout(STATE_LOCK_TIMEOUT, async {
+            self.state.lock().await.sender.clone()
+        })
         .await
-        {
-            Ok(state) => state.sender.clone(),
-            Err(_) => {
-                error!("send_packet: state mutex held for over 2s, giving up");
-                return Err(Error::from(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "state mutex busy",
-                )));
-            },
+        else {
+            error!("send_packet: state mutex held for over 2s, giving up");
+            return Err(AacpError::StateBusy);
         };
-        if let Some(sender) = sender {
-            sender.send(data.to_vec()).await.map_err(|e| {
-                error!("Failed to send packet to channel: {}", e);
-                Error::from(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "L2CAP send channel closed",
-                ))
-            })
-        } else {
+        let Some(sender) = sender else {
             error!("Cannot send packet, sender is not available.");
-            Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "L2CAP stream not connected",
-            )))
-        }
+            return Err(AacpError::NotConnected);
+        };
+        sender.send(data.to_vec()).await.map_err(|e| {
+            error!("Failed to send packet to channel: {e}");
+            AacpError::SendChannelClosed
+        })
     }
 
-    async fn send_data_packet(&self, data: &[u8]) -> Result<()> {
+    async fn send_data_packet(&self, data: &[u8]) -> Result<(), AacpError> {
         let packet = [HEADER_BYTES.as_slice(), data].concat();
         self.send_packet(&packet).await
     }
@@ -729,445 +1206,26 @@ impl AACPManager {
             .push(tx);
     }
 
+    /// Handle one control packet from the AirPods: update the state, emit its
+    /// event and persist a changed device record.
     pub async fn receive_packet(&self, packet: &[u8]) {
-        if !packet.starts_with(&HEADER_BYTES) {
-            debug!(
-                "Received packet does not start with expected header: {}",
-                hex::encode(packet)
-            );
+        let Some(incoming) = parse_packet(packet) else {
             return;
+        };
+        let update = self.state.lock().await.apply(incoming);
+        if let Some(update) = update {
+            self.save_device(update).await;
         }
-        if packet.len() < 5 {
-            debug!("Received packet too short: {}", hex::encode(packet));
-            return;
-        }
+    }
 
-        let opcode = packet[4];
-        let payload = &packet[4..];
-
-        match opcode {
-            opcodes::BATTERY_INFO => {
-                if payload.len() < 3 {
-                    error!("Battery Info packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let count = payload[2] as usize;
-                if payload.len() < 3 + count * 5 {
-                    error!(
-                        "Battery Info packet length mismatch: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let mut batteries = Vec::with_capacity(count);
-                for i in 0..count {
-                    let base_index = 3 + i * 5;
-                    batteries.push(BatteryInfo {
-                        component: match payload[base_index] {
-                            0x01 => BatteryComponent::Headphone,
-                            0x02 => BatteryComponent::Right,
-                            0x04 => BatteryComponent::Left,
-                            0x08 => BatteryComponent::Case,
-                            _ => {
-                                error!("Unknown battery component: {:#04x}", payload[base_index]);
-                                continue;
-                            },
-                        },
-                        level: payload[base_index + 2],
-                        status: match payload[base_index + 3] {
-                            0x01 => BatteryStatus::Charging,
-                            0x02 => BatteryStatus::NotCharging,
-                            0x04 => BatteryStatus::Disconnected,
-                            0x05 => BatteryStatus::OptimizedCharging,
-                            _ => {
-                                error!("Unknown battery status: {:#04x}", payload[base_index + 3]);
-                                continue;
-                            },
-                        },
-                    });
-                }
-                let mut state = self.state.lock().await;
-                state.battery_info = batteries.clone();
-                if let Some(ref tx) = state.event_tx {
-                    let _ = tx.send(AACPEvent::BatteryInfo(batteries));
-                }
-                info!("Received Battery Info: {:?}", state.battery_info);
-            },
-            opcodes::CONTROL_COMMAND => {
-                if payload.len() < 7 {
-                    error!("Control Command packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let identifier_byte = payload[2];
-                let value_bytes = &payload[3..7];
-
-                let last_non_zero = value_bytes.iter().rposition(|&b| b != 0);
-                let value = match last_non_zero {
-                    Some(i) => value_bytes[..=i].to_vec(),
-                    None => vec![0],
-                };
-
-                if let Some(identifier) = ControlCommandIdentifiers::from_u8(identifier_byte) {
-                    let status = ControlCommandStatus {
-                        identifier,
-                        value: value.clone(),
-                    };
-                    let mut state = self.state.lock().await;
-                    if let Some(existing) = state
-                        .control_command_status_list
-                        .iter_mut()
-                        .find(|s| s.identifier == identifier)
-                    {
-                        existing.value = value.clone();
-                    } else {
-                        state.control_command_status_list.push(status.clone());
-                    }
-                    if identifier == ControlCommandIdentifiers::OwnsConnection {
-                        state.owns = value_bytes[0] != 0;
-                    }
-                    if let Some(subscribers) = state.control_command_subscribers.get(&identifier) {
-                        for sub in subscribers {
-                            let _ = sub.send(value.clone());
-                        }
-                    }
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::ControlCommand(status));
-                    }
-                    info!(
-                        "Received Control Command: {:?}, value: {}",
-                        identifier,
-                        hex::encode(&value)
-                    );
-                } else {
-                    error!(
-                        "Unknown Control Command identifier: {:#04x}",
-                        identifier_byte
-                    );
-                }
-            },
-            opcodes::EAR_DETECTION => {
-                if payload.len() < 4 {
-                    error!("Ear Detection packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let primary_status = payload[2];
-                let secondary_status = payload[3];
-                let mut statuses = Vec::new();
-                statuses.push(match primary_status {
-                    0x00 => EarDetectionStatus::InEar,
-                    0x01 => EarDetectionStatus::OutOfEar,
-                    0x02 => EarDetectionStatus::InCase,
-                    0x03 => EarDetectionStatus::Disconnected,
-                    _ => {
-                        error!("Unknown ear detection status: {:#04x}", primary_status);
-                        EarDetectionStatus::OutOfEar
-                    },
-                });
-                statuses.push(match secondary_status {
-                    0x00 => EarDetectionStatus::InEar,
-                    0x01 => EarDetectionStatus::OutOfEar,
-                    0x02 => EarDetectionStatus::InCase,
-                    0x03 => EarDetectionStatus::Disconnected,
-                    _ => {
-                        error!("Unknown ear detection status: {:#04x}", secondary_status);
-                        EarDetectionStatus::OutOfEar
-                    },
-                });
-                let mut state = self.state.lock().await;
-                state.old_ear_detection_status = state.ear_detection_status.clone();
-                state.ear_detection_status = statuses.clone();
-
-                if let Some(ref tx) = state.event_tx {
-                    debug!(
-                        "Sending Ear Detection event: old: {:?}, new: {:?}",
-                        state.old_ear_detection_status, statuses
-                    );
-                    let _ = tx.send(AACPEvent::EarDetection(
-                        state.old_ear_detection_status.clone(),
-                        statuses,
-                    ));
-                }
-                info!(
-                    "Received Ear Detection Status: {:?}",
-                    state.ear_detection_status
-                );
-            },
-            opcodes::CONVERSATION_AWARENESS => {
-                if packet.len() == 10 {
-                    let status = packet[9];
-                    let mut state = self.state.lock().await;
-                    state.conversational_awareness_status = status;
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::ConversationalAwareness(status));
-                    }
-                    info!("Received Conversation Awareness: {}", status);
-                } else {
-                    info!(
-                        "Received Conversation Awareness packet with unexpected length: {}",
-                        packet.len()
-                    );
-                }
-            },
-            opcodes::INFORMATION => {
-                if payload.len() < 6 {
-                    error!("Information packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let data = &payload[4..];
-                let mut index = 0;
-                while index < data.len() && data[index] != 0x00 {
-                    index += 1;
-                }
-                let mut strings = Vec::new();
-                while index < data.len() {
-                    while index < data.len() && data[index] == 0x00 {
-                        index += 1;
-                    }
-                    if index >= data.len() {
-                        break;
-                    }
-                    let start = index;
-                    while index < data.len() && data[index] != 0x00 {
-                        index += 1;
-                    }
-                    // Lossy, not skipped: the fields are positional, so dropping
-                    // one bad string would shift every field after it.
-                    strings.push(String::from_utf8_lossy(&data[start..index]).into_owned());
-                }
-                if strings.is_empty() {
-                    error!(
-                        "Information packet has no strings: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                strings.remove(0);
-                let mut info = AirPodsInformation {
-                    name: strings.first().cloned().unwrap_or_default(),
-                    model_number: strings.get(1).cloned().unwrap_or_default(),
-                    manufacturer: strings.get(2).cloned().unwrap_or_default(),
-                    serial_number: strings.get(3).cloned().unwrap_or_default(),
-                    version1: strings.get(4).cloned().unwrap_or_default(),
-                    version2: strings.get(5).cloned().unwrap_or_default(),
-                    hardware_revision: strings.get(6).cloned().unwrap_or_default(),
-                    updater_identifier: strings.get(7).cloned().unwrap_or_default(),
-                    left_serial_number: strings.get(8).cloned().unwrap_or_default(),
-                    right_serial_number: strings.get(9).cloned().unwrap_or_default(),
-                    version3: strings.get(10).cloned().unwrap_or_default(),
-                    le_keys: AirPodsLEKeys {
-                        irk: "".to_string(),
-                        enc_key: "".to_string(),
-                    },
-                };
-                let mut state = self.state.lock().await;
-                let updated = if let Some(mac) = state.airpods_mac
-                    && let Some(device_data) = state.devices.get_mut(&mac.to_string())
-                {
-                    // The LE keys come from a separate response; this packet must
-                    // not wipe the ones already stored.
-                    if let Some(DeviceInformation::AirPods(old)) = &device_data.information {
-                        info.le_keys = old.le_keys.clone();
-                    }
-                    device_data.name = info.name.clone();
-                    device_data.information = Some(DeviceInformation::AirPods(info.clone()));
-                    Some((mac.to_string(), device_data.clone()))
-                } else {
-                    None
-                };
-                drop(state);
-                info!("Received Information: {:?}", info);
-                if let Some((mac, data)) = updated {
-                    save_device(mac, data).await;
-                }
-            },
-
-            opcodes::PROXIMITY_KEYS_RSP => {
-                if payload.len() < 4 {
-                    error!(
-                        "Proximity Keys Response packet too short: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let key_count = payload[2] as usize;
-                debug!("Proximity Keys Response contains {} keys.", key_count);
-                let mut offset = 3;
-                let mut keys = Vec::new();
-                for _ in 0..key_count {
-                    if offset + 3 >= payload.len() {
-                        error!(
-                            "Proximity Keys Response packet too short while parsing keys: {}",
-                            hex::encode(payload)
-                        );
-                        return;
-                    }
-                    let key_type = payload[offset];
-                    let key_length = payload[offset + 2] as usize;
-                    offset += 4;
-                    if offset + key_length > payload.len() {
-                        error!(
-                            "Proximity Keys Response packet too short for key data: {}",
-                            hex::encode(payload)
-                        );
-                        return;
-                    }
-                    let key_data = payload[offset..offset + key_length].to_vec();
-                    keys.push((key_type, key_data));
-                    offset += key_length;
-                }
-                info!(
-                    "Received Proximity Keys Response: {:?}",
-                    keys.iter()
-                        .map(|(kt, kd)| (kt, hex::encode(kd)))
-                        .collect::<Vec<_>>()
-                );
-                let mut state = self.state.lock().await;
-                let Some(mac) = state.airpods_mac else {
-                    return;
-                };
-                let mac_str = mac.to_string();
-                let device_data = state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                    name: mac_str.clone(),
-                    type_: DeviceType::AirPods,
-                    information: None,
-                });
-                // The keys may arrive before the information packet; start an
-                // empty record for them instead of dropping them.
-                if !matches!(device_data.information, Some(DeviceInformation::AirPods(_))) {
-                    device_data.information =
-                        Some(DeviceInformation::AirPods(AirPodsInformation::default()));
-                }
-                if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
-                    for (key_type, key_data) in &keys {
-                        match ProximityKeyType::from_u8(*key_type) {
-                            Some(ProximityKeyType::Irk) => info.le_keys.irk = hex::encode(key_data),
-                            Some(ProximityKeyType::EncKey) => {
-                                info.le_keys.enc_key = hex::encode(key_data)
-                            },
-                            None => {},
-                        }
-                    }
-                }
-                let data = device_data.clone();
-                drop(state);
-                save_device(mac_str, data).await;
-            },
-            opcodes::STEM_PRESS => {
-                if payload.len() < 4 {
-                    error!("Stem Press packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let press_type = StemPressType::from_u8(payload[2]);
-                let bud_type = StemPressBudType::from_u8(payload[3]);
-                if let (Some(press), Some(bud)) = (press_type, bud_type) {
-                    info!("Received Stem Press: {:?} on {:?}", press, bud);
-                    let state = self.state.lock().await;
-                    if let Some(ref tx) = state.event_tx {
-                        let _ = tx.send(AACPEvent::StemPress(press, bud));
-                    }
-                } else {
-                    error!(
-                        "Invalid Stem Press packet - type: {:?}, bud: {:?}",
-                        press_type, bud_type
-                    );
-                }
-            },
-            opcodes::AUDIO_SOURCE => {
-                if payload.len() < 9 {
-                    error!("Audio Source packet too short: {}", hex::encode(payload));
-                    return;
-                }
-                let mac = format!(
-                    "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                    payload[7], payload[6], payload[5], payload[4], payload[3], payload[2]
-                );
-                let typ = AudioSourceType::from_u8(payload[8]).unwrap_or(AudioSourceType::None);
-                let audio_source = AudioSource { mac, r#type: typ };
-                let mut state = self.state.lock().await;
-                state.audio_source = Some(audio_source.clone());
-                if let Some(ref tx) = state.event_tx {
-                    let _ = tx.send(AACPEvent::AudioSource(audio_source));
-                }
-                info!("Received Audio Source: {:?}", state.audio_source);
-            },
-            opcodes::CONNECTED_DEVICES => {
-                if payload.len() < 3 {
-                    error!(
-                        "Connected Devices packet too short: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let count = payload[2] as usize;
-                // Entries start at offset 5 and are 8 bytes each.
-                if payload.len() < 5 + count * 8 {
-                    error!(
-                        "Connected Devices packet length mismatch: {}",
-                        hex::encode(payload)
-                    );
-                    return;
-                }
-                let mut devices = Vec::with_capacity(count);
-                for i in 0..count {
-                    let base = 5 + i * 8;
-                    let mac = format!(
-                        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                        payload[base],
-                        payload[base + 1],
-                        payload[base + 2],
-                        payload[base + 3],
-                        payload[base + 4],
-                        payload[base + 5]
-                    );
-                    let info1 = payload[base + 6];
-                    let info2 = payload[base + 7];
-                    devices.push(ConnectedDevice {
-                        mac,
-                        info1,
-                        info2,
-                        r#type: None,
-                    });
-                }
-                let mut state = self.state.lock().await;
-                state.old_connected_devices = state.connected_devices.clone();
-                state.connected_devices = devices.clone();
-                if let Some(ref tx) = state.event_tx {
-                    let _ = tx.send(AACPEvent::ConnectedDevices(
-                        state.old_connected_devices.clone(),
-                        devices,
-                    ));
-                }
-                info!("Received Connected Devices: {:?}", state.connected_devices);
-            },
-            opcodes::SMART_ROUTING_RESP => {
-                let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or_default());
-                info!("Received Smart Routing Response: {}", packet_string);
-                if packet_string.contains("SetOwnershipToFalse") {
-                    info!("Received OwnershipToFalse request");
-                    if let Some(ref tx) = self.state.lock().await.event_tx {
-                        let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
-                    }
-                }
-            },
-            opcodes::EQ_DATA => {
-                debug!("Received EQ Data");
-            },
-            opcodes::CUSTOM_EQ => {
-                let Some(custom_eq) = eq::parse(payload) else {
-                    warn!(
-                        "Ignoring malformed custom EQ packet: {}",
-                        hex::encode(packet)
-                    );
-                    return;
-                };
-                info!("Received custom EQ: {:?}", custom_eq);
-                let mut state = self.state.lock().await;
-                state.custom_eq = Some(custom_eq);
-                if let Some(ref tx) = state.event_tx {
-                    let _ = tx.send(AACPEvent::CustomEq(custom_eq));
-                }
-            },
-            _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
+    /// Persist one device record without blocking the runtime.
+    async fn save_device(&self, update: DeviceUpdate) {
+        let store = Arc::clone(&self.store);
+        let result = tokio::task::spawn_blocking(move || store.save(update.mac, update.data)).await;
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => error!("Failed to save devices: {e}"),
+            Err(e) => error!("Failed to save devices: {e}"),
         }
     }
 
@@ -1188,27 +1246,27 @@ impl AACPManager {
     }
 
     /// Start the proprietary hi-res microphone stream (0x58 START).
-    pub async fn send_start_audio(&self) -> Result<()> {
+    pub async fn send_start_audio(&self) -> Result<(), AacpError> {
         self.send_packet(&AACP_START_AUDIO).await
     }
 
     /// Stop the proprietary hi-res microphone stream (0x58 STOP).
-    pub async fn send_stop_audio(&self) -> Result<()> {
+    pub async fn send_stop_audio(&self) -> Result<(), AacpError> {
         self.send_packet(&AACP_STOP_AUDIO).await
     }
 
-    pub async fn send_custom_eq(&self, custom_eq: &CustomEq) -> Result<()> {
+    pub async fn send_custom_eq(&self, custom_eq: &CustomEq) -> Result<(), AacpError> {
         self.send_data_packet(&custom_eq.to_packet()).await
     }
 
-    pub async fn send_notification_request(&self) -> Result<()> {
+    pub async fn send_notification_request(&self) -> Result<(), AacpError> {
         let opcode = [opcodes::REQUEST_NOTIFICATIONS, 0x00];
         let data = [0xFF, 0xFF, 0xFF, 0xFF];
         let packet = [opcode.as_slice(), data.as_slice()].concat();
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_set_feature_flags_packet(&self) -> Result<()> {
+    pub async fn send_set_feature_flags_packet(&self) -> Result<(), AacpError> {
         let opcode = [opcodes::SET_FEATURE_FLAGS, 0x00];
         // let data = [0xD7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let data = [0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // adaptive volume is actually useful, seeing if it works
@@ -1216,7 +1274,7 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_handshake(&self) -> Result<()> {
+    pub async fn send_handshake(&self) -> Result<(), AacpError> {
         let packet = [
             0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
@@ -1227,16 +1285,13 @@ impl AACPManager {
     pub async fn send_proximity_keys_request(
         &self,
         key_types: Vec<ProximityKeyType>,
-    ) -> Result<()> {
-        let opcode = [opcodes::PROXIMITY_KEYS_REQ, 0x00];
-        let mut data = Vec::with_capacity(2);
-        data.push(key_types.iter().fold(0u8, |acc, kt| acc | (*kt as u8)));
-        data.push(0x00);
-        let packet = [opcode.as_slice(), data.as_slice()].concat();
-        self.send_data_packet(&packet).await
+    ) -> Result<(), AacpError> {
+        let mask = key_types.iter().fold(0u8, |acc, kt| acc | (*kt as u8));
+        self.send_data_packet(&[opcodes::PROXIMITY_KEYS_REQ, 0x00, mask, 0x00])
+            .await
     }
 
-    pub async fn send_rename_packet(&self, name: &str) -> Result<()> {
+    pub async fn send_rename_packet(&self, name: &str) -> Result<(), AacpError> {
         let packet = rename_payload(name)?;
         self.send_data_packet(&packet).await
     }
@@ -1245,13 +1300,9 @@ impl AACPManager {
         &self,
         identifier: ControlCommandIdentifiers,
         value: &[u8],
-    ) -> Result<()> {
-        let opcode = [opcodes::CONTROL_COMMAND, 0x00];
-        let mut data = vec![identifier as u8];
-        for i in 0..4 {
-            data.push(value.get(i).copied().unwrap_or(0));
-        }
-        let packet = [opcode.as_slice(), data.as_slice()].concat();
+    ) -> Result<(), AacpError> {
+        let mut packet = vec![opcodes::CONTROL_COMMAND, 0x00, identifier as u8];
+        packet.extend((0..4).map(|i| value.get(i).copied().unwrap_or(0)));
         self.send_data_packet(&packet).await
     }
 
@@ -1259,7 +1310,7 @@ impl AACPManager {
         &self,
         self_mac_address: &str,
         target_mac_address: &str,
-    ) -> Result<()> {
+    ) -> Result<(), AacpError> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(112);
         buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
@@ -1290,7 +1341,7 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
+    pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<(), AacpError> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(106);
         buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
@@ -1325,13 +1376,16 @@ impl AACPManager {
         self_mac_address: &str,
         target_mac_address: &str,
         streaming_state: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AacpError> {
         let packet =
             media_information_payload(self_mac_address, target_mac_address, streaming_state)?;
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
+    pub async fn send_smart_routing_show_ui(
+        &self,
+        target_mac_address: &str,
+    ) -> Result<(), AacpError> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(134);
         buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
@@ -1363,36 +1417,11 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(97);
-        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
-        buffer.extend_from_slice(&[0x59, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE3]);
-        buffer.push(0x5F);
-        buffer.extend_from_slice(b"audioRoutingSetOwnershipToFalse");
-        buffer.push(0x01);
-        buffer.push(0x59);
-        buffer.extend_from_slice(b"audioRoutingShowReverseUI");
-        buffer.push(0x01);
-        buffer.push(0x46);
-        buffer.extend_from_slice(b"reason");
-        buffer.push(0x53);
-        buffer.extend_from_slice(b"ReverseBannerTapped");
-
-        while buffer.len() < 97 {
-            buffer.push(0x00);
-        }
-
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
-    }
-
     pub async fn send_add_tipi_device(
         &self,
         self_mac_address: &str,
         target_mac_address: &str,
-    ) -> Result<()> {
+    ) -> Result<(), AacpError> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(86);
         buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
@@ -1418,7 +1447,7 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
-    pub async fn send_some_packet(&self) -> Result<()> {
+    pub async fn send_some_packet(&self) -> Result<(), AacpError> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
             .await
     }
@@ -1440,10 +1469,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 if crate::bluetooth::aacp_audio::is_audio(data) {
                     // Device-level liveness for the hi-res stall watchdog.
                     manager.mic_status.mark_sdu();
-                    let audio_tx = {
-                        let state = manager.state.lock().await;
-                        state.audio_tx.clone()
-                    };
+                    let audio_tx = manager.state.lock().await.audio_tx.clone();
                     if let Some(tx) = audio_tx {
                         let _ = tx.try_send(data.to_vec());
                     }
@@ -1454,22 +1480,13 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 manager.receive_packet(data).await;
             },
             Err(e) => {
-                info!("Read error, the AirPods probably disconnected: {}", e);
+                info!("Read error, the AirPods probably disconnected: {e}");
                 break;
             },
         }
     }
     // Both exits end the connection: nothing read from it is current any more.
-    {
-        let mut state = manager.state.lock().await;
-        state.sender = None;
-        state.audio_tx = None;
-        state.owns = false;
-        state.connected_devices.clear();
-        state.control_command_status_list.clear();
-        state.ear_detection_status.clear();
-        state.battery_info.clear();
-    }
+    manager.state.lock().await.reset_connection();
     manager.disarm_hires_mic().await;
     manager.stop_connection_tasks();
 }
@@ -1483,12 +1500,12 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
                     debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
                     break;
                 },
-                Err(e) if e.raw_os_error() == Some(107) && attempts < 10 => {
+                Err(e) if e.kind() == io::ErrorKind::NotConnected && attempts < 10 => {
                     attempts += 1;
                     sleep(Duration::from_millis(100)).await;
                 },
                 Err(e) => {
-                    error!("Failed to send data: {}", e);
+                    error!("Failed to send data: {e}");
                     return;
                 },
             }
@@ -1497,49 +1514,22 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
     info!("Send thread finished.");
 }
 
-/// Persist one device record without blocking the runtime.
-async fn save_device(mac: String, data: DeviceData) {
-    let result = tokio::task::spawn_blocking(move || {
-        crate::utils::update_devices_file(|devices| {
-            devices.insert(mac, data);
-        })
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => {},
-        Ok(Err(e)) => error!("Failed to save devices: {}", e),
-        Err(e) => error!("Failed to save devices: {}", e),
-    }
-}
-
-fn connect_error(kind: std::io::ErrorKind, msg: &str) -> Error {
-    Error::from(std::io::Error::new(kind, msg))
-}
-
-fn invalid_input(msg: String) -> Error {
-    Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
-}
-
 /// A colon-separated MAC address as the 6 bytes AACP sends, least significant
 /// byte first.
-fn mac_to_wire(mac: &str) -> Result<[u8; 6]> {
+fn mac_to_wire(mac: &str) -> Result<[u8; 6], AacpError> {
     let addr: Address = mac
         .parse()
-        .map_err(|_| invalid_input(format!("invalid MAC address: {mac:?}")))?;
+        .map_err(|_| AacpError::InvalidMac(mac.to_string()))?;
     let mut bytes = addr.0;
     bytes.reverse();
     Ok(bytes)
 }
 
 /// Rename payload: opcode, 0x00, 0x01, name length (one byte), 0x00, name.
-fn rename_payload(name: &str) -> Result<Vec<u8>> {
+fn rename_payload(name: &str) -> Result<Vec<u8>, AacpError> {
     let name_bytes = name.as_bytes();
-    let size = u8::try_from(name_bytes.len()).map_err(|_| {
-        invalid_input(format!(
-            "name is {} bytes long, at most 255 fit in the rename packet",
-            name_bytes.len()
-        ))
-    })?;
+    let size =
+        u8::try_from(name_bytes.len()).map_err(|_| AacpError::NameTooLong(name_bytes.len()))?;
     let mut packet = Vec::with_capacity(5 + name_bytes.len());
     packet.extend_from_slice(&[opcodes::RENAME, 0x00, 0x01, size, 0x00]);
     packet.extend_from_slice(name_bytes);
@@ -1556,7 +1546,7 @@ fn media_information_payload(
     self_mac_address: &str,
     target_mac_address: &str,
     streaming_state: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, AacpError> {
     // The 0x51 tag below is for a 17 character address.
     mac_to_wire(self_mac_address)?;
     let (state_tag, state): (u8, &[u8]) = if streaming_state {
@@ -1586,8 +1576,7 @@ fn media_information_payload(
     body.extend_from_slice(b"otherDevice");
     body.extend_from_slice(b"AudioCategory");
     body.extend_from_slice(&[0x31, 0x2D, 0x01]);
-    let body_len = u16::try_from(body.len())
-        .map_err(|_| invalid_input(format!("media information is {} bytes", body.len())))?;
+    let body_len = u16::try_from(body.len()).map_err(|_| AacpError::BodyTooLong(body.len()))?;
 
     let mut packet = Vec::with_capacity(2 + 138);
     packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
@@ -1597,10 +1586,65 @@ fn media_information_payload(
     packet.resize(packet.len().max(2 + 138), 0x00);
     Ok(packet)
 }
+/// Fakes that let tests drive an `AACPManager` without Bluetooth or files.
+#[cfg(test)]
+pub(crate) mod testing {
+    use {
+        super::{AACPManager, DeviceStore},
+        crate::devices::enums::DeviceData,
+        std::{
+            collections::HashMap,
+            io,
+            sync::{Arc, Mutex},
+        },
+        tokio::sync::mpsc,
+    };
+
+    /// Device records in memory, with every save recorded in order.
+    #[derive(Default)]
+    pub(crate) struct MemoryStore {
+        pub(crate) initial: HashMap<String, DeviceData>,
+        pub(crate) saved: Mutex<Vec<(String, DeviceData)>>,
+    }
+
+    impl MemoryStore {
+        pub(crate) fn saved(&self) -> Vec<(String, DeviceData)> {
+            self.saved.lock().unwrap().clone()
+        }
+    }
+
+    impl DeviceStore for MemoryStore {
+        fn load(&self) -> HashMap<String, DeviceData> {
+            self.initial.clone()
+        }
+
+        fn save(&self, mac: String, data: DeviceData) -> Result<(), crate::utils::StorageError> {
+            self.saved.lock().unwrap().push((mac, data));
+            Ok(())
+        }
+    }
+
+    /// A manager over `store` whose outgoing packets land in the returned
+    /// receiver, as if connected.
+    pub(crate) async fn connected_manager(
+        store: Arc<MemoryStore>,
+    ) -> (AACPManager, mpsc::Receiver<Vec<u8>>) {
+        let manager = AACPManager::with_deps(store, false);
+        let (tx, rx) = mpsc::channel(64);
+        manager.attach_transport(tx).await;
+        (manager, rx)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::{
+            testing::{MemoryStore, connected_manager},
+            *,
+        },
+        proptest::prelude::*,
+    };
 
     #[test]
     fn media_information_length_counts_the_bytes_after_it() {
@@ -1676,5 +1720,904 @@ mod tests {
         assert!(rename_payload(&"a".repeat(256)).is_err());
         // 128 two-byte characters: 128 chars but 256 bytes.
         assert!(rename_payload(&"é".repeat(128)).is_err());
+    }
+
+    const AIRPODS_MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    /// Sample information packet from AirPods Pro 2, from the AAP definitions.
+    const INFORMATION_SAMPLE: &str = "040004001d0002d5000400416972506f64732050726f004133303438004170706c6520496e632e0051584e524848595850360036312e313836383034303030323030303030302e323731330036312e313836383034303030323030303030302e3237313300312e302e3000636f6d2e6170706c652e6163636573736f72792e757064617465722e6170702e3731004859394c5432454632364a59004833504c5748444a32364b3000363335373533360089312a6567a5400f84a3ca234947efd40b90d78436ae5946748d70273e66066a2589300035333935303630363400";
+
+    /// An AACP packet: the header, then `body` starting at the opcode.
+    fn packet(body: &[u8]) -> Vec<u8> {
+        [HEADER_BYTES.as_slice(), body].concat()
+    }
+
+    struct Harness {
+        manager: AACPManager,
+        store: Arc<MemoryStore>,
+        sent: mpsc::Receiver<Vec<u8>>,
+        events: mpsc::UnboundedReceiver<AACPEvent>,
+    }
+
+    impl Harness {
+        async fn with_store(store: MemoryStore) -> Self {
+            let store = Arc::new(store);
+            let (manager, sent) = connected_manager(store.clone()).await;
+            let (event_tx, events) = mpsc::unbounded_channel();
+            manager.set_event_channel(event_tx).await;
+            manager.state.lock().await.airpods_mac = Some(AIRPODS_MAC.parse().unwrap());
+            Self {
+                manager,
+                store,
+                sent,
+                events,
+            }
+        }
+
+        async fn new() -> Self {
+            Self::with_store(MemoryStore::default()).await
+        }
+
+        async fn receive(&self, body: &[u8]) {
+            self.manager.receive_packet(&packet(body)).await;
+        }
+
+        fn next_event(&mut self) -> AACPEvent {
+            self.events.try_recv().expect("an event was emitted")
+        }
+
+        fn assert_no_event(&mut self) {
+            if let Ok(event) = self.events.try_recv() {
+                panic!("unexpected event {event:?}");
+            }
+        }
+
+        fn next_sent(&mut self) -> Vec<u8> {
+            self.sent.try_recv().expect("a packet was sent")
+        }
+    }
+
+    fn airpods_record(le_keys: AirPodsLEKeys) -> DeviceData {
+        DeviceData {
+            name: "Old name".to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(AirPodsInformation {
+                le_keys,
+                ..AirPodsInformation::default()
+            })),
+        }
+    }
+
+    // Battery (0x04)
+
+    #[tokio::test]
+    async fn battery_sample_from_airpods_pro_2_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+        let expected = vec![
+            BatteryInfo {
+                component: BatteryComponent::Right,
+                level: 100,
+                status: BatteryStatus::NotCharging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Left,
+                level: 99,
+                status: BatteryStatus::Charging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 17,
+                status: BatteryStatus::NotCharging,
+            },
+        ];
+
+        h.receive(&[
+            0x04, 0x00, 0x03, 0x02, 0x01, 0x64, 0x02, 0x01, 0x04, 0x01, 0x63, 0x01, 0x01, 0x08,
+            0x01, 0x11, 0x02, 0x01,
+        ])
+        .await;
+
+        assert_eq!(h.manager.state.lock().await.battery_info, expected);
+        assert!(matches!(h.next_event(), AACPEvent::BatteryInfo(b) if b == expected));
+        assert!(h.manager.has_device_status().await);
+    }
+
+    #[tokio::test]
+    async fn battery_status_0x05_is_optimized_charging_and_counts_as_charging() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x04, 0x00, 0x01, 0x04, 0x01, 0x50, 0x05, 0x01])
+            .await;
+
+        let AACPEvent::BatteryInfo(batteries) = h.next_event() else {
+            panic!("expected a battery event");
+        };
+        assert_eq!(batteries.len(), 1);
+        assert_eq!(batteries[0].status, BatteryStatus::OptimizedCharging);
+        assert!(batteries[0].status.is_charging());
+        assert_eq!(batteries[0].level, 80);
+    }
+
+    #[tokio::test]
+    async fn battery_entries_with_unknown_component_or_status_are_skipped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[
+            0x04, 0x00, 0x03, 0x10, 0x01, 0x32, 0x01, 0x01, 0x02, 0x01, 0x33, 0x00, 0x01, 0x08,
+            0x01, 0x34, 0x04, 0x01,
+        ])
+        .await;
+
+        assert_eq!(
+            h.manager.state.lock().await.battery_info,
+            [BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 0x34,
+                status: BatteryStatus::Disconnected,
+            }]
+        );
+        assert!(matches!(h.next_event(), AACPEvent::BatteryInfo(_)));
+    }
+
+    #[tokio::test]
+    async fn battery_packet_shorter_than_its_count_is_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x04, 0x00, 0x02, 0x02, 0x01, 0x64, 0x02, 0x01])
+            .await;
+        h.receive(&[0x04, 0x00]).await;
+
+        assert!(h.manager.state.lock().await.battery_info.is_empty());
+        h.assert_no_event();
+    }
+
+    // Ear detection (0x06)
+
+    #[tokio::test]
+    async fn ear_detection_reports_the_previous_and_new_status() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x00, 0x01]).await;
+        h.receive(&[0x06, 0x00, 0x02, 0x03]).await;
+
+        let AACPEvent::EarDetection(old, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert!(old.is_empty());
+        assert_eq!(
+            new,
+            [EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar]
+        );
+        let AACPEvent::EarDetection(old, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert_eq!(
+            old,
+            [EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar]
+        );
+        assert_eq!(
+            new,
+            [EarDetectionStatus::InCase, EarDetectionStatus::Disconnected]
+        );
+        let state = h.manager.state.lock().await;
+        assert_eq!(state.old_ear_detection_status, old);
+        assert_eq!(state.ear_detection_status, new);
+    }
+
+    #[tokio::test]
+    async fn unknown_ear_detection_status_reads_as_out_of_ear() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x07, 0x00]).await;
+
+        let AACPEvent::EarDetection(_, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert_eq!(
+            new,
+            [EarDetectionStatus::OutOfEar, EarDetectionStatus::InEar]
+        );
+    }
+
+    #[tokio::test]
+    async fn short_ear_detection_packet_is_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x00]).await;
+
+        h.assert_no_event();
+        assert!(!h.manager.has_device_status().await);
+    }
+
+    // Control commands (0x09)
+
+    #[tokio::test]
+    async fn listening_mode_is_stored_emitted_and_sent_to_subscribers() {
+        let mut h = Harness::new().await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        h.manager
+            .subscribe_to_control_command(ControlCommandIdentifiers::ListeningMode, sub_tx)
+            .await;
+
+        // Noise control notification: 09 00 0D [mode] 00 00 00, 03 is transparency.
+        h.receive(&[0x09, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00]).await;
+
+        let expected = ControlCommandStatus {
+            identifier: ControlCommandIdentifiers::ListeningMode,
+            value: vec![0x03],
+        };
+        assert_eq!(
+            h.manager.state.lock().await.control_command_status_list,
+            std::slice::from_ref(&expected)
+        );
+        assert!(matches!(h.next_event(), AACPEvent::ControlCommand(s) if s == expected));
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x03]);
+    }
+
+    #[tokio::test]
+    async fn control_command_value_trims_trailing_zeros_only() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x1A, 0x03, 0x00, 0x01, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00]).await;
+
+        let state = h.manager.state.lock().await;
+        let value = |id| {
+            state
+                .control_command_status_list
+                .iter()
+                .find(|s| s.identifier == id)
+                .map(|s| s.value.clone())
+        };
+        assert_eq!(
+            value(ControlCommandIdentifiers::ListeningModeConfigs),
+            Some(vec![0x03, 0x00, 0x01])
+        );
+        assert_eq!(
+            value(ControlCommandIdentifiers::ChimeVolume),
+            Some(vec![0x00])
+        );
+    }
+
+    #[tokio::test]
+    async fn control_command_update_replaces_the_stored_value() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00]).await;
+        assert!(h.manager.conversation_detection_enabled().await);
+        h.receive(&[0x09, 0x00, 0x28, 0x02, 0x00, 0x00, 0x00]).await;
+
+        assert!(!h.manager.conversation_detection_enabled().await);
+        assert_eq!(
+            h.manager
+                .state
+                .lock()
+                .await
+                .control_command_status_list
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn owns_connection_command_sets_ownership() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00]).await;
+        assert!(h.manager.state.lock().await.owns);
+        h.receive(&[0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]).await;
+
+        assert!(!h.manager.state.lock().await.owns);
+    }
+
+    #[tokio::test]
+    async fn unknown_or_short_control_commands_are_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x7F, 0x01, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x0D, 0x03, 0x00, 0x00]).await;
+
+        h.assert_no_event();
+        assert!(
+            h.manager
+                .state
+                .lock()
+                .await
+                .control_command_status_list
+                .is_empty()
+        );
+    }
+
+    // Conversation awareness (0x4B)
+
+    #[tokio::test]
+    async fn conversation_awareness_level_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01, 0x03]).await;
+
+        assert_eq!(
+            h.manager.state.lock().await.conversational_awareness_status,
+            0x03
+        );
+        assert!(matches!(
+            h.next_event(),
+            AACPEvent::ConversationalAwareness(0x03)
+        ));
+    }
+
+    #[tokio::test]
+    async fn conversation_awareness_of_another_length_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01]).await;
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01, 0x03, 0x00]).await;
+
+        h.assert_no_event();
+    }
+
+    // Information (0x1D)
+
+    #[test]
+    fn information_sample_is_parsed_field_by_field() {
+        let sample = hex::decode(INFORMATION_SAMPLE).unwrap();
+
+        let Some(Incoming::Information(info)) = parse_packet(&sample) else {
+            panic!("expected information");
+        };
+
+        assert_eq!(
+            *info,
+            AirPodsInformation {
+                name: "AirPods Pro".to_string(),
+                model_number: "A3048".to_string(),
+                manufacturer: "Apple Inc.".to_string(),
+                serial_number: "QXNRHHYXP6".to_string(),
+                version1: "61.1868040002000000.2713".to_string(),
+                version2: "61.1868040002000000.2713".to_string(),
+                hardware_revision: "1.0.0".to_string(),
+                updater_identifier: "com.apple.accessory.updater.app.71".to_string(),
+                left_serial_number: "HY9LT2EF26JY".to_string(),
+                right_serial_number: "H3PLWHDJ26K0".to_string(),
+                version3: "6357536".to_string(),
+                le_keys: AirPodsLEKeys::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn information_skips_a_leading_run_before_the_first_zero() {
+        let parsed = parse_information(b"\x1d\x00\x02\x00junk\x00skipped\x00Name\x00A1\x00");
+
+        let info = parsed.unwrap();
+        assert_eq!(info.name, "Name");
+        assert_eq!(info.model_number, "A1");
+        assert_eq!(info.version3, "");
+    }
+
+    #[test]
+    fn information_without_strings_or_too_short_is_dropped() {
+        assert!(parse_information(&[0x1D, 0x00, 0x02, 0x00, 0x00, 0x00]).is_none());
+        assert!(parse_information(&[0x1D, 0x00, 0x02, 0x00, 0x00]).is_none());
+    }
+
+    #[tokio::test]
+    async fn information_updates_the_record_and_keeps_its_le_keys() {
+        let keys = AirPodsLEKeys {
+            irk: "01".repeat(16),
+            enc_key: "02".repeat(16),
+        };
+        let store = MemoryStore {
+            initial: HashMap::from([(AIRPODS_MAC.to_string(), airpods_record(keys.clone()))]),
+            ..MemoryStore::default()
+        };
+        let h = Harness::with_store(store).await;
+
+        h.manager
+            .receive_packet(&hex::decode(INFORMATION_SAMPLE).unwrap())
+            .await;
+
+        let saved = h.store.saved();
+        assert_eq!(saved.len(), 1);
+        let (mac, data) = &saved[0];
+        assert_eq!(mac, AIRPODS_MAC);
+        assert_eq!(data.name, "AirPods Pro");
+        let Some(DeviceInformation::AirPods(info)) = &data.information else {
+            panic!("expected AirPods information");
+        };
+        assert_eq!(info.model_number, "A3048");
+        assert_eq!(info.le_keys, keys);
+        assert_eq!(h.manager.state.lock().await.devices[AIRPODS_MAC], *data);
+    }
+
+    #[tokio::test]
+    async fn information_for_airpods_without_a_record_is_not_saved() {
+        let h = Harness::new().await;
+
+        h.manager
+            .receive_packet(&hex::decode(INFORMATION_SAMPLE).unwrap())
+            .await;
+
+        assert!(h.store.saved().is_empty());
+        assert!(h.manager.state.lock().await.devices.is_empty());
+    }
+
+    // Proximity keys (0x31)
+
+    /// Keys response as the Qt client parses it: count 2, then an IRK (type
+    /// 0x01) and an encryption key (type 0x04), each with a 16 byte length.
+    fn proximity_keys_body() -> Vec<u8> {
+        let mut body = vec![0x31, 0x00, 0x02, 0x01, 0x00, 0x10, 0x00];
+        body.extend([0x11; 16]);
+        body.extend([0x04, 0x00, 0x10, 0x00]);
+        body.extend([0x22; 16]);
+        body
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_start_a_record_for_new_airpods() {
+        let h = Harness::new().await;
+
+        h.receive(&proximity_keys_body()).await;
+
+        let saved = h.store.saved();
+        assert_eq!(saved.len(), 1);
+        let (mac, data) = &saved[0];
+        assert_eq!(mac, AIRPODS_MAC);
+        assert_eq!(data.name, AIRPODS_MAC);
+        assert_eq!(data.type_, DeviceType::AirPods);
+        let Some(DeviceInformation::AirPods(info)) = &data.information else {
+            panic!("expected AirPods information");
+        };
+        assert_eq!(info.le_keys.irk, "11".repeat(16));
+        assert_eq!(info.le_keys.enc_key, "22".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_keep_the_rest_of_an_existing_record() {
+        let store = MemoryStore {
+            initial: HashMap::from([(
+                AIRPODS_MAC.to_string(),
+                airpods_record(AirPodsLEKeys::default()),
+            )]),
+            ..MemoryStore::default()
+        };
+        let h = Harness::with_store(store).await;
+
+        h.receive(&proximity_keys_body()).await;
+
+        let (_, data) = &h.store.saved()[0];
+        assert_eq!(data.name, "Old name");
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_without_a_connected_mac_are_not_saved() {
+        let h = Harness::new().await;
+        h.manager.state.lock().await.airpods_mac = None;
+
+        h.receive(&proximity_keys_body()).await;
+
+        assert!(h.store.saved().is_empty());
+    }
+
+    #[test]
+    fn proximity_keys_running_past_the_end_are_dropped() {
+        let body = proximity_keys_body();
+
+        assert!(parse_proximity_keys(&body[..body.len() - 1]).is_none());
+        // The second key's header cut short.
+        assert!(parse_proximity_keys(&body[..3 + 4 + 16 + 3]).is_none());
+        assert!(parse_proximity_keys(&[0x31, 0x00, 0x01]).is_none());
+        assert_eq!(parse_proximity_keys(&body).map(|k| k.len()), Some(2));
+    }
+
+    // Stem press (0x19)
+
+    #[tokio::test]
+    async fn stem_press_emits_the_press_and_the_bud() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x19, 0x00, 0x06, 0x02]).await;
+
+        assert!(matches!(
+            h.next_event(),
+            AACPEvent::StemPress(StemPressType::Double, StemPressBudType::Right)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stem_press_with_unknown_type_or_bud_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x19, 0x00, 0x09, 0x01]).await;
+        h.receive(&[0x19, 0x00, 0x05, 0x03]).await;
+        h.receive(&[0x19, 0x00, 0x05]).await;
+
+        h.assert_no_event();
+    }
+
+    // Audio source (0x0E)
+
+    #[tokio::test]
+    async fn audio_source_mac_is_read_least_significant_byte_first() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x0E, 0x00, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x02])
+            .await;
+        let unknown_type = parse_audio_source(&[0x0E, 0x00, 1, 2, 3, 4, 5, 6, 0x09]);
+
+        assert_eq!(
+            h.manager.state.lock().await.audio_source,
+            Some(AudioSource {
+                mac: "11:22:33:44:55:66".to_string(),
+                r#type: AudioSourceType::Media,
+            })
+        );
+        assert_eq!(unknown_type.unwrap().r#type, AudioSourceType::None);
+    }
+
+    // Connected devices (0x2E)
+
+    #[tokio::test]
+    async fn connected_devices_replace_the_list_and_report_the_old_one() {
+        let mut h = Harness::new().await;
+        let first = ConnectedDevice {
+            mac: "11:22:33:44:55:66".to_string(),
+            info1: 0x01,
+            info2: 0x02,
+            r#type: None,
+        };
+        let second = ConnectedDevice {
+            mac: "A1:B2:C3:D4:E5:F6".to_string(),
+            info1: 0x03,
+            info2: 0x04,
+            r#type: None,
+        };
+
+        h.receive(&[
+            0x2E, 0x00, 0x01, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02,
+        ])
+        .await;
+        h.receive(&[
+            0x2E, 0x00, 0x02, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02, 0xA1,
+            0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x03, 0x04,
+        ])
+        .await;
+
+        let _ = h.next_event();
+        let AACPEvent::ConnectedDevices(old, new) = h.next_event() else {
+            panic!("expected a connected devices event");
+        };
+        assert_eq!(old, std::slice::from_ref(&first));
+        assert_eq!(new, [first, second]);
+        assert_eq!(h.manager.state.lock().await.connected_devices, new);
+    }
+
+    #[tokio::test]
+    async fn connected_devices_shorter_than_their_count_are_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[
+            0x2E, 0x00, 0x02, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02,
+        ])
+        .await;
+
+        h.assert_no_event();
+    }
+
+    // Smart routing response (0x11)
+
+    #[tokio::test]
+    async fn smart_routing_ownership_to_false_is_emitted() {
+        let mut h = Harness::new().await;
+        let mut body = vec![0x11, 0x00];
+        body.extend_from_slice(b"\x01\x02audioRoutingSetOwnershipToFalse\x01");
+
+        h.receive(&body).await;
+        h.receive(b"\x11\x00otherKey").await;
+
+        assert!(matches!(h.next_event(), AACPEvent::OwnershipToFalseRequest));
+        h.assert_no_event();
+    }
+
+    // Custom EQ (0x63)
+
+    #[tokio::test]
+    async fn custom_eq_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+        let expected = CustomEq {
+            enabled: true,
+            low: 65,
+            mid: 50,
+            high: 70,
+        };
+
+        h.receive(&[0x63, 0x00, 0x05, 0x00, 0x01, 0x02, 0x41, 0x32, 0x46])
+            .await;
+
+        assert_eq!(h.manager.state.lock().await.custom_eq, Some(expected));
+        assert!(matches!(h.next_event(), AACPEvent::CustomEq(eq) if eq == expected));
+    }
+
+    #[tokio::test]
+    async fn malformed_custom_eq_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x63, 0x00, 0x05, 0x00, 0x01, 0x02, 101, 50, 50])
+            .await;
+
+        assert_eq!(h.manager.state.lock().await.custom_eq, None);
+        h.assert_no_event();
+    }
+
+    // Framing
+
+    #[tokio::test]
+    async fn packets_without_header_or_opcode_and_unknown_opcodes_are_ignored() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .receive_packet(&[0x05, 0x00, 0x04, 0x00, 0x04, 0x00, 0x01])
+            .await;
+        h.manager.receive_packet(&HEADER_BYTES).await;
+        h.manager.receive_packet(&[]).await;
+        h.receive(&[0x53, 0x00, 0x01]).await;
+        h.receive(&[0x7E, 0x00]).await;
+
+        h.assert_no_event();
+    }
+
+    #[tokio::test]
+    async fn reset_connection_forgets_what_the_connection_reported() {
+        let h = Harness::new().await;
+        h.receive(&[0x04, 0x00, 0x01, 0x02, 0x01, 0x64, 0x02, 0x01])
+            .await;
+        h.receive(&[0x06, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00]).await;
+
+        h.manager.state.lock().await.reset_connection();
+
+        let state = h.manager.state.lock().await;
+        assert!(state.sender.is_none());
+        assert!(!state.owns);
+        assert!(state.battery_info.is_empty());
+        assert!(state.ear_detection_status.is_empty());
+        assert!(state.control_command_status_list.is_empty());
+        drop(state);
+        assert!(!h.manager.has_device_status().await);
+    }
+
+    const KNOWN_OPCODES: [u8; 12] = [
+        opcodes::BATTERY_INFO,
+        opcodes::CONTROL_COMMAND,
+        opcodes::EAR_DETECTION,
+        opcodes::CONVERSATION_AWARENESS,
+        opcodes::INFORMATION,
+        opcodes::PROXIMITY_KEYS_RSP,
+        opcodes::STEM_PRESS,
+        opcodes::AUDIO_SOURCE,
+        opcodes::CONNECTED_DEVICES,
+        opcodes::SMART_ROUTING_RESP,
+        opcodes::EQ_DATA,
+        opcodes::CUSTOM_EQ,
+    ];
+
+    /// Run `packet` through `receive_packet` on a fresh manager.
+    fn receive_on_fresh_manager(packet: &[u8]) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let h = Harness::new().await;
+                h.manager.receive_packet(packet).await;
+            });
+    }
+
+    proptest! {
+        #[test]
+        fn receive_packet_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            receive_on_fresh_manager(&bytes);
+        }
+
+        #[test]
+        fn receive_packet_never_panics_on_known_opcodes_with_any_body(
+            opcode in proptest::sample::select(KNOWN_OPCODES.as_slice()),
+            // Small counts and lengths so the count and length fields often
+            // point just inside or just past the end.
+            body in proptest::collection::vec(
+                prop_oneof![0u8..=4, any::<u8>()],
+                0..300,
+            ),
+        ) {
+            receive_on_fresh_manager(&packet(&[&[opcode][..], &body].concat()));
+        }
+    }
+
+    // Commands sent to the AirPods
+
+    #[tokio::test]
+    async fn control_command_is_padded_to_four_value_bytes() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .send_control_command(ControlCommandIdentifiers::ListeningMode, &[0x02])
+            .await
+            .unwrap();
+        h.manager
+            .send_control_command(
+                ControlCommandIdentifiers::ClickHoldMode,
+                &[0x01, 0x05, 0x07, 0x08, 0x09],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00
+            ]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x16, 0x01, 0x05, 0x07, 0x08
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_sends_the_length_prefixed_name() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_rename_packet("Pods").await.unwrap();
+
+        assert_eq!(h.next_sent(), packet(b"\x1a\x00\x01\x04\x00Pods"));
+    }
+
+    #[tokio::test]
+    async fn rename_with_a_long_name_fails_before_sending() {
+        let mut h = Harness::new().await;
+
+        let result = h.manager.send_rename_packet(&"a".repeat(256)).await;
+
+        assert!(matches!(result, Err(AacpError::NameTooLong(256))));
+        assert!(h.sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn setup_requests_match_the_captured_packets() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_notification_request().await.unwrap();
+        h.manager
+            .send_proximity_keys_request(vec![ProximityKeyType::Irk, ProximityKeyType::EncKey])
+            .await
+            .unwrap();
+        h.manager.send_handshake().await.unwrap();
+
+        assert_eq!(
+            h.next_sent(),
+            [0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [0x04, 0x00, 0x04, 0x00, 0x30, 0x00, 0x05, 0x00]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hi_res_audio_start_and_stop_are_sent_as_is() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_start_audio().await.unwrap();
+        h.manager.send_stop_audio().await.unwrap();
+
+        assert_eq!(h.next_sent(), AACP_START_AUDIO);
+        assert_eq!(h.next_sent(), AACP_STOP_AUDIO);
+    }
+
+    #[tokio::test]
+    async fn media_information_is_sent_with_the_header() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .send_media_information("11:22:33:44:55:66", AIRPODS_MAC, true)
+            .await
+            .unwrap();
+
+        let expected = media_information_payload("11:22:33:44:55:66", AIRPODS_MAC, true).unwrap();
+        assert_eq!(h.next_sent(), packet(&expected));
+    }
+
+    #[tokio::test]
+    async fn hijack_request_length_counts_the_body_before_the_padding() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_hijack_request(AIRPODS_MAC).await.unwrap();
+
+        let sent = h.next_sent();
+        assert_eq!(sent.len(), 4 + 2 + 106);
+        assert_eq!(sent[4..6], [opcodes::SMART_ROUTING, 0x00]);
+        assert_eq!(sent[6..12], [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]);
+        let len = usize::from(u16::from_le_bytes([sent[12], sent[13]]));
+        let body = &sent[14..14 + len];
+        assert!(body.ends_with(b"remotescore\xa5"));
+        assert!(sent[14 + len..].iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn smart_routing_with_a_malformed_mac_fails_before_sending() {
+        let mut h = Harness::new().await;
+
+        let result = h.manager.send_hijack_request("not a mac").await;
+
+        assert!(matches!(result, Err(AacpError::InvalidMac(mac)) if mac == "not a mac"));
+        assert!(h.sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn send_without_a_connection_fails_with_not_connected() {
+        let manager = AACPManager::with_deps(Arc::new(MemoryStore::default()), false);
+
+        let result = manager.send_notification_request().await;
+
+        assert!(matches!(result, Err(AacpError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn send_after_the_socket_task_ended_fails_with_channel_closed() {
+        let Harness { manager, sent, .. } = Harness::new().await;
+        drop(sent);
+
+        let result = manager.send_notification_request().await;
+
+        assert!(matches!(result, Err(AacpError::SendChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn set_conversation_detection_sends_and_records_the_setting() {
+        let mut h = Harness::new().await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        h.manager
+            .subscribe_to_control_command(
+                ControlCommandIdentifiers::ConversationDetectConfig,
+                sub_tx,
+            )
+            .await;
+
+        h.manager.set_conversation_detection(true).await;
+
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00
+            ]
+        );
+        assert!(h.manager.conversation_detection_enabled().await);
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x01]);
+        assert!(matches!(h.next_event(), AACPEvent::ControlCommand(_)));
+    }
+
+    #[tokio::test]
+    async fn subscriber_gets_the_current_value_first() {
+        let h = Harness::new().await;
+        h.receive(&[0x09, 0x00, 0x34, 0x01, 0x00, 0x00, 0x00]).await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+
+        h.manager
+            .subscribe_to_control_command(ControlCommandIdentifiers::AllowOffOption, sub_tx)
+            .await;
+
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x01]);
     }
 }

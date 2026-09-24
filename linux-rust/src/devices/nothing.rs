@@ -1,142 +1,146 @@
 use {
     crate::{
-        bluetooth::att::{ATTHandles, ATTManager},
+        bluetooth::{
+            att::{ATTHandles, ATTManager, AttError},
+            l2cap::ConnectError,
+        },
         devices::enums::{DeviceData, DeviceInformation, DeviceType},
         ui::messages::BluetoothUIMessage,
-        utils::{get_devices_path, update_devices_file},
+        utils::update_devices_file,
     },
     bluer::Address,
     serde::{Deserialize, Serialize},
-    std::{collections::HashMap, time::Duration},
+    std::time::Duration,
     tokio::{sync::mpsc, time::sleep},
     tracing::{debug, error, info},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Asks for the firmware version, answered with `FIRMWARE_VERSION_PREFIX`.
+const REQUEST_FIRMWARE_VERSION: [u8; 10] =
+    [0x55, 0x20, 0x01, 0x42, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Asks for the serial number, answered with `SERIAL_NUMBER_PREFIX`.
+const REQUEST_SERIAL_NUMBER: [u8; 10] =
+    [0x55, 0x20, 0x01, 0x06, 0xC0, 0x00, 0x00, 0x13, 0x00, 0x00];
+const FIRMWARE_VERSION_PREFIX: [u8; 5] = [0x55, 0x20, 0x01, 0x42, 0x40];
+const SERIAL_NUMBER_PREFIX: [u8; 5] = [0x55, 0x20, 0x01, 0x06, 0x40];
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct NothingInformation {
     pub serial_number: String,
     pub firmware_version: String,
 }
 
+/// Why connected Nothing earbuds could not be set up. The cause is part of the
+/// message because the callers log these with `{}`.
+#[derive(Debug, thiserror::Error)]
+pub enum NothingSetupError {
+    #[error("opening the ATT channel failed: {0}")]
+    Connect(ConnectError),
+    #[error("requesting the firmware version failed: {0}")]
+    RequestFirmwareVersion(AttError),
+    #[error("requesting the serial number failed: {0}")]
+    RequestSerialNumber(AttError),
+}
+
+/// A notification from the earbuds on the read handle, decoded.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    FirmwareVersion(String),
+    SerialNumber(String),
+    /// A serial number response whose serial does not start with "SH".
+    UnexpectedSerialNumber,
+}
+
+/// The firmware version follows the 8 byte header. The serial number starts
+/// at the first 'S' (byte 8 when there is none), must continue with 'H', and
+/// ends before the next newline or at the end.
+fn parse_report(data: &[u8]) -> Option<Report> {
+    if data.starts_with(&FIRMWARE_VERSION_PREFIX) {
+        let version_bytes = data.get(8..)?;
+        return Some(Report::FirmwareVersion(
+            String::from_utf8_lossy(version_bytes).into_owned(),
+        ));
+    }
+    if !data.starts_with(&SERIAL_NUMBER_PREFIX) {
+        return None;
+    }
+    let start = data.iter().position(|&b| b == b'S').unwrap_or(8);
+    if data.get(start + 1) != Some(&b'H') {
+        return Some(Report::UnexpectedSerialNumber);
+    }
+    let end = data[start..]
+        .iter()
+        .position(|&b| b == 0x0A)
+        .map_or(data.len(), |pos| pos + start);
+    Some(Report::SerialNumber(
+        String::from_utf8_lossy(&data[start..end]).into_owned(),
+    ))
+}
+
 pub struct NothingDevice {
     pub att_manager: ATTManager,
-    pub information: NothingInformation,
 }
 
 impl NothingDevice {
     pub async fn new(
         mac_address: Address,
-        ui_tx: mpsc::UnboundedSender<BluetoothUIMessage>,
-    ) -> bluer::Result<Self> {
+        _ui_tx: mpsc::UnboundedSender<BluetoothUIMessage>,
+    ) -> Result<Self, NothingSetupError> {
         let mut att_manager = ATTManager::new();
-        att_manager.connect(mac_address).await?;
+        att_manager
+            .connect(mac_address)
+            .await
+            .map_err(NothingSetupError::Connect)?;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
         att_manager
             .register_listener(ATTHandles::NothingEverythingRead, tx)
             .await;
 
-        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let device_key = mac_address.to_string();
-        let information = if let Some(device_data) = devices.get(&device_key) {
-            let info = device_data.information.clone();
-            if let Some(DeviceInformation::Nothing(ref nothing_info)) = info {
-                nothing_info.clone()
-            } else {
-                NothingInformation {
-                    serial_number: String::new(),
-                    firmware_version: String::new(),
-                }
-            }
-        } else {
-            NothingInformation {
-                serial_number: String::new(),
-                firmware_version: String::new(),
-            }
-        };
-
-        // Request version information
         att_manager
-            .write(
-                ATTHandles::NothingEverything,
-                &[
-                    0x55, 0x20, 0x01, 0x42, 0xC0, 0x00, 0x00, 0x00, 0x00,
-                    0x00, // something, idk
-                ],
-            )
-            .await?;
+            .write(ATTHandles::NothingEverything, &REQUEST_FIRMWARE_VERSION)
+            .await
+            .map_err(NothingSetupError::RequestFirmwareVersion)?;
 
         sleep(Duration::from_millis(100)).await;
 
-        // Request serial number
         att_manager
-            .write(
-                ATTHandles::NothingEverything,
-                &[0x55, 0x20, 0x01, 0x06, 0xC0, 0x00, 0x00, 0x13, 0x00, 0x00],
-            )
-            .await?;
+            .write(ATTHandles::NothingEverything, &REQUEST_SERIAL_NUMBER)
+            .await
+            .map_err(NothingSetupError::RequestSerialNumber)?;
 
-        // let ui_tx_clone = ui_tx.clone();
+        let device_key = mac_address.to_string();
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                if data.starts_with(&[0x55, 0x20, 0x01, 0x42, 0x40]) {
-                    let Some(version_bytes) = data.get(8..) else {
-                        continue;
-                    };
-                    let firmware_version = String::from_utf8_lossy(version_bytes).to_string();
-                    info!(
-                        "Received firmware version from Nothing device {}: {}",
-                        mac_address, firmware_version
-                    );
-                    save_nothing_info(device_key.clone(), move |info| {
-                        info.firmware_version = firmware_version;
-                    });
-                } else if data.starts_with(&[0x55, 0x20, 0x01, 0x06, 0x40]) {
-                    let serial_number_start_position = data
-                        .iter()
-                        .position(|&b| b == "S".as_bytes()[0])
-                        .unwrap_or(8);
-                    let serial_number_end = data
-                        .iter()
-                        .skip(serial_number_start_position)
-                        .position(|&b| b == 0x0A)
-                        .map(|pos| pos + serial_number_start_position)
-                        .unwrap_or(data.len());
-                    if data.get(serial_number_start_position + 1) == Some(&"H".as_bytes()[0]) {
-                        let serial_number = String::from_utf8_lossy(
-                            &data[serial_number_start_position..serial_number_end],
-                        )
-                        .to_string();
+                match parse_report(&data) {
+                    Some(Report::FirmwareVersion(firmware_version)) => {
                         info!(
-                            "Received serial number from Nothing device {}: {}",
-                            mac_address, serial_number
+                            "Received firmware version from Nothing device {mac_address}: {firmware_version}"
+                        );
+                        save_nothing_info(device_key.clone(), move |info| {
+                            info.firmware_version = firmware_version;
+                        });
+                    },
+                    Some(Report::SerialNumber(serial_number)) => {
+                        info!(
+                            "Received serial number from Nothing device {mac_address}: {serial_number}"
                         );
                         save_nothing_info(device_key.clone(), move |info| {
                             info.serial_number = serial_number;
                         });
-                    } else {
+                    },
+                    Some(Report::UnexpectedSerialNumber) => {
                         debug!(
-                            "Serial number format unexpected from Nothing device {}: {:?}",
-                            mac_address, data
+                            "Serial number format unexpected from Nothing device {mac_address}: {data:?}"
                         );
-                    }
+                    },
+                    None => {},
                 }
-
-                debug!(
-                    "Received data from (Nothing) device {}, data: {:?}",
-                    mac_address, data
-                );
+                debug!("Received data from (Nothing) device {mac_address}, data: {data:?}");
             }
         });
 
-        Ok(NothingDevice {
-            att_manager,
-            information,
-        })
+        Ok(NothingDevice { att_manager })
     }
 }
 
@@ -158,7 +162,74 @@ fn save_nothing_info(key: String, update: impl FnOnce(&mut NothingInformation) +
             }
         });
         if let Err(e) = result {
-            error!("Failed to save Nothing device information: {}", e);
+            error!("Failed to save Nothing device information: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_prefix(prefix: [u8; 5], rest: &[u8]) -> Vec<u8> {
+        [prefix.as_slice(), rest].concat()
+    }
+
+    #[test]
+    fn firmware_version_is_the_text_after_the_header() {
+        let data = with_prefix(FIRMWARE_VERSION_PREFIX, b"\x00\x00\x001.0.2.3");
+
+        assert_eq!(
+            parse_report(&data),
+            Some(Report::FirmwareVersion("1.0.2.3".to_string()))
+        );
+    }
+
+    #[test]
+    fn firmware_version_header_without_text_is_empty_or_ignored() {
+        let header_only = with_prefix(FIRMWARE_VERSION_PREFIX, &[0x00, 0x00, 0x00]);
+        assert_eq!(
+            parse_report(&header_only),
+            Some(Report::FirmwareVersion(String::new()))
+        );
+        let short = with_prefix(FIRMWARE_VERSION_PREFIX, &[0x00]);
+        assert_eq!(parse_report(&short), None);
+    }
+
+    #[test]
+    fn serial_number_runs_from_sh_to_the_newline() {
+        let data = with_prefix(SERIAL_NUMBER_PREFIX, b"\x00\x00\x00\x07SH12345\nrest");
+
+        assert_eq!(
+            parse_report(&data),
+            Some(Report::SerialNumber("SH12345".to_string()))
+        );
+    }
+
+    #[test]
+    fn serial_number_without_newline_runs_to_the_end() {
+        let data = with_prefix(SERIAL_NUMBER_PREFIX, b"\x00\x00\x00SH9");
+
+        assert_eq!(
+            parse_report(&data),
+            Some(Report::SerialNumber("SH9".to_string()))
+        );
+    }
+
+    #[test]
+    fn serial_number_not_starting_with_sh_is_unexpected() {
+        let wrong_letter = with_prefix(SERIAL_NUMBER_PREFIX, b"\x00\x00\x00SX123");
+        assert_eq!(
+            parse_report(&wrong_letter),
+            Some(Report::UnexpectedSerialNumber)
+        );
+        let no_s = with_prefix(SERIAL_NUMBER_PREFIX, b"\x00\x00");
+        assert_eq!(parse_report(&no_s), Some(Report::UnexpectedSerialNumber));
+    }
+
+    #[test]
+    fn other_notifications_are_ignored() {
+        assert_eq!(parse_report(&[]), None);
+        assert_eq!(parse_report(&[0x55, 0x60, 0x01, 0x0F, 0xF0, 0x03]), None);
+    }
 }
