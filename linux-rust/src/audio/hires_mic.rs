@@ -303,7 +303,7 @@ fn spawn_decode_thread(
                 let peak = if pcm.is_empty() {
                     0.0
                 } else {
-                    match output.write(&pcm) {
+                    match output.write(&mut pcm) {
                         Ok(peak) => peak,
                         Err(()) => {
                             warn!("hi-res output broke; stopping decode loop");

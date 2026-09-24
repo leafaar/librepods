@@ -114,17 +114,13 @@ impl Output {
         Some(Output { fifo, agc })
     }
 
-    // Write s16 PCM into the FIFO, returning the (post-AGC) peak
-    pub fn write(&mut self, pcm: &[i16]) -> Result<f32, ()> {
-        let processed;
-        let pcm: &[i16] = if let Some(agc) = &mut self.agc {
-            let mut buf = pcm.to_vec();
-            agc.process(&mut buf);
-            processed = buf;
-            &processed
-        } else {
-            pcm
-        };
+    // Write s16 PCM into the FIFO, returning the (post-AGC) peak. AGC runs in
+    // place on `pcm`.
+    pub fn write(&mut self, pcm: &mut [i16]) -> Result<f32, ()> {
+        if let Some(agc) = &mut self.agc {
+            agc.process(pcm);
+        }
+        let pcm: &[i16] = pcm;
 
         let peak = pcm
             .iter()
@@ -137,17 +133,19 @@ impl Output {
             std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
         };
 
-        for chunk in bytes.chunks(PIPE_BUF) {
-            match self.fifo.write(chunk) {
-                Ok(_) => {}
-                // Nobody is draining the pipe: drop the rest of this block
-                // rather than block the decode thread.
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                    break;
-                }
-                Err(e) => {
-                    error!("hi-res fifo write broke: {}", e);
-                    return Err(());
+        'chunks: for chunk in bytes.chunks(PIPE_BUF) {
+            loop {
+                match self.fifo.write(chunk) {
+                    Ok(_) => break,
+                    // A signal arrived before anything was written: retry this chunk.
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    // Nobody is draining the pipe: drop the rest of this block
+                    // rather than block the decode thread.
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break 'chunks,
+                    Err(e) => {
+                        error!("hi-res fifo write broke: {}", e);
+                        return Err(());
+                    }
                 }
             }
         }
