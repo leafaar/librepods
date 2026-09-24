@@ -48,23 +48,9 @@
               libpulseaudio
               # libavcodec/libavutil for the hi-res microphone's AAC-ELD decoder
               ffmpeg-headless
-              alsa-lib
               bluez
-
-              # https://github.com/max-privatevoid/iced/blob/master/DEPENDENCIES.md
-              expat
-              fontconfig
-              freetype
-              freetype.dev
-              libGL
-              pkg-config
-              xorg.libX11
-              xorg.libXcursor
-              xorg.libXi
-              xorg.libXrandr
-              wayland
-              libxkbcommon
-              vulkan-loader
+              gtk4
+              libadwaita
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
               pkgs.libiconv
@@ -72,9 +58,10 @@
 
           nativeBuildInputs = with pkgs; [
             pkg-config
-            makeWrapper
             # libclang for ffmpeg-sys-next's bindgen step
             rustPlatform.bindgenHook
+            # Points the installed binary at GTK's schemas, icons and modules.
+            wrapGAppsHook4
           ];
 
           # Build with the same toolchain the repo pins for everyone else.
@@ -110,11 +97,6 @@
 
               doCheck = false;
 
-              # Wrap the binary after build to set runtime library path
-              postInstall = ''
-                wrapProgram $out/bin/librepods \
-                  --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath buildInputs}
-              '';
 
               meta = {
                 description = "AirPods liberated from Apple's ecosystem";
@@ -167,7 +149,6 @@
               ]
               ++ buildInputs;
 
-            LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
           };
 
           treefmt = {
