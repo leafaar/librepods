@@ -517,3 +517,164 @@ pub struct AirPodsInformation {
     pub version3: String,
     pub le_keys: AirPodsLEKeys,
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::bluetooth::aacp::testing::{MemoryStore, connected_manager},
+        std::sync::Arc,
+        tokio::{sync::mpsc, time::Instant},
+    };
+
+    const HANDSHAKE: [u8; 16] = [
+        0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const FEATURE_FLAGS: [u8; 14] = [
+        0x04, 0x00, 0x04, 0x00, 0x4D, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const NOTIFICATION_REQUEST: [u8; 10] =
+        [0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+
+    /// Everything sent while `run` runs, with the time since the start at which
+    /// it was sent. `reply` is called with the number of packets sent so far and
+    /// may return a packet for the AirPods to answer with. Needs the paused
+    /// clock so the times are exact.
+    async fn record_sent(
+        manager: &AACPManager,
+        mut sent: mpsc::Receiver<Vec<u8>>,
+        run: impl Future<Output = ()>,
+        mut reply: impl FnMut(usize) -> Option<Vec<u8>>,
+    ) -> Vec<(Duration, Vec<u8>)> {
+        let start = Instant::now();
+        let run = async {
+            run.await;
+            // Closes the channel so the recorder below ends.
+            manager.state.lock().await.sender = None;
+        };
+        let record = async {
+            let mut log = Vec::new();
+            while let Some(packet) = sent.recv().await {
+                log.push((start.elapsed(), packet));
+                if let Some(answer) = reply(log.len()) {
+                    manager.receive_packet(&answer).await;
+                }
+            }
+            log
+        };
+        tokio::join!(run, record).1
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_setup_sends_handshake_flags_and_requests_300ms_apart() {
+        let (manager, sent) = connected_manager(Arc::new(MemoryStore::default())).await;
+
+        let log = record_sent(&manager, sent, send_initial_setup(&manager, false), |_| {
+            None
+        })
+        .await;
+
+        assert_eq!(
+            log,
+            [
+                (ms(0), HANDSHAKE.to_vec()),
+                (ms(300), FEATURE_FLAGS.to_vec()),
+                (ms(600), NOTIFICATION_REQUEST.to_vec()),
+                (
+                    ms(600),
+                    vec![
+                        0x04, 0x00, 0x04, 0x00, 0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                        0xFF, 0xFF
+                    ]
+                ),
+                (
+                    ms(600),
+                    vec![0x04, 0x00, 0x04, 0x00, 0x30, 0x00, 0x05, 0x00]
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_setup_with_stem_control_asks_for_double_and_triple_press() {
+        let (manager, sent) = connected_manager(Arc::new(MemoryStore::default())).await;
+
+        let log = record_sent(&manager, sent, send_initial_setup(&manager, true), |_| None).await;
+
+        assert_eq!(log.len(), 6);
+        assert_eq!(
+            log[5],
+            (
+                ms(600),
+                vec![
+                    0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x39, 0x06, 0x00, 0x00, 0x00
+                ]
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_airpods_get_the_setup_twice_then_ten_notification_requests() {
+        let (manager, sent) = connected_manager(Arc::new(MemoryStore::default())).await;
+
+        let log = record_sent(&manager, sent, repeat_setup_until_status(&manager), |_| {
+            None
+        })
+        .await;
+
+        let mut expected = vec![
+            (ms(200), HANDSHAKE.to_vec()),
+            (ms(400), FEATURE_FLAGS.to_vec()),
+            (ms(600), NOTIFICATION_REQUEST.to_vec()),
+            (ms(5_600), HANDSHAKE.to_vec()),
+            (ms(5_800), FEATURE_FLAGS.to_vec()),
+            (ms(6_000), NOTIFICATION_REQUEST.to_vec()),
+        ];
+        expected.extend((1..=10).map(|i| (ms(6_000 + 3_000 * i), NOTIFICATION_REQUEST.to_vec())));
+        assert_eq!(log, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_repeats_stop_once_the_airpods_report_battery() {
+        let (manager, sent) = connected_manager(Arc::new(MemoryStore::default())).await;
+        let start = Instant::now();
+        let battery = vec![
+            0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x01, 0x02, 0x01, 0x64, 0x02, 0x01,
+        ];
+
+        // The battery report answers the second setup's notification request.
+        let log = record_sent(
+            &manager,
+            sent,
+            repeat_setup_until_status(&manager),
+            |count| (count == 6).then(|| battery.clone()),
+        )
+        .await;
+
+        assert_eq!(log.len(), 6);
+        assert_eq!(start.elapsed(), ms(9_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ear_detection_also_ends_the_notification_requests() {
+        let (manager, sent) = connected_manager(Arc::new(MemoryStore::default())).await;
+        let ear_detection = vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00];
+
+        // Arrives after the first repeated notification request.
+        let log = record_sent(
+            &manager,
+            sent,
+            repeat_setup_until_status(&manager),
+            |count| (count == 7).then(|| ear_detection.clone()),
+        )
+        .await;
+
+        assert_eq!(log.len(), 7);
+        assert_eq!(log[6].0, ms(9_000));
+    }
+}

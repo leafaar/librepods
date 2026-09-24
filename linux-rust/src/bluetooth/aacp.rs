@@ -1586,9 +1586,65 @@ fn media_information_payload(
     packet.resize(packet.len().max(2 + 138), 0x00);
     Ok(packet)
 }
+/// Fakes that let tests drive an `AACPManager` without Bluetooth or files.
+#[cfg(test)]
+pub(crate) mod testing {
+    use {
+        super::{AACPManager, DeviceStore},
+        crate::devices::enums::DeviceData,
+        std::{
+            collections::HashMap,
+            io,
+            sync::{Arc, Mutex},
+        },
+        tokio::sync::mpsc,
+    };
+
+    /// Device records in memory, with every save recorded in order.
+    #[derive(Default)]
+    pub(crate) struct MemoryStore {
+        pub(crate) initial: HashMap<String, DeviceData>,
+        pub(crate) saved: Mutex<Vec<(String, DeviceData)>>,
+    }
+
+    impl MemoryStore {
+        pub(crate) fn saved(&self) -> Vec<(String, DeviceData)> {
+            self.saved.lock().unwrap().clone()
+        }
+    }
+
+    impl DeviceStore for MemoryStore {
+        fn load(&self) -> HashMap<String, DeviceData> {
+            self.initial.clone()
+        }
+
+        fn save(&self, mac: String, data: DeviceData) -> io::Result<()> {
+            self.saved.lock().unwrap().push((mac, data));
+            Ok(())
+        }
+    }
+
+    /// A manager over `store` whose outgoing packets land in the returned
+    /// receiver, as if connected.
+    pub(crate) async fn connected_manager(
+        store: Arc<MemoryStore>,
+    ) -> (AACPManager, mpsc::Receiver<Vec<u8>>) {
+        let manager = AACPManager::with_deps(store, false);
+        let (tx, rx) = mpsc::channel(64);
+        manager.attach_transport(tx).await;
+        (manager, rx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::{
+            testing::{MemoryStore, connected_manager},
+            *,
+        },
+        proptest::prelude::*,
+    };
 
     #[test]
     fn media_information_length_counts_the_bytes_after_it() {
@@ -1664,5 +1720,904 @@ mod tests {
         assert!(rename_payload(&"a".repeat(256)).is_err());
         // 128 two-byte characters: 128 chars but 256 bytes.
         assert!(rename_payload(&"é".repeat(128)).is_err());
+    }
+
+    const AIRPODS_MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    /// Sample information packet from AirPods Pro 2, from the AAP definitions.
+    const INFORMATION_SAMPLE: &str = "040004001d0002d5000400416972506f64732050726f004133303438004170706c6520496e632e0051584e524848595850360036312e313836383034303030323030303030302e323731330036312e313836383034303030323030303030302e3237313300312e302e3000636f6d2e6170706c652e6163636573736f72792e757064617465722e6170702e3731004859394c5432454632364a59004833504c5748444a32364b3000363335373533360089312a6567a5400f84a3ca234947efd40b90d78436ae5946748d70273e66066a2589300035333935303630363400";
+
+    /// An AACP packet: the header, then `body` starting at the opcode.
+    fn packet(body: &[u8]) -> Vec<u8> {
+        [HEADER_BYTES.as_slice(), body].concat()
+    }
+
+    struct Harness {
+        manager: AACPManager,
+        store: Arc<MemoryStore>,
+        sent: mpsc::Receiver<Vec<u8>>,
+        events: mpsc::UnboundedReceiver<AACPEvent>,
+    }
+
+    impl Harness {
+        async fn with_store(store: MemoryStore) -> Self {
+            let store = Arc::new(store);
+            let (manager, sent) = connected_manager(store.clone()).await;
+            let (event_tx, events) = mpsc::unbounded_channel();
+            manager.set_event_channel(event_tx).await;
+            manager.state.lock().await.airpods_mac = Some(AIRPODS_MAC.parse().unwrap());
+            Self {
+                manager,
+                store,
+                sent,
+                events,
+            }
+        }
+
+        async fn new() -> Self {
+            Self::with_store(MemoryStore::default()).await
+        }
+
+        async fn receive(&self, body: &[u8]) {
+            self.manager.receive_packet(&packet(body)).await;
+        }
+
+        fn next_event(&mut self) -> AACPEvent {
+            self.events.try_recv().expect("an event was emitted")
+        }
+
+        fn assert_no_event(&mut self) {
+            if let Ok(event) = self.events.try_recv() {
+                panic!("unexpected event {event:?}");
+            }
+        }
+
+        fn next_sent(&mut self) -> Vec<u8> {
+            self.sent.try_recv().expect("a packet was sent")
+        }
+    }
+
+    fn airpods_record(le_keys: AirPodsLEKeys) -> DeviceData {
+        DeviceData {
+            name: "Old name".to_string(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(AirPodsInformation {
+                le_keys,
+                ..AirPodsInformation::default()
+            })),
+        }
+    }
+
+    // Battery (0x04)
+
+    #[tokio::test]
+    async fn battery_sample_from_airpods_pro_2_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+        let expected = vec![
+            BatteryInfo {
+                component: BatteryComponent::Right,
+                level: 100,
+                status: BatteryStatus::NotCharging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Left,
+                level: 99,
+                status: BatteryStatus::Charging,
+            },
+            BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 17,
+                status: BatteryStatus::NotCharging,
+            },
+        ];
+
+        h.receive(&[
+            0x04, 0x00, 0x03, 0x02, 0x01, 0x64, 0x02, 0x01, 0x04, 0x01, 0x63, 0x01, 0x01, 0x08,
+            0x01, 0x11, 0x02, 0x01,
+        ])
+        .await;
+
+        assert_eq!(h.manager.state.lock().await.battery_info, expected);
+        assert!(matches!(h.next_event(), AACPEvent::BatteryInfo(b) if b == expected));
+        assert!(h.manager.has_device_status().await);
+    }
+
+    #[tokio::test]
+    async fn battery_status_0x05_is_optimized_charging_and_counts_as_charging() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x04, 0x00, 0x01, 0x04, 0x01, 0x50, 0x05, 0x01])
+            .await;
+
+        let AACPEvent::BatteryInfo(batteries) = h.next_event() else {
+            panic!("expected a battery event");
+        };
+        assert_eq!(batteries.len(), 1);
+        assert_eq!(batteries[0].status, BatteryStatus::OptimizedCharging);
+        assert!(batteries[0].status.is_charging());
+        assert_eq!(batteries[0].level, 80);
+    }
+
+    #[tokio::test]
+    async fn battery_entries_with_unknown_component_or_status_are_skipped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[
+            0x04, 0x00, 0x03, 0x10, 0x01, 0x32, 0x01, 0x01, 0x02, 0x01, 0x33, 0x00, 0x01, 0x08,
+            0x01, 0x34, 0x04, 0x01,
+        ])
+        .await;
+
+        assert_eq!(
+            h.manager.state.lock().await.battery_info,
+            [BatteryInfo {
+                component: BatteryComponent::Case,
+                level: 0x34,
+                status: BatteryStatus::Disconnected,
+            }]
+        );
+        assert!(matches!(h.next_event(), AACPEvent::BatteryInfo(_)));
+    }
+
+    #[tokio::test]
+    async fn battery_packet_shorter_than_its_count_is_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x04, 0x00, 0x02, 0x02, 0x01, 0x64, 0x02, 0x01])
+            .await;
+        h.receive(&[0x04, 0x00]).await;
+
+        assert!(h.manager.state.lock().await.battery_info.is_empty());
+        h.assert_no_event();
+    }
+
+    // Ear detection (0x06)
+
+    #[tokio::test]
+    async fn ear_detection_reports_the_previous_and_new_status() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x00, 0x01]).await;
+        h.receive(&[0x06, 0x00, 0x02, 0x03]).await;
+
+        let AACPEvent::EarDetection(old, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert!(old.is_empty());
+        assert_eq!(
+            new,
+            [EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar]
+        );
+        let AACPEvent::EarDetection(old, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert_eq!(
+            old,
+            [EarDetectionStatus::InEar, EarDetectionStatus::OutOfEar]
+        );
+        assert_eq!(
+            new,
+            [EarDetectionStatus::InCase, EarDetectionStatus::Disconnected]
+        );
+        let state = h.manager.state.lock().await;
+        assert_eq!(state.old_ear_detection_status, old);
+        assert_eq!(state.ear_detection_status, new);
+    }
+
+    #[tokio::test]
+    async fn unknown_ear_detection_status_reads_as_out_of_ear() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x07, 0x00]).await;
+
+        let AACPEvent::EarDetection(_, new) = h.next_event() else {
+            panic!("expected an ear detection event");
+        };
+        assert_eq!(
+            new,
+            [EarDetectionStatus::OutOfEar, EarDetectionStatus::InEar]
+        );
+    }
+
+    #[tokio::test]
+    async fn short_ear_detection_packet_is_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x00]).await;
+
+        h.assert_no_event();
+        assert!(!h.manager.has_device_status().await);
+    }
+
+    // Control commands (0x09)
+
+    #[tokio::test]
+    async fn listening_mode_is_stored_emitted_and_sent_to_subscribers() {
+        let mut h = Harness::new().await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        h.manager
+            .subscribe_to_control_command(ControlCommandIdentifiers::ListeningMode, sub_tx)
+            .await;
+
+        // Noise control notification: 09 00 0D [mode] 00 00 00, 03 is transparency.
+        h.receive(&[0x09, 0x00, 0x0D, 0x03, 0x00, 0x00, 0x00]).await;
+
+        let expected = ControlCommandStatus {
+            identifier: ControlCommandIdentifiers::ListeningMode,
+            value: vec![0x03],
+        };
+        assert_eq!(
+            h.manager.state.lock().await.control_command_status_list,
+            std::slice::from_ref(&expected)
+        );
+        assert!(matches!(h.next_event(), AACPEvent::ControlCommand(s) if s == expected));
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x03]);
+    }
+
+    #[tokio::test]
+    async fn control_command_value_trims_trailing_zeros_only() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x1A, 0x03, 0x00, 0x01, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00]).await;
+
+        let state = h.manager.state.lock().await;
+        let value = |id| {
+            state
+                .control_command_status_list
+                .iter()
+                .find(|s| s.identifier == id)
+                .map(|s| s.value.clone())
+        };
+        assert_eq!(
+            value(ControlCommandIdentifiers::ListeningModeConfigs),
+            Some(vec![0x03, 0x00, 0x01])
+        );
+        assert_eq!(
+            value(ControlCommandIdentifiers::ChimeVolume),
+            Some(vec![0x00])
+        );
+    }
+
+    #[tokio::test]
+    async fn control_command_update_replaces_the_stored_value() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00]).await;
+        assert!(h.manager.conversation_detection_enabled().await);
+        h.receive(&[0x09, 0x00, 0x28, 0x02, 0x00, 0x00, 0x00]).await;
+
+        assert!(!h.manager.conversation_detection_enabled().await);
+        assert_eq!(
+            h.manager
+                .state
+                .lock()
+                .await
+                .control_command_status_list
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn owns_connection_command_sets_ownership() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00]).await;
+        assert!(h.manager.state.lock().await.owns);
+        h.receive(&[0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]).await;
+
+        assert!(!h.manager.state.lock().await.owns);
+    }
+
+    #[tokio::test]
+    async fn unknown_or_short_control_commands_are_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x09, 0x00, 0x7F, 0x01, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x0D, 0x03, 0x00, 0x00]).await;
+
+        h.assert_no_event();
+        assert!(
+            h.manager
+                .state
+                .lock()
+                .await
+                .control_command_status_list
+                .is_empty()
+        );
+    }
+
+    // Conversation awareness (0x4B)
+
+    #[tokio::test]
+    async fn conversation_awareness_level_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01, 0x03]).await;
+
+        assert_eq!(
+            h.manager.state.lock().await.conversational_awareness_status,
+            0x03
+        );
+        assert!(matches!(
+            h.next_event(),
+            AACPEvent::ConversationalAwareness(0x03)
+        ));
+    }
+
+    #[tokio::test]
+    async fn conversation_awareness_of_another_length_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01]).await;
+        h.receive(&[0x4B, 0x00, 0x02, 0x00, 0x01, 0x03, 0x00]).await;
+
+        h.assert_no_event();
+    }
+
+    // Information (0x1D)
+
+    #[test]
+    fn information_sample_is_parsed_field_by_field() {
+        let sample = hex::decode(INFORMATION_SAMPLE).unwrap();
+
+        let Some(Incoming::Information(info)) = parse_packet(&sample) else {
+            panic!("expected information");
+        };
+
+        assert_eq!(
+            *info,
+            AirPodsInformation {
+                name: "AirPods Pro".to_string(),
+                model_number: "A3048".to_string(),
+                manufacturer: "Apple Inc.".to_string(),
+                serial_number: "QXNRHHYXP6".to_string(),
+                version1: "61.1868040002000000.2713".to_string(),
+                version2: "61.1868040002000000.2713".to_string(),
+                hardware_revision: "1.0.0".to_string(),
+                updater_identifier: "com.apple.accessory.updater.app.71".to_string(),
+                left_serial_number: "HY9LT2EF26JY".to_string(),
+                right_serial_number: "H3PLWHDJ26K0".to_string(),
+                version3: "6357536".to_string(),
+                le_keys: AirPodsLEKeys::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn information_skips_a_leading_run_before_the_first_zero() {
+        let parsed = parse_information(b"\x1d\x00\x02\x00junk\x00skipped\x00Name\x00A1\x00");
+
+        let info = parsed.unwrap();
+        assert_eq!(info.name, "Name");
+        assert_eq!(info.model_number, "A1");
+        assert_eq!(info.version3, "");
+    }
+
+    #[test]
+    fn information_without_strings_or_too_short_is_dropped() {
+        assert!(parse_information(&[0x1D, 0x00, 0x02, 0x00, 0x00, 0x00]).is_none());
+        assert!(parse_information(&[0x1D, 0x00, 0x02, 0x00, 0x00]).is_none());
+    }
+
+    #[tokio::test]
+    async fn information_updates_the_record_and_keeps_its_le_keys() {
+        let keys = AirPodsLEKeys {
+            irk: "01".repeat(16),
+            enc_key: "02".repeat(16),
+        };
+        let store = MemoryStore {
+            initial: HashMap::from([(AIRPODS_MAC.to_string(), airpods_record(keys.clone()))]),
+            ..MemoryStore::default()
+        };
+        let h = Harness::with_store(store).await;
+
+        h.manager
+            .receive_packet(&hex::decode(INFORMATION_SAMPLE).unwrap())
+            .await;
+
+        let saved = h.store.saved();
+        assert_eq!(saved.len(), 1);
+        let (mac, data) = &saved[0];
+        assert_eq!(mac, AIRPODS_MAC);
+        assert_eq!(data.name, "AirPods Pro");
+        let Some(DeviceInformation::AirPods(info)) = &data.information else {
+            panic!("expected AirPods information");
+        };
+        assert_eq!(info.model_number, "A3048");
+        assert_eq!(info.le_keys, keys);
+        assert_eq!(h.manager.state.lock().await.devices[AIRPODS_MAC], *data);
+    }
+
+    #[tokio::test]
+    async fn information_for_airpods_without_a_record_is_not_saved() {
+        let h = Harness::new().await;
+
+        h.manager
+            .receive_packet(&hex::decode(INFORMATION_SAMPLE).unwrap())
+            .await;
+
+        assert!(h.store.saved().is_empty());
+        assert!(h.manager.state.lock().await.devices.is_empty());
+    }
+
+    // Proximity keys (0x31)
+
+    /// Keys response as the Qt client parses it: count 2, then an IRK (type
+    /// 0x01) and an encryption key (type 0x04), each with a 16 byte length.
+    fn proximity_keys_body() -> Vec<u8> {
+        let mut body = vec![0x31, 0x00, 0x02, 0x01, 0x00, 0x10, 0x00];
+        body.extend([0x11; 16]);
+        body.extend([0x04, 0x00, 0x10, 0x00]);
+        body.extend([0x22; 16]);
+        body
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_start_a_record_for_new_airpods() {
+        let h = Harness::new().await;
+
+        h.receive(&proximity_keys_body()).await;
+
+        let saved = h.store.saved();
+        assert_eq!(saved.len(), 1);
+        let (mac, data) = &saved[0];
+        assert_eq!(mac, AIRPODS_MAC);
+        assert_eq!(data.name, AIRPODS_MAC);
+        assert_eq!(data.type_, DeviceType::AirPods);
+        let Some(DeviceInformation::AirPods(info)) = &data.information else {
+            panic!("expected AirPods information");
+        };
+        assert_eq!(info.le_keys.irk, "11".repeat(16));
+        assert_eq!(info.le_keys.enc_key, "22".repeat(16));
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_keep_the_rest_of_an_existing_record() {
+        let store = MemoryStore {
+            initial: HashMap::from([(
+                AIRPODS_MAC.to_string(),
+                airpods_record(AirPodsLEKeys::default()),
+            )]),
+            ..MemoryStore::default()
+        };
+        let h = Harness::with_store(store).await;
+
+        h.receive(&proximity_keys_body()).await;
+
+        let (_, data) = &h.store.saved()[0];
+        assert_eq!(data.name, "Old name");
+    }
+
+    #[tokio::test]
+    async fn proximity_keys_without_a_connected_mac_are_not_saved() {
+        let h = Harness::new().await;
+        h.manager.state.lock().await.airpods_mac = None;
+
+        h.receive(&proximity_keys_body()).await;
+
+        assert!(h.store.saved().is_empty());
+    }
+
+    #[test]
+    fn proximity_keys_running_past_the_end_are_dropped() {
+        let body = proximity_keys_body();
+
+        assert!(parse_proximity_keys(&body[..body.len() - 1]).is_none());
+        // The second key's header cut short.
+        assert!(parse_proximity_keys(&body[..3 + 4 + 16 + 3]).is_none());
+        assert!(parse_proximity_keys(&[0x31, 0x00, 0x01]).is_none());
+        assert_eq!(parse_proximity_keys(&body).map(|k| k.len()), Some(2));
+    }
+
+    // Stem press (0x19)
+
+    #[tokio::test]
+    async fn stem_press_emits_the_press_and_the_bud() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x19, 0x00, 0x06, 0x02]).await;
+
+        assert!(matches!(
+            h.next_event(),
+            AACPEvent::StemPress(StemPressType::Double, StemPressBudType::Right)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stem_press_with_unknown_type_or_bud_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x19, 0x00, 0x09, 0x01]).await;
+        h.receive(&[0x19, 0x00, 0x05, 0x03]).await;
+        h.receive(&[0x19, 0x00, 0x05]).await;
+
+        h.assert_no_event();
+    }
+
+    // Audio source (0x0E)
+
+    #[tokio::test]
+    async fn audio_source_mac_is_read_least_significant_byte_first() {
+        let h = Harness::new().await;
+
+        h.receive(&[0x0E, 0x00, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x02])
+            .await;
+        let unknown_type = parse_audio_source(&[0x0E, 0x00, 1, 2, 3, 4, 5, 6, 0x09]);
+
+        assert_eq!(
+            h.manager.state.lock().await.audio_source,
+            Some(AudioSource {
+                mac: "11:22:33:44:55:66".to_string(),
+                r#type: AudioSourceType::Media,
+            })
+        );
+        assert_eq!(unknown_type.unwrap().r#type, AudioSourceType::None);
+    }
+
+    // Connected devices (0x2E)
+
+    #[tokio::test]
+    async fn connected_devices_replace_the_list_and_report_the_old_one() {
+        let mut h = Harness::new().await;
+        let first = ConnectedDevice {
+            mac: "11:22:33:44:55:66".to_string(),
+            info1: 0x01,
+            info2: 0x02,
+            r#type: None,
+        };
+        let second = ConnectedDevice {
+            mac: "A1:B2:C3:D4:E5:F6".to_string(),
+            info1: 0x03,
+            info2: 0x04,
+            r#type: None,
+        };
+
+        h.receive(&[
+            0x2E, 0x00, 0x01, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02,
+        ])
+        .await;
+        h.receive(&[
+            0x2E, 0x00, 0x02, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02, 0xA1,
+            0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x03, 0x04,
+        ])
+        .await;
+
+        let _ = h.next_event();
+        let AACPEvent::ConnectedDevices(old, new) = h.next_event() else {
+            panic!("expected a connected devices event");
+        };
+        assert_eq!(old, std::slice::from_ref(&first));
+        assert_eq!(new, [first, second]);
+        assert_eq!(h.manager.state.lock().await.connected_devices, new);
+    }
+
+    #[tokio::test]
+    async fn connected_devices_shorter_than_their_count_are_dropped() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[
+            0x2E, 0x00, 0x02, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02,
+        ])
+        .await;
+
+        h.assert_no_event();
+    }
+
+    // Smart routing response (0x11)
+
+    #[tokio::test]
+    async fn smart_routing_ownership_to_false_is_emitted() {
+        let mut h = Harness::new().await;
+        let mut body = vec![0x11, 0x00];
+        body.extend_from_slice(b"\x01\x02audioRoutingSetOwnershipToFalse\x01");
+
+        h.receive(&body).await;
+        h.receive(b"\x11\x00otherKey").await;
+
+        assert!(matches!(h.next_event(), AACPEvent::OwnershipToFalseRequest));
+        h.assert_no_event();
+    }
+
+    // Custom EQ (0x63)
+
+    #[tokio::test]
+    async fn custom_eq_is_stored_and_emitted() {
+        let mut h = Harness::new().await;
+        let expected = CustomEq {
+            enabled: true,
+            low: 65,
+            mid: 50,
+            high: 70,
+        };
+
+        h.receive(&[0x63, 0x00, 0x05, 0x00, 0x01, 0x02, 0x41, 0x32, 0x46])
+            .await;
+
+        assert_eq!(h.manager.state.lock().await.custom_eq, Some(expected));
+        assert!(matches!(h.next_event(), AACPEvent::CustomEq(eq) if eq == expected));
+    }
+
+    #[tokio::test]
+    async fn malformed_custom_eq_is_ignored() {
+        let mut h = Harness::new().await;
+
+        h.receive(&[0x63, 0x00, 0x05, 0x00, 0x01, 0x02, 101, 50, 50])
+            .await;
+
+        assert_eq!(h.manager.state.lock().await.custom_eq, None);
+        h.assert_no_event();
+    }
+
+    // Framing
+
+    #[tokio::test]
+    async fn packets_without_header_or_opcode_and_unknown_opcodes_are_ignored() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .receive_packet(&[0x05, 0x00, 0x04, 0x00, 0x04, 0x00, 0x01])
+            .await;
+        h.manager.receive_packet(&HEADER_BYTES).await;
+        h.manager.receive_packet(&[]).await;
+        h.receive(&[0x53, 0x00, 0x01]).await;
+        h.receive(&[0x7E, 0x00]).await;
+
+        h.assert_no_event();
+    }
+
+    #[tokio::test]
+    async fn reset_connection_forgets_what_the_connection_reported() {
+        let h = Harness::new().await;
+        h.receive(&[0x04, 0x00, 0x01, 0x02, 0x01, 0x64, 0x02, 0x01])
+            .await;
+        h.receive(&[0x06, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00]).await;
+
+        h.manager.state.lock().await.reset_connection();
+
+        let state = h.manager.state.lock().await;
+        assert!(state.sender.is_none());
+        assert!(!state.owns);
+        assert!(state.battery_info.is_empty());
+        assert!(state.ear_detection_status.is_empty());
+        assert!(state.control_command_status_list.is_empty());
+        drop(state);
+        assert!(!h.manager.has_device_status().await);
+    }
+
+    const KNOWN_OPCODES: [u8; 12] = [
+        opcodes::BATTERY_INFO,
+        opcodes::CONTROL_COMMAND,
+        opcodes::EAR_DETECTION,
+        opcodes::CONVERSATION_AWARENESS,
+        opcodes::INFORMATION,
+        opcodes::PROXIMITY_KEYS_RSP,
+        opcodes::STEM_PRESS,
+        opcodes::AUDIO_SOURCE,
+        opcodes::CONNECTED_DEVICES,
+        opcodes::SMART_ROUTING_RESP,
+        opcodes::EQ_DATA,
+        opcodes::CUSTOM_EQ,
+    ];
+
+    /// Run `packet` through `receive_packet` on a fresh manager.
+    fn receive_on_fresh_manager(packet: &[u8]) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let h = Harness::new().await;
+                h.manager.receive_packet(packet).await;
+            });
+    }
+
+    proptest! {
+        #[test]
+        fn receive_packet_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            receive_on_fresh_manager(&bytes);
+        }
+
+        #[test]
+        fn receive_packet_never_panics_on_known_opcodes_with_any_body(
+            opcode in proptest::sample::select(KNOWN_OPCODES.as_slice()),
+            // Small counts and lengths so the count and length fields often
+            // point just inside or just past the end.
+            body in proptest::collection::vec(
+                prop_oneof![0u8..=4, any::<u8>()],
+                0..300,
+            ),
+        ) {
+            receive_on_fresh_manager(&packet(&[&[opcode][..], &body].concat()));
+        }
+    }
+
+    // Commands sent to the AirPods
+
+    #[tokio::test]
+    async fn control_command_is_padded_to_four_value_bytes() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .send_control_command(ControlCommandIdentifiers::ListeningMode, &[0x02])
+            .await
+            .unwrap();
+        h.manager
+            .send_control_command(
+                ControlCommandIdentifiers::ClickHoldMode,
+                &[0x01, 0x05, 0x07, 0x08, 0x09],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0D, 0x02, 0x00, 0x00, 0x00
+            ]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x16, 0x01, 0x05, 0x07, 0x08
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_sends_the_length_prefixed_name() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_rename_packet("Pods").await.unwrap();
+
+        assert_eq!(h.next_sent(), packet(b"\x1a\x00\x01\x04\x00Pods"));
+    }
+
+    #[tokio::test]
+    async fn rename_with_a_long_name_fails_before_sending() {
+        let mut h = Harness::new().await;
+
+        let result = h.manager.send_rename_packet(&"a".repeat(256)).await;
+
+        assert!(matches!(result, Err(AacpError::NameTooLong(256))));
+        assert!(h.sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn setup_requests_match_the_captured_packets() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_notification_request().await.unwrap();
+        h.manager
+            .send_proximity_keys_request(vec![ProximityKeyType::Irk, ProximityKeyType::EncKey])
+            .await
+            .unwrap();
+        h.manager.send_handshake().await.unwrap();
+
+        assert_eq!(
+            h.next_sent(),
+            [0x04, 0x00, 0x04, 0x00, 0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [0x04, 0x00, 0x04, 0x00, 0x30, 0x00, 0x05, 0x00]
+        );
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hi_res_audio_start_and_stop_are_sent_as_is() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_start_audio().await.unwrap();
+        h.manager.send_stop_audio().await.unwrap();
+
+        assert_eq!(h.next_sent(), AACP_START_AUDIO);
+        assert_eq!(h.next_sent(), AACP_STOP_AUDIO);
+    }
+
+    #[tokio::test]
+    async fn media_information_is_sent_with_the_header() {
+        let mut h = Harness::new().await;
+
+        h.manager
+            .send_media_information("11:22:33:44:55:66", AIRPODS_MAC, true)
+            .await
+            .unwrap();
+
+        let expected = media_information_payload("11:22:33:44:55:66", AIRPODS_MAC, true).unwrap();
+        assert_eq!(h.next_sent(), packet(&expected));
+    }
+
+    #[tokio::test]
+    async fn hijack_request_length_counts_the_body_before_the_padding() {
+        let mut h = Harness::new().await;
+
+        h.manager.send_hijack_request(AIRPODS_MAC).await.unwrap();
+
+        let sent = h.next_sent();
+        assert_eq!(sent.len(), 4 + 2 + 106);
+        assert_eq!(sent[4..6], [opcodes::SMART_ROUTING, 0x00]);
+        assert_eq!(sent[6..12], [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]);
+        let len = usize::from(u16::from_le_bytes([sent[12], sent[13]]));
+        let body = &sent[14..14 + len];
+        assert!(body.ends_with(b"remotescore\xa5"));
+        assert!(sent[14 + len..].iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn smart_routing_with_a_malformed_mac_fails_before_sending() {
+        let mut h = Harness::new().await;
+
+        let result = h.manager.send_hijack_request("not a mac").await;
+
+        assert!(matches!(result, Err(AacpError::InvalidMac(mac)) if mac == "not a mac"));
+        assert!(h.sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn send_without_a_connection_fails_with_not_connected() {
+        let manager = AACPManager::with_deps(Arc::new(MemoryStore::default()), false);
+
+        let result = manager.send_notification_request().await;
+
+        assert!(matches!(result, Err(AacpError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn send_after_the_socket_task_ended_fails_with_channel_closed() {
+        let Harness { manager, sent, .. } = Harness::new().await;
+        drop(sent);
+
+        let result = manager.send_notification_request().await;
+
+        assert!(matches!(result, Err(AacpError::SendChannelClosed)));
+    }
+
+    #[tokio::test]
+    async fn set_conversation_detection_sends_and_records_the_setting() {
+        let mut h = Harness::new().await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        h.manager
+            .subscribe_to_control_command(
+                ControlCommandIdentifiers::ConversationDetectConfig,
+                sub_tx,
+            )
+            .await;
+
+        h.manager.set_conversation_detection(true).await;
+
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00
+            ]
+        );
+        assert!(h.manager.conversation_detection_enabled().await);
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x01]);
+        assert!(matches!(h.next_event(), AACPEvent::ControlCommand(_)));
+    }
+
+    #[tokio::test]
+    async fn subscriber_gets_the_current_value_first() {
+        let h = Harness::new().await;
+        h.receive(&[0x09, 0x00, 0x34, 0x01, 0x00, 0x00, 0x00]).await;
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+
+        h.manager
+            .subscribe_to_control_command(ControlCommandIdentifiers::AllowOffOption, sub_tx)
+            .await;
+
+        assert_eq!(sub_rx.try_recv().unwrap(), [0x01]);
     }
 }
