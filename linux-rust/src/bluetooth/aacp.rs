@@ -60,6 +60,7 @@ pub mod opcodes {
     pub const SEND_CONNECTED_MAC: u8 = 0x14;
     pub const HEADTRACKING: u8 = 0x17;
     pub const TIPI_3: u8 = 0x0C;
+    pub const CUSTOM_EQ: u8 = 0x63;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
