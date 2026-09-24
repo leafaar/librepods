@@ -138,6 +138,13 @@ impl MediaController {
         )>,
     ) {
         info!("Starting playback listener loop");
+        // `is_playing` starts false, which is a placeholder rather than an
+        // observation. Whatever is already playing when this loop starts would
+        // otherwise read as playback that just began — and on a reconnect, with
+        // another device holding the audio, that escalates into taking it away
+        // from a device the user was happily listening on.
+        let mut baseline_taken = false;
+        let device_mac = self.state.lock().await.connected_device_mac.clone();
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -150,6 +157,33 @@ impl MediaController {
             state.is_playing = is_playing;
             let local_mac = state.local_mac.clone();
             drop(state);
+
+            if !baseline_taken {
+                baseline_taken = true;
+                // Exception: this PC connected the AirPods itself to play here
+                // (auto-switch or the connect button), so media already playing
+                // is exactly what should take the audio.
+                let requested = crate::auto_switch::take_takeover_request(&device_mac);
+                if !(requested && is_playing) {
+                    debug!("Recorded initial playback state ({is_playing}); not a transition");
+                    continue;
+                }
+                info!("Connection was requested to play here; taking ownership");
+            }
+
+            // Losing ownership pauses local players and drops the audio
+            // profile. Players tend to resume on their own once the profile
+            // comes back, and that resume is not the user asking for the audio
+            // — treating it as one starts a tug of war with the device that
+            // just took over, ending with neither side playing.
+            if is_playing && !was_playing {
+                let mut state = self.state.lock().await;
+                if state.i_paused_the_media {
+                    state.i_paused_the_media = false;
+                    debug!("Playback resumed after our own pause; not taking ownership");
+                    continue;
+                }
+            }
 
             if !was_playing && is_playing {
                 let (bud_in_ear, connected_devices) = {
@@ -254,6 +288,19 @@ impl MediaController {
             }
         }
 
+        // No previous reading means this is the first report after connecting,
+        // not a change the wearer made. It matters because `old_all_out` is
+        // vacuously true for an empty list, so an already-worn pair looks like
+        // it was just put in: playback resumes, and with a second device
+        // connected the resume escalates into taking the audio away from it.
+        // Record the baseline and wait for a real transition instead.
+        if old_statuses.is_empty() {
+            debug!("First ear reading after connecting: recording baseline, not acting");
+            let mut state = self.state.lock().await;
+            state.old_in_ear_data = new_in_ear_data;
+            return;
+        }
+
         if new_has_at_least_one_in && old_all_out {
             debug!("Condition met: buds inserted, activating A2DP and checking play state");
             self.activate_a2dp_profile().await;
@@ -336,6 +383,7 @@ impl MediaController {
 
     /// Resolves the card by Bluetooth MAC and refreshes the cached index.
     /// PipeWire can assign a different index after a disconnect/reconnect.
+    /// Retries for a few seconds, see get_audio_device_index.
     async fn refresh_device_index(&self) -> Option<u32> {
         let mac = self.state.lock().await.connected_device_mac.clone();
         if mac.is_empty() {
@@ -348,10 +396,14 @@ impl MediaController {
 
     /// Waits for the card to expose an A2DP profile, re-resolving the card on
     /// every attempt. Sleeps between attempts, but never after the last one.
+    /// Each attempt looks the card up once: this loop is the retry, and nesting
+    /// the retrying lookup inside it would stretch the wait to tens of seconds.
     async fn wait_for_a2dp_profile(&self, attempts: u32) -> bool {
+        let mac = self.state.lock().await.connected_device_mac.clone();
         for attempt in 0..attempts {
-            if self.refresh_device_index().await.is_some() && self.is_a2dp_profile_available().await
-            {
+            let index = find_audio_device_index(&mac).await;
+            self.state.lock().await.device_index = index;
+            if index.is_some() && self.is_a2dp_profile_available().await {
                 return true;
             }
             if attempt + 1 < attempts {
@@ -504,6 +556,10 @@ impl MediaController {
 
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
+
+        // Remember that the pause came from us, so the playback listener does
+        // not mistake the players coming back for the user starting something.
+        self.state.lock().await.i_paused_the_media = true;
 
         let paused_count = tokio::task::spawn_blocking(|| {
             let conn = match Connection::new_session() {
@@ -674,22 +730,35 @@ impl MediaController {
         if mac.is_empty() {
             return None;
         }
-        let mac_clone = mac.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            for card in get_card_info_list_sync() {
-                if let Some(device_string) = card.proplist.get_str("device.string")
-                    && device_string.contains(&mac_clone)
-                {
-                    info!("Found audio device index for MAC {}: {}", mac_clone, card.index);
-                    return Some(card.index);
+        // Taking the connection back from another device makes the earbuds
+        // renegotiate, and the card briefly disappears from the sound server
+        // while that happens. A single lookup can land in that window and give
+        // up, leaving the audio nowhere: ownership already taken from the other
+        // device, but no local profile to play through. So poll for a moment.
+        const ATTEMPTS: u32 = 12;
+        const INTERVAL: Duration = Duration::from_millis(250);
+
+        for attempt in 1..=ATTEMPTS {
+            if let Some(index) = find_audio_device_index(mac).await {
+                if attempt > 1 {
+                    debug!("Found audio device for {mac} after {attempt} attempts");
                 }
+                info!("Found audio device index for MAC {}: {}", mac, index);
+                return Some(index);
             }
-            error!("No matching Bluetooth card found for MAC address: {}", mac_clone);
-            None
-        })
-            .await
-            .unwrap_or(None)
+
+            if attempt < ATTEMPTS {
+                tokio::time::sleep(INTERVAL).await;
+            }
+        }
+
+        error!(
+            "No matching Bluetooth card found for MAC address: {} after {:?}",
+            mac,
+            INTERVAL * ATTEMPTS
+        );
+        None
     }
 
     pub async fn deactivate_a2dp_profile(&self) {
@@ -956,6 +1025,22 @@ fn pulse_connect() -> Option<(Mainloop, Context)> {
         }
     }
     Some((mainloop, context))
+}
+
+/// One lookup of the sound server card that belongs to a Bluetooth MAC.
+async fn find_audio_device_index(mac: &str) -> Option<u32> {
+    if mac.is_empty() {
+        return None;
+    }
+    let mac = mac.to_string();
+    tokio::task::spawn_blocking(move || {
+        get_card_info_list_sync().into_iter().find_map(|card| {
+            let device_string = card.proplist.get_str("device.string")?;
+            device_string.contains(&mac).then_some(card.index)
+        })
+    })
+    .await
+    .unwrap_or(None)
 }
 
 fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {

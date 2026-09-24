@@ -7,6 +7,7 @@
 //! connected; the existing takeover path then claims audio as the device comes up.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// After an attempt, wait this long before the next one, so AirPods that stay in
 /// the case or refuse the connection are not retried on every play/pause.
 const RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// How long a takeover request stays valid. Covers connecting plus AACP setup;
+/// an older request must not grab the audio on some later, unrelated connect.
+const TAKEOVER_REQUEST_TTL: Duration = Duration::from_secs(30);
+
+/// AirPods this PC connected on purpose, keyed by MAC. The media controller
+/// normally ignores media already playing when a connection comes up (a plain
+/// reconnect must not steal the audio from another device); for these it acts.
+/// A static because the controller is created per connection, after the
+/// request, and has no handle back to the code that asked for it.
+static TAKEOVER_REQUESTS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn request_takeover(addr: Address) {
+    if let Ok(mut requests) = TAKEOVER_REQUESTS.lock() {
+        requests.insert(addr.to_string(), Instant::now());
+    }
+}
+
+/// Consume the takeover request for `mac`; true when one was made recently.
+pub(crate) fn take_takeover_request(mac: &str) -> bool {
+    TAKEOVER_REQUESTS
+        .lock()
+        .ok()
+        .and_then(|mut requests| requests.remove(mac))
+        .is_some_and(|at| at.elapsed() < TAKEOVER_REQUEST_TTL)
+}
 
 fn players_playing() -> HashSet<String> {
     playing_media_players().into_iter().collect()
@@ -100,6 +128,7 @@ async fn connect_device(adapter: &Adapter, addr: Address) -> Result<(), String> 
     if device.is_connected().await.unwrap_or(false) {
         return Ok(());
     }
+    request_takeover(addr);
     let result = match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(explain_connect_error(&e.to_string())),
