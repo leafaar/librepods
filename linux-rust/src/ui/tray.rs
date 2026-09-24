@@ -141,6 +141,18 @@ impl ksni::Tray for MyTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                label: "Connect AirPods to this PC".into(),
+                icon_name: "bluetooth-active".into(),
+                enabled: !self.connected,
+                activate: Box::new(|this: &mut Self| {
+                    if let Some(tx) = &this.ui_tx {
+                        let _ = tx.send(BluetoothUIMessage::ConnectAirPods);
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
             RadioGroup {
                 selected,
                 select: Box::new(move |this: &mut Self, current| {

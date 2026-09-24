@@ -1,4 +1,5 @@
 mod audio;
+mod auto_switch;
 mod bluetooth;
 mod devices;
 mod media_controller;
@@ -166,6 +167,8 @@ async fn async_main(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
+    tokio::spawn(auto_switch::run(adapter.clone()));
+
     let le_tray_clone = tray_handle.clone();
     tokio::spawn(async move {
         info!("Starting LE monitor...");
@@ -301,6 +304,15 @@ async fn async_main(
         if is_connected==0 {
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
+            }
+            // AirPodsDevice::new sets this on connect; clear it so the tray's
+            // connect item comes back.
+            if uuids.iter().any(|u| u == target_uuid)
+                && let Some(handle) = tray_handle.clone()
+            {
+                tokio::spawn(async move {
+                    handle.update(|tray: &mut MyTray| tray.connected = false).await;
+                });
             }
             return true
         }

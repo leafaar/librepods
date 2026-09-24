@@ -87,6 +87,16 @@ pub struct App {
     hires_mic_agc: bool,
     hires_mic_pause_convo: bool,
     a2dp_reset: bool,
+    auto_switch_on_playback: bool,
+    // Manual connect requests from the UI or tray, keyed by MAC; cleared once
+    // the device connects.
+    connect_status: HashMap<String, ConnectStatus>,
+}
+
+#[derive(Debug, Clone)]
+enum ConnectStatus {
+    Connecting,
+    Failed(String),
 }
 
 // The icon is embedded: a path is resolved against the working directory, which
@@ -124,6 +134,8 @@ pub enum Message {
     ThemeSelected(MyTheme),
     CopyToClipboard(String),
     BluetoothMessage(BluetoothUIMessage),
+    ConnectDevice(String),
+    ConnectFinished(String, Result<(), String>),
     // ShowNewDialogTab,
     GotPairedDevices(HashMap<String, Address>),
     StartAddDevice(String, Address),
@@ -134,6 +146,7 @@ pub enum Message {
     TrayTextModeChanged(bool), // yes, I know I should add all settings to a struct, but I'm lazy
     StemControlChanged(bool),
     A2dpResetChanged(bool),
+    AutoSwitchChanged(bool),
     HiResMicAgcChanged(bool),
     HiResMicPauseConvoChanged(bool),
     MicLevelTick,
@@ -180,6 +193,7 @@ impl App {
         let hires_mic_agc = app_settings.hires_mic_agc;
         let hires_mic_pause_convo = app_settings.hires_mic_pause_convo;
         let a2dp_reset = app_settings.a2dp_reset;
+        let auto_switch_on_playback = app_settings.auto_switch_on_playback;
 
         let bluetooth_state = BluetoothState::new();
 
@@ -235,6 +249,8 @@ impl App {
                 hires_mic_agc,
                 hires_mic_pause_convo,
                 a2dp_reset,
+                auto_switch_on_playback,
+                connect_status: HashMap::new(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -249,6 +265,7 @@ impl App {
             hires_mic_agc: self.hires_mic_agc,
             hires_mic_pause_convo: self.hires_mic_pause_convo,
             a2dp_reset: self.a2dp_reset,
+            auto_switch_on_playback: self.auto_switch_on_playback,
         }
         .save();
     }
@@ -283,6 +300,19 @@ impl App {
                 Task::none()
             }
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
+            Message::ConnectDevice(mac) => self.start_connect(mac),
+            Message::ConnectFinished(mac, result) => {
+                match result {
+                    // DeviceConnected arrives separately once the device is set up.
+                    Ok(()) => {
+                        self.connect_status.remove(&mac);
+                    }
+                    Err(e) => {
+                        self.connect_status.insert(mac, ConnectStatus::Failed(e));
+                    }
+                }
+                Task::none()
+            }
             Message::MicLevelTick => Task::none(),
             Message::BluetoothMessage(ui_message) => {
                 match ui_message {
@@ -290,6 +320,19 @@ impl App {
                         let ui_rx = Arc::clone(&self.ui_rx);
 
                         Task::perform(wait_for_message(ui_rx), |msg| msg)
+                    }
+                    BluetoothUIMessage::ConnectAirPods => {
+                        let ui_rx = Arc::clone(&self.ui_rx);
+                        let mut tasks = vec![Task::perform(wait_for_message(ui_rx), |msg| msg)];
+                        let away: Vec<String> = crate::auto_switch::known_airpods()
+                            .iter()
+                            .map(|a| a.to_string())
+                            .filter(|mac| !self.bluetooth_state.connected_devices.contains(mac))
+                            .collect();
+                        for mac in away {
+                            tasks.push(self.start_connect(mac));
+                        }
+                        Task::batch(tasks)
                     }
                     BluetoothUIMessage::OpenWindow => {
                         let ui_rx = Arc::clone(&self.ui_rx);
@@ -320,6 +363,7 @@ impl App {
                         if !already_connected {
                             self.bluetooth_state.connected_devices.push(mac.clone());
                         }
+                        self.connect_status.remove(&mac);
 
                         // self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                         //     conversation_awareness_enabled: false,
@@ -435,7 +479,11 @@ impl App {
 
                         self.device_states.remove(&mac);
 
-                        if matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
+                        let is_airpods = crate::auto_switch::known_airpods()
+                            .iter()
+                            .any(|a| a.to_string() == mac);
+                        if !is_airpods
+                            && matches!(&self.selected_tab, Tab::Device(selected_mac) if selected_mac == &mac)
                         {
                             self.selected_tab = Tab::Device("none".to_string());
                         }
@@ -665,6 +713,11 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::AutoSwitchChanged(is_enabled) => {
+                self.auto_switch_on_playback = is_enabled;
+                self.save_settings();
+                Task::none()
+            }
             Message::HiResMicAgcChanged(is_enabled) => {
                 self.hires_mic_agc = is_enabled;
                 self.save_settings();
@@ -676,6 +729,50 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    fn start_connect(&mut self, mac: String) -> Task<Message> {
+        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting)) {
+            return Task::none();
+        }
+        let Ok(addr) = mac.parse::<Address>() else {
+            error!("Cannot connect, invalid address {}", mac);
+            return Task::none();
+        };
+        self.connect_status.insert(mac.clone(), ConnectStatus::Connecting);
+        Task::perform(crate::auto_switch::connect_airpods(addr), move |result| {
+            Message::ConnectFinished(mac, result)
+        })
+    }
+
+    fn disconnected_view(&self, mac: &str) -> iced::widget::Container<'_, Message> {
+        let (status, connecting) = match self.connect_status.get(mac) {
+            Some(ConnectStatus::Connecting) => ("Connecting…".to_string(), true),
+            Some(ConnectStatus::Failed(e)) => (e.clone(), false),
+            None => (
+                "Not connected to this PC. If they are on your phone, connecting here takes them over."
+                    .to_string(),
+                false,
+            ),
+        };
+        let label = if connecting { "Connecting…" } else { "Connect to this PC" };
+        let mut connect = button(text(label).size(16)).padding(Padding {
+            top: 10.0,
+            bottom: 10.0,
+            left: 20.0,
+            right: 20.0,
+        });
+        if !connecting {
+            connect = connect.on_press(Message::ConnectDevice(mac.to_string()));
+        }
+        container(
+            column![text("AirPods not connected").size(20), text(status).size(14), connect]
+                .spacing(16)
+                .align_x(Center)
+                .max_width(440),
+        )
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
@@ -738,7 +835,11 @@ impl App {
                                         _ => "Connected".to_string(),
                                     }
                                 } else {
-                                    mac_addr.to_string()
+                                    match self.connect_status.get(mac_addr) {
+                                        Some(ConnectStatus::Connecting) => "Connecting…".to_string(),
+                                        Some(ConnectStatus::Failed(_)) => "Couldn't connect".to_string(),
+                                        None => "Not connected".to_string(),
+                                    }
                                 }
                             }).size(12)
                         ];
@@ -902,11 +1003,15 @@ impl App {
                                                 _ => None,
                                             }
                                         }).unwrap_or_else(|| {
-                                            container(
-                                                text("Required managers or state not available for this AirPods device").size(16)
-                                            )
-                                                .center_x(Length::Fill)
-                                                .center_y(Length::Fill)
+                                            if self.bluetooth_state.connected_devices.contains(id) {
+                                                container(
+                                                    text("Waiting for the AirPods to report their state…").size(16)
+                                                )
+                                                    .center_x(Length::Fill)
+                                                    .center_y(Length::Fill)
+                                            } else {
+                                                self.disconnected_view(id)
+                                            }
                                         })
                                     }
                                     Some(DeviceType::Nothing) => {
@@ -1157,6 +1262,47 @@ impl App {
                                         )
                                     .align_y(Center);
 
+                            let auto_switch_value = self.auto_switch_on_playback;
+                            let auto_switch_toggle = container(
+                                row![
+                                    column![
+                                        text("Switch to this PC on playback").size(16),
+                                        text("When media starts playing here and the AirPods are on another device, connect them to this PC. They leave the other device, even mid-call.").size(12).style(
+                                            |theme: &Theme| {
+                                                let mut style = text::Style::default();
+                                                style.color = Some(theme.palette().text.scale_alpha(0.7));
+                                                style
+                                            }
+                                        ).width(Length::Fill)
+                                    ].width(Length::Fill),
+                                    toggler(auto_switch_value)
+                                        .on_toggle(move |is_enabled| {
+                                            Message::AutoSwitchChanged(is_enabled)
+                                        })
+                                    .spacing(0)
+                                    .size(20)
+                                    ]
+                                        .align_y(Center)
+                                        .spacing(12)
+                                    )
+                                        .padding(Padding{
+                                            top: 5.0,
+                                            bottom: 5.0,
+                                            left: 18.0,
+                                            right: 18.0,
+                                        })
+                                        .style(
+                                            |theme: &Theme| {
+                                                let mut style = container::Style::default();
+                                                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+                                                let mut border = Border::default();
+                                                border.color = theme.palette().primary.scale_alpha(0.5);
+                                                style.border = border.rounded(16);
+                                                style
+                                            }
+                                        )
+                                    .align_y(Center);
+
                             let hires_mic_agc_value = self.hires_mic_agc;
                             let hires_mic_agc_toggle = container(
                                 row![
@@ -1266,6 +1412,8 @@ impl App {
                                     tray_text_mode_toggle,
                                     Space::new().height(Length::from(20)),
                                     controls_settings_col,
+                                    Space::new().height(Length::from(20)),
+                                    auto_switch_toggle,
                                     Space::new().height(Length::from(20)),
                                     a2dp_reset_toggle,
                                     Space::new().height(Length::from(20)),

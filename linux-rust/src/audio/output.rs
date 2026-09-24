@@ -250,7 +250,7 @@ pub fn reset_a2dp(bdaddr: &str) {
 }
 
 // MPRIS players currently reporting "Playing" (kdeconnect proxies excluded).
-fn playing_media_players() -> Vec<String> {
+pub(crate) fn playing_media_players() -> Vec<String> {
     let Ok(conn) = Connection::new_session() else {
         return Vec::new();
     };
