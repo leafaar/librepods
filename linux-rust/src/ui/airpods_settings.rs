@@ -24,7 +24,7 @@ use {
         border::Radius,
         widget::{Space, column, container, pick_list, row, rule, slider, text, toggler},
     },
-    log::error,
+    tracing::error,
     std::{rc::Rc, sync::Arc},
 };
 

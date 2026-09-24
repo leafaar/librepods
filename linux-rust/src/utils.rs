@@ -20,7 +20,7 @@ pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::en
         if devices.contains_key(mac) {
             return;
         }
-        log::info!("Registering device {} ({}) as {:?}", name, mac, type_);
+        tracing::info!("Registering device {} ({}) as {:?}", name, mac, type_);
         devices.insert(
             mac.to_string(),
             DeviceData {
@@ -31,7 +31,7 @@ pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::en
         );
     });
     if let Err(e) = result {
-        log::error!("Failed to register device {}: {}", mac, e);
+        tracing::error!("Failed to register device {}: {}", mac, e);
     }
 }
 
@@ -242,10 +242,10 @@ impl AppSettings {
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
                 if let Err(e) = write_atomic(&path, &json) {
-                    log::error!("Failed to write app settings: {}", e);
+                    tracing::error!("Failed to write app settings: {}", e);
                 }
             }
-            Err(e) => log::error!("Failed to serialize app settings: {}", e),
+            Err(e) => tracing::error!("Failed to serialize app settings: {}", e),
         }
     }
 }

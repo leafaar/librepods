@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use bluer::{Adapter, Address};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio::output::playing_media_players;
 use crate::devices::enums::{DeviceData, DeviceType};

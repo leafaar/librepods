@@ -1,7 +1,7 @@
 use bluer::l2cap::{SeqPacket, Socket, SocketAddr};
 use bluer::{Address, AddressType, Error, Result};
 use hex;
-use log::{debug, error, info};
+use tracing::{debug, error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};

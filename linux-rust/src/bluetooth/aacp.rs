@@ -6,7 +6,7 @@ use bluer::{
     Address, AddressType, Error, Result,
     l2cap::{SeqPacket, Socket, SocketAddr},
 };
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;

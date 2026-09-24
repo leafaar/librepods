@@ -21,7 +21,7 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::message::MatchRule;
 use devices::airpods::AirPodsDevice;
 use ksni::TrayMethods;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool};
@@ -62,24 +62,7 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
-    let log_level = if args.debug { "debug" } else { "info" };
-    // let wayland_display = env::var("WAYLAND_DISPLAY").is_ok();
-    // if wayland_display && env::var("WGPU_BACKEND").is_err() {
-    //     unsafe { env::set_var("WGPU_BACKEND", "gl") };
-    // }
-    if env::var("RUST_LOG").is_err() {
-        unsafe {
-            env::set_var(
-                "RUST_LOG",
-                log_level.to_owned()
-                    + &format!(
-                        ",zbus=warn,winit=warn,tracing=warn,iced_wgpu=warn,wgpu_hal=warn,wgpu_core=warn,cosmic_text=warn,naga=warn,iced_winit=warn,librepods::bluetooth::le={}",
-                        if args.le_debug { "debug" } else { "info" }
-                    ),
-            )
-        };
-    }
-    env_logger::init();
+    init_tracing(args.debug, args.le_debug);
 
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
 
@@ -92,7 +75,7 @@ fn main() -> iced::Result {
         info!("Running in headless mode (no GUI)");
         let rt = tokio::runtime::Runtime::new().unwrap();
         if let Err(e) = rt.block_on(async_main(ui_tx, device_managers, args.no_tray)) {
-            log::error!("LibrePods could not start: {e}");
+            tracing::error!("LibrePods could not start: {e}");
             std::process::exit(1);
         }
         Ok(())
@@ -103,7 +86,7 @@ fn main() -> iced::Result {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(async_main(ui_tx, device_managers_clone, no_tray)) {
-                log::error!("LibrePods could not start: {e}");
+                tracing::error!("LibrePods could not start: {e}");
                 std::process::exit(1);
             }
         });
@@ -121,12 +104,12 @@ async fn async_main(
 
     let devices_path = get_devices_path();
     let devices_json = std::fs::read_to_string(&devices_path).unwrap_or_else(|e| {
-        log::error!("Failed to read devices file: {}", e);
+        tracing::error!("Failed to read devices file: {}", e);
         "{}".to_string()
     });
     let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
         .unwrap_or_else(|e| {
-            log::error!("Deserialization failed: {}", e);
+            tracing::error!("Deserialization failed: {}", e);
             HashMap::new()
         });
     for (mac, device_data) in devices_list.iter() {
@@ -164,7 +147,7 @@ async fn async_main(
         match tray.assume_sni_available(true).spawn().await {
             Ok(handle) => Some(handle),
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "Failed to start system tray ({e}); continuing without tray. \
                      Your environment may lack a StatusNotifier/AppIndicator watcher."
                 );
@@ -174,19 +157,19 @@ async fn async_main(
     };
 
     let session = bluer::Session::new().await.inspect_err(|e| {
-        log::error!(
+        tracing::error!(
             "Cannot talk to BlueZ over D-Bus: {e}. Is the bluetooth service running? \
              Check with `systemctl status bluetooth`."
         )
     })?;
     let adapter = session.default_adapter().await.inspect_err(|e| {
-        log::error!(
+        tracing::error!(
             "No Bluetooth adapter available: {e}. Make sure an adapter is present \
              and not blocked - see `rfkill list bluetooth`."
         )
     })?;
     adapter.set_powered(true).await.inspect_err(|e| {
-        log::error!(
+        tracing::error!(
             "Cannot power on the Bluetooth adapter: {e}. It is likely soft-blocked, \
              try `rfkill unblock bluetooth`."
         )
@@ -199,7 +182,7 @@ async fn async_main(
     tokio::spawn(async move {
         info!("Starting LE monitor...");
         if let Err(e) = start_le_monitor(le_tray_clone, le_ui_tx).await {
-            log::error!("LE monitor error: {}", e);
+            tracing::error!("LE monitor error: {}", e);
         }
     });
 
@@ -285,11 +268,11 @@ async fn async_main(
             }
         }
         Err(e) => {
-            log::debug!("type of error: {:?}", e.kind);
+            tracing::debug!("type of error: {:?}", e.kind);
             if e.kind
                 != bluer::ErrorKind::Internal(InternalErrorKind::Io(std::io::ErrorKind::NotFound))
             {
-                log::error!("Error finding other managed devices: {}", e);
+                tracing::error!("Error finding other managed devices: {}", e);
             } else {
                 info!("No other managed devices found.");
             }
@@ -493,4 +476,18 @@ fn spawn_shutdown_handler(
         }
         std::process::exit(0);
     });
+}
+
+/// Log to stderr through tracing. RUST_LOG overrides the defaults; libraries that
+/// use the `log` crate (bluer, iced, wgpu) are bridged into the same subscriber.
+fn init_tracing(debug: bool, le_debug: bool) {
+    let level = if debug { "debug" } else { "info" };
+    let le_level = if le_debug { "debug" } else { "info" };
+    let default_filter = format!(
+        "{level},zbus=warn,winit=warn,iced_wgpu=warn,wgpu_hal=warn,wgpu_core=warn,\
+         cosmic_text=warn,naga=warn,iced_winit=warn,librepods::bluetooth::le={le_level}"
+    );
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }

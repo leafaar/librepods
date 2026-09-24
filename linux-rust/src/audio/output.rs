@@ -7,7 +7,7 @@ use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::operation::{Operation, State as OperationState};
 use libpulse_binding::proplist::properties;
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};

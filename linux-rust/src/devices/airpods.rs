@@ -5,7 +5,7 @@ use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::tray::MyTray;
 use bluer::Address;
 use ksni::Handle;
-use log::{debug, error, info};
+use tracing::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 use crate::utils::get_app_settings_path;
@@ -163,7 +163,7 @@ impl AirPodsDevice {
         aacp_manager.spawn_connection_task(async move {
             while let Some((id, value)) = command_rx.recv().await {
                 if let Err(e) = aacp_manager_clone.send_control_command(id, &value).await {
-                    log::error!("Failed to send control command: {}", e);
+                    tracing::error!("Failed to send control command: {}", e);
                 }
             }
         });

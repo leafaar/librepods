@@ -7,7 +7,7 @@ use libpulse_binding::context::introspect::SinkInfo;
 use libpulse_binding::def::Retval;
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

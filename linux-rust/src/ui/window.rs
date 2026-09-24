@@ -29,7 +29,7 @@ use iced::{
     Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
     Subscription, Task, Theme, daemon, window,
 };
-use log::{debug, error, warn};
+use tracing::{debug, error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

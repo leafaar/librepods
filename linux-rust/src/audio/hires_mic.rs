@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioHandle;

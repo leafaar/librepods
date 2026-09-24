@@ -3,7 +3,7 @@
 //! See https://ffmpeg-d.dpldocs.info/v3.1.1/ffmpeg.libavcodec.avcodec.AVCodecContext.html
 
 use ffmpeg_sys_next as ff;
-use log::{info, warn};
+use tracing::{info, warn};
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::Once;

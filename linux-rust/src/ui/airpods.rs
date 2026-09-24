@@ -9,7 +9,7 @@ use iced::widget::{
     toggler,
 };
 use iced::{Background, Border, Center, Color, Length, Padding, Theme};
-use log::error;
+use tracing::error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

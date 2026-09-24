@@ -3,7 +3,7 @@ use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::utils::{get_devices_path, update_devices_file};
 use bluer::Address;
-use log::{debug, error, info};
+use tracing::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;

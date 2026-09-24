@@ -10,7 +10,7 @@ use bluer::monitor::{Monitor, MonitorEvent, Pattern};
 use bluer::{Address, DeviceEvent, DeviceProperty, Session};
 use futures::{Stream, StreamExt};
 use hex;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};

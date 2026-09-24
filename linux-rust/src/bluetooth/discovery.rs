@@ -1,5 +1,5 @@
 use bluer::Adapter;
-use log::{debug, warn};
+use tracing::{debug, warn};
 use std::io::Error;
 
 pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<bluer::Device> {

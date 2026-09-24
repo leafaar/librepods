@@ -6,7 +6,7 @@ use iced::border::Radius;
 use iced::widget::rule::FillMode;
 use iced::widget::{Space, button, column, container, row, rule, slider, text, toggler};
 use iced::{Background, Border, Center, Element, Length, Padding, Theme};
-use log::error;
+use tracing::error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
