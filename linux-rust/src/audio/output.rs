@@ -1,29 +1,33 @@
 //! PipeWire/PulseAudio output for the hi-res microphone
 
 use {
-    crate::audio::agc::Agc,
-    dbus::blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
+    crate::{
+        audio::{
+            agc::Agc,
+            mpris::{self, DbusMediaPlayers, MediaPlayers, PlayerCommand},
+            pulse::{SoundServerError, connect, wait_for},
+        },
+        utils::AppSettings,
+    },
     libpulse_binding::{
         callbacks::ListResult,
-        context::{Context, FlagSet as ContextFlagSet, introspect::SourceOutputInfo},
+        context::{Context, introspect::SourceOutputInfo},
         def::Retval,
-        mainloop::standard::{IterateResult, Mainloop},
-        operation::{Operation, State as OperationState},
+        mainloop::standard::Mainloop,
         proplist::properties,
     },
     std::{
         cell::{Cell, RefCell},
         fs::{File, OpenOptions},
-        io::{ErrorKind, Write},
+        io::{self, ErrorKind, Write},
         os::unix::fs::OpenOptionsExt,
         rc::Rc,
         sync::{
-            Mutex,
+            Mutex, PoisonError,
             atomic::{AtomicBool, Ordering},
         },
-        time::{Duration, Instant},
     },
-    tracing::{error, info, warn},
+    tracing::{debug, info, warn},
 };
 
 pub const SOURCE_NAME: &str = "AirPodsHiRes";
@@ -50,11 +54,10 @@ impl VirtualMic {
     /// Load the pipe-source. The sound server round trips block for up to
     /// PULSE_TIMEOUT each, so they run on the blocking pool, not on the async
     /// worker that awaits this.
-    pub async fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
+    pub async fn open(sample_rate: u32, channels: u8) -> Result<VirtualMic, SoundServerError> {
         tokio::task::spawn_blocking(move || Self::open_blocking(sample_rate, channels))
             .await
-            .ok()
-            .flatten()
+            .map_err(|_| SoundServerError::OperationCancelled)?
     }
 
     /// Unload the pipe-source on the blocking pool. Dropping a VirtualMic
@@ -63,8 +66,10 @@ impl VirtualMic {
         let _ = tokio::task::spawn_blocking(move || drop(self)).await;
     }
 
-    fn open_blocking(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
-        unload_stale_modules();
+    fn open_blocking(sample_rate: u32, channels: u8) -> Result<VirtualMic, SoundServerError> {
+        if let Err(e) = unload_stale_modules() {
+            warn!("[pw] could not remove stale hi-res modules: {}", e);
+        }
 
         let chan_map = if channels == 1 {
             "mono"
@@ -80,25 +85,21 @@ impl VirtualMic {
              channels={channels} channel_map={chan_map} \
              source_properties=\"device.description=AirPods_HiRes_Mic node.driver=false priority.driver=0\""
         );
-        let module = match load_module("module-pipe-source", &args) {
-            Some(i) => i,
-            None => {
-                warn!("could not load module-pipe-source");
-                return None;
-            },
-        };
+        let module = load_module("module-pipe-source", &args)?;
 
         info!(
             "[pw] hi-res mic ready: select '{}' as your microphone",
             SOURCE_NAME
         );
-        Some(VirtualMic { module })
+        Ok(VirtualMic { module })
     }
 }
 
 impl Drop for VirtualMic {
     fn drop(&mut self) {
-        unload_module(self.module);
+        if let Err(e) = unload_module(self.module) {
+            warn!("[pw] could not unload the hi-res module: {}", e);
+        }
         let _ = std::fs::remove_file(fifo_path());
     }
 }
@@ -110,37 +111,32 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn open(sample_rate: u32, _channels: u8) -> Option<Output> {
+    pub fn open(sample_rate: u32, _channels: u8) -> io::Result<Output> {
         // O_RDWR never blocks on a FIFO and keeps the pipe from ever seeing
         // "all writers closed"; we only ever write to it. O_NONBLOCK keeps the
         // decode thread from hanging when the source stops draining the pipe
         // (it suspends once the last recorder leaves, before the monitor notices).
         let path = fifo_path();
-        let fifo = match OpenOptions::new()
+        let fifo = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(O_NONBLOCK)
             .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                error!("could not open hi-res fifo {}: {}", path, e);
-                return None;
-            },
-        };
+            .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
 
-        let agc = crate::utils::AppSettings::load()
+        let agc = AppSettings::load()
             .hires_mic_agc
             .then(|| Agc::new(sample_rate));
         if agc.is_none() {
             info!("[pw] AGC disabled; passing through raw hi-res capture");
         }
-        Some(Output { fifo, agc })
+        Ok(Output { fifo, agc })
     }
 
     // Write s16 PCM into the FIFO, returning the (post-AGC) peak. AGC runs in
-    // place on `pcm`.
-    pub fn write(&mut self, pcm: &mut [i16]) -> Result<f32, ()> {
+    // place on `pcm`. A full pipe drops the rest of the block and is not an
+    // error; any other write failure is.
+    pub fn write(&mut self, pcm: &mut [i16]) -> io::Result<f32> {
         if let Some(agc) = &mut self.agc {
             agc.process(pcm);
         }
@@ -148,13 +144,13 @@ impl Output {
 
         let peak = pcm
             .iter()
-            .map(|&s| (s as f32 / 32768.0).abs())
+            .map(|&s| (f32::from(s) / 32768.0).abs())
             .fold(0.0f32, f32::max);
 
         // SAFETY: the pointer and length cover exactly the initialised i16 slice,
         // u8 has no alignment requirement and every byte pattern is a valid u8.
         let bytes = unsafe {
-            std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
+            std::slice::from_raw_parts(pcm.as_ptr().cast::<u8>(), std::mem::size_of_val(pcm))
         };
 
         'chunks: for chunk in bytes.chunks(PIPE_BUF) {
@@ -166,10 +162,7 @@ impl Output {
                     // Nobody is draining the pipe: drop the rest of this block
                     // rather than block the decode thread.
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break 'chunks,
-                    Err(e) => {
-                        error!("hi-res fifo write broke: {}", e);
-                        return Err(());
-                    },
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -202,48 +195,53 @@ fn is_level_meter(item: &SourceOutputInfo) -> bool {
 
 // Name of the application recording from the virtual source, or None if idle.
 // Corked (paused) streams and level meters do not count as recording.
-pub fn source_consumer(name: &str) -> Option<String> {
+pub fn source_consumer(name: &str) -> Result<Option<String>, SoundServerError> {
     let (mut mainloop, context) = connect()?;
-    let introspect = context.introspect();
+    let result = source_consumer_on(&mut mainloop, &context, name);
+    mainloop.quit(Retval(0));
+    result
+}
 
-    let index = Rc::new(Cell::new(u32::MAX));
+fn source_consumer_on(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    name: &str,
+) -> Result<Option<String>, SoundServerError> {
+    let introspect = context.introspect();
+    let index = Rc::new(Cell::new(None::<u32>));
     let mut op = introspect.get_source_info_by_name(name, {
         let index = index.clone();
         move |result| {
             if let ListResult::Item(item) = result {
-                index.set(item.index);
+                index.set(Some(item.index));
             }
         }
     });
-    wait_for(&mut mainloop, &mut op);
+    wait_for(mainloop, &mut op)?;
+    let Some(idx) = index.get() else {
+        return Ok(None);
+    };
 
     let app = Rc::new(RefCell::new(None::<String>));
-    let idx = index.get();
-    if idx != u32::MAX {
-        let mut op = introspect.get_source_output_info_list({
-            let app = app.clone();
-            move |result| {
-                if let ListResult::Item(item) = result {
-                    if item.source == idx
-                        && !item.corked
-                        && !is_level_meter(item)
-                        && app.borrow().is_none()
-                    {
-                        let label = item
-                            .proplist
-                            .get_str("application.name")
-                            .or_else(|| item.name.as_ref().map(|n| n.to_string()));
-                        app.replace(label);
-                    }
-                }
+    let mut op = introspect.get_source_output_info_list({
+        let app = app.clone();
+        move |result| {
+            if let ListResult::Item(item) = result
+                && item.source == idx
+                && !item.corked
+                && !is_level_meter(item)
+                && app.borrow().is_none()
+            {
+                let label = item
+                    .proplist
+                    .get_str("application.name")
+                    .or_else(|| item.name.as_ref().map(ToString::to_string));
+                app.replace(label);
             }
-        });
-        wait_for(&mut mainloop, &mut op);
-    }
-    mainloop.quit(Retval(0));
-
-    let result = app.borrow().clone();
-    result
+        }
+    });
+    wait_for(mainloop, &mut op)?;
+    Ok(app.borrow_mut().take())
 }
 
 // Serializes A2DP resets. A reset reads the active card profile, switches to
@@ -261,26 +259,38 @@ static A2DP_RESET_LOCK: Mutex<()> = Mutex::new(());
 // `cancel` is checked before each step up to switching the card off; once the
 // card is off it is always switched back.
 pub fn reset_a2dp(bdaddr: &str, cancel: Option<&AtomicBool>) {
-    // A flag with no other data riding on it, so Relaxed is enough.
-    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
-    if !crate::utils::AppSettings::load().a2dp_reset {
+    if !AppSettings::load().a2dp_reset {
         return;
     }
+    // A flag with no other data riding on it, so Relaxed is enough.
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     // The guarded data is (), so a poisoned lock carries no broken state.
     let _guard = A2DP_RESET_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
     if cancelled() {
         return;
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
-    let Some((mut mainloop, context)) = connect() else {
+    let Ok((mut mainloop, context)) = connect() else {
         return;
     };
+    if let Err(e) = reset_card(&mut mainloop, &context, &card, cancelled) {
+        warn!("[pw] A2DP reset of {} failed: {}", card, e);
+    }
+    mainloop.quit(Retval(0));
+}
+
+fn reset_card(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    card: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), SoundServerError> {
     let mut introspect = context.introspect();
 
     let current_profile = Rc::new(RefCell::new(None::<String>));
-    let mut op = introspect.get_card_info_by_name(&card, {
+    let mut op = introspect.get_card_info_by_name(card, {
         let current_profile = current_profile.clone();
         move |result| {
             if let ListResult::Item(item) = result {
@@ -288,233 +298,139 @@ pub fn reset_a2dp(bdaddr: &str, cancel: Option<&AtomicBool>) {
                     .active_profile
                     .as_ref()
                     .and_then(|p| p.name.as_ref())
-                    .map(|n| n.to_string());
+                    .map(ToString::to_string);
             }
         }
     });
-    wait_for(&mut mainloop, &mut op);
+    // A failed lookup leaves no profile, which skips the reset below.
+    let _ = wait_for(mainloop, &mut op);
 
-    let Some(current_profile) = current_profile.borrow().clone() else {
+    let Some(current_profile) = current_profile.borrow_mut().take() else {
         warn!("[pw] no active profile on {}; skipping A2DP reset", card);
-        mainloop.quit(Retval(0));
-        return;
+        return Ok(());
     };
     // Already off: another reset was interrupted or the user turned the card
     // off. Restoring "off" would do nothing useful, so leave it alone.
     if current_profile == "off" {
         warn!("[pw] {} profile is off; skipping A2DP reset", card);
-        mainloop.quit(Retval(0));
-        return;
+        return Ok(());
     }
     if cancelled() {
-        mainloop.quit(Retval(0));
-        return;
+        return Ok(());
     }
 
-    // Resetting the a2dp transport can pause media players do to setting the crad profile to off
-    // Get all active media players
-    let players = playing_media_players();
+    // Switching the card off can pause media players, so remember which were
+    // playing and resume them afterwards.
+    let players = mpris::playing(&DbusMediaPlayers).unwrap_or_else(|e| {
+        warn!("[pw] could not list media players: {}", e);
+        Vec::new()
+    });
     if cancelled() {
-        mainloop.quit(Retval(0));
-        return;
+        return Ok(());
     }
 
     info!(
         "[pw] reset A2DP transport: {} off -> {}",
         card, current_profile
     );
-    let mut op = introspect.set_card_profile_by_name(&card, "off", None);
-    wait_for(&mut mainloop, &mut op);
+    let mut op = introspect.set_card_profile_by_name(card, "off", None);
+    if let Err(e) = wait_for(mainloop, &mut op) {
+        warn!("[pw] switching {} off failed: {}", card, e);
+    }
+    // Restore even if switching off failed: the card must not stay off.
+    let mut op = introspect.set_card_profile_by_name(card, &current_profile, None);
+    let restored = wait_for(mainloop, &mut op);
 
-    let mut op = introspect.set_card_profile_by_name(&card, &current_profile, None);
-    wait_for(&mut mainloop, &mut op);
-    mainloop.quit(Retval(0));
-
-    // resume all media players after the reset
-    resume_media_players(&players);
-}
-
-// MPRIS players currently reporting "Playing" (kdeconnect proxies excluded).
-pub(crate) fn playing_media_players() -> Vec<String> {
-    let Ok(conn) = Connection::new_session() else {
-        return Vec::new();
-    };
-    let proxy = conn.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_secs(5),
-    );
-    let names: (Vec<String>,) = match proxy.method_call("org.freedesktop.DBus", "ListNames", ()) {
-        Ok(n) => n,
-        Err(_) => return Vec::new(),
-    };
-    names
-        .0
-        .into_iter()
-        .filter(|s| {
-            s.starts_with("org.mpris.MediaPlayer2.")
-                && !s.starts_with("org.mpris.MediaPlayer2.kdeconnect.mpris_")
-        })
-        .filter(|s| {
-            let proxy = conn.with_proxy(s, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-            proxy
-                .get::<String>("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
-                .map(|st| st == "Playing")
-                .unwrap_or(false)
-        })
-        .collect()
+    resume_players(&DbusMediaPlayers, &players);
+    restored
 }
 
 /// Pause every MPRIS player that is playing and return them, so the caller can
-/// resume exactly those later.
+/// resume exactly those later. The microphone test pauses media this way.
 pub(crate) fn pause_media_players() -> Vec<String> {
-    let players = playing_media_players();
-    let Ok(conn) = Connection::new_session() else {
-        return Vec::new();
+    let players = DbusMediaPlayers;
+    let playing = match mpris::playing(&players) {
+        Ok(playing) => playing,
+        Err(e) => {
+            warn!("[pw] could not list media players: {}", e);
+            return Vec::new();
+        },
     };
-    for service in &players {
-        let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-        let _ =
-            proxy.method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Pause", ());
+    for service in &playing {
+        if let Err(e) = players.send(service, PlayerCommand::Pause) {
+            warn!("[pw] {}", e);
+        }
     }
-    players
+    playing
 }
 
 pub(crate) fn resume_media_players(services: &[String]) {
-    if services.is_empty() {
-        return;
-    }
-    let Ok(conn) = Connection::new_session() else {
-        return;
-    };
+    resume_players(&DbusMediaPlayers, services);
+}
+
+fn resume_players(players: &dyn MediaPlayers, services: &[String]) {
     for service in services {
-        let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
-        if proxy
-            .method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Play", ())
-            .is_ok()
-        {
-            info!("[pw] resumed media player after A2DP reset: {}", service);
+        match players.send(service, PlayerCommand::Play) {
+            Ok(()) => info!("[pw] resumed media player after A2DP reset: {}", service),
+            Err(e) => debug!("[pw] {}", e),
         }
     }
 }
 
-/// Longest a single sound server request may take before we give up on it.
-const PULSE_TIMEOUT: Duration = Duration::from_secs(3);
-const PULSE_POLL: Duration = Duration::from_millis(2);
-
-/// Run the mainloop until `op` finishes. Returns false if it was cancelled, the
-/// connection died, or the server did not answer within PULSE_TIMEOUT. Polls
-/// instead of blocking in iterate(true), which would wait forever on a server
-/// that stopped answering.
-pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>) -> bool {
-    let deadline = Instant::now() + PULSE_TIMEOUT;
-    loop {
-        match op.get_state() {
-            OperationState::Done => return true,
-            OperationState::Cancelled => return false,
-            OperationState::Running => {},
-        }
-        if Instant::now() >= deadline {
-            warn!("[pw] sound server did not answer in time");
-            op.cancel();
-            return false;
-        }
-        match mainloop.iterate(false) {
-            IterateResult::Quit(_) | IterateResult::Err(_) => return false,
-            IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
-            IterateResult::Success(_) => {},
-        }
-    }
-}
-
-/// Connect to the sound server, giving up after PULSE_TIMEOUT.
-pub(crate) fn connect() -> Option<(Mainloop, Context)> {
-    connect_cancellable(|| false)
-}
-
-/// Like connect(), but also gives up as soon as `cancelled` returns true.
-pub(crate) fn connect_cancellable(cancelled: impl Fn() -> bool) -> Option<(Mainloop, Context)> {
-    let mut mainloop = Mainloop::new()?;
-    let mut context = Context::new(&mainloop, "LibrePods")?;
-    context
-        .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
-        .ok()?;
-    let deadline = Instant::now() + PULSE_TIMEOUT;
-    loop {
-        if cancelled() {
-            return None;
-        }
-        if Instant::now() >= deadline {
-            warn!("[pw] could not connect to the sound server in time");
-            return None;
-        }
-        match mainloop.iterate(false) {
-            IterateResult::Quit(_) | IterateResult::Err(_) => return None,
-            IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
-            IterateResult::Success(_) => {},
-        }
-        match context.get_state() {
-            libpulse_binding::context::State::Ready => break,
-            libpulse_binding::context::State::Failed
-            | libpulse_binding::context::State::Terminated => return None,
-            _ => {},
-        }
-    }
-    Some((mainloop, context))
-}
-
-fn unload_stale_modules() {
-    let Some((mut mainloop, context)) = connect() else {
-        return;
-    };
+fn unload_stale_modules() -> Result<(), SoundServerError> {
+    let (mut mainloop, context) = connect()?;
     let stale: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
     let introspect = context.introspect();
     let mut op = introspect.get_module_info_list({
         let stale = stale.clone();
         move |result| {
-            if let ListResult::Item(item) = result {
-                if let Some(arg) = &item.argument {
-                    if arg.contains(SOURCE_NAME) {
-                        stale.borrow_mut().push(item.index);
-                    }
-                }
+            if let ListResult::Item(item) = result
+                && item
+                    .argument
+                    .as_ref()
+                    .is_some_and(|arg| arg.contains(SOURCE_NAME))
+            {
+                stale.borrow_mut().push(item.index);
             }
         }
     });
-    wait_for(&mut mainloop, &mut op);
+    let listed = wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
+    listed?;
 
     for index in stale.borrow().iter() {
         warn!("[pw] unloading stale hi-res module {}", index);
-        unload_module(*index);
+        if let Err(e) = unload_module(*index) {
+            warn!("[pw] could not unload stale module {}: {}", index, e);
+        }
     }
+    Ok(())
 }
 
-fn load_module(name: &str, args: &str) -> Option<u32> {
+fn load_module(name: &str, args: &str) -> Result<u32, SoundServerError> {
     let (mut mainloop, context) = connect()?;
-    let idx: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
+    let idx = Rc::new(Cell::new(u32::MAX));
     let mut introspect = context.introspect();
     let mut op = introspect.load_module(name, args, {
         let idx = idx.clone();
         move |index| idx.set(index)
     });
-    wait_for(&mut mainloop, &mut op);
+    let loaded = wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
+    loaded?;
 
+    // The sound server reports a failed load as index u32::MAX.
     match idx.get() {
-        u32::MAX => None,
-        i => Some(i),
+        u32::MAX => Err(SoundServerError::ModuleLoadFailed(name.to_string())),
+        i => Ok(i),
     }
 }
 
-fn unload_module(index: u32) {
-    if index == u32::MAX {
-        return;
-    }
-    if let Some((mut mainloop, context)) = connect() {
-        let mut introspect = context.introspect();
-        let mut op = introspect.unload_module(index, |_| {});
-        wait_for(&mut mainloop, &mut op);
-        mainloop.quit(Retval(0));
-    }
+fn unload_module(index: u32) -> Result<(), SoundServerError> {
+    let (mut mainloop, context) = connect()?;
+    let mut introspect = context.introspect();
+    let mut op = introspect.unload_module(index, |_| {});
+    let unloaded = wait_for(&mut mainloop, &mut op);
+    mainloop.quit(Retval(0));
+    unloaded
 }
