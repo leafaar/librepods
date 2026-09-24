@@ -8,6 +8,8 @@
 //! `AACPManager::receive_packet`), and outgoing values are zero padded to four bytes
 //! by `send_control_command`, so decoders treat missing trailing bytes as zero.
 
+use std::fmt;
+
 /// A value carried by one control command.
 pub trait ControlValue: Sized {
     fn to_value(self) -> Vec<u8>;
@@ -61,7 +63,7 @@ impl MicMode {
         MicMode::AlwaysLeft,
     ];
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             MicMode::Automatic => "Automatic",
             MicMode::AlwaysRight => "Always Right",
@@ -99,7 +101,7 @@ pub enum ClickHoldAction {
 impl ClickHoldAction {
     pub const ALL: [ClickHoldAction; 2] = [ClickHoldAction::NoiseControl, ClickHoldAction::Siri];
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             ClickHoldAction::NoiseControl => "Listening Mode",
             ClickHoldAction::Siri => "Siri",
@@ -239,10 +241,18 @@ impl CallControls {
         CallControls::PressTwiceToMute,
     ];
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            CallControls::PressOnceToMute => "Press once to mute, press twice to hang up",
-            CallControls::PressTwiceToMute => "Press twice to mute, press once to hang up",
+            CallControls::PressOnceToMute => "Press Once",
+            CallControls::PressTwiceToMute => "Press Twice",
+        }
+    }
+
+    /// The press that hangs up, the one not used for mute.
+    pub fn hang_up_press(self) -> &'static str {
+        match self {
+            CallControls::PressOnceToMute => CallControls::PressTwiceToMute.label(),
+            CallControls::PressTwiceToMute => CallControls::PressOnceToMute.label(),
         }
     }
 }
@@ -280,7 +290,7 @@ impl PressInterval {
         PressInterval::Slowest,
     ];
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             PressInterval::Default => "Default",
             PressInterval::Slower => "Slower",
@@ -324,7 +334,7 @@ impl SwipeInterval {
         SwipeInterval::Longest,
     ];
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             SwipeInterval::Default => "Default",
             SwipeInterval::Longer => "Longer",
@@ -351,6 +361,26 @@ impl ControlValue for SwipeInterval {
         }
     }
 }
+
+// Choices shown in a pick list render through `Display`. For `CallControls` the
+// label is the press that mutes.
+macro_rules! display_via_label {
+    ($($t:ty),*) => {
+        $(impl fmt::Display for $t {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.label())
+            }
+        })*
+    };
+}
+
+display_via_label!(
+    MicMode,
+    ClickHoldAction,
+    CallControls,
+    PressInterval,
+    SwipeInterval
+);
 
 /// Upper bound of the percentage settings below.
 pub const PERCENT_MAX: u8 = 100;
