@@ -1,0 +1,109 @@
+name: linux-rust CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "linux-rust/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/linux-rust-ci.yml"
+  pull_request:
+    paths:
+      - "linux-rust/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/linux-rust-ci.yml"
+  # Advisories appear without any change here; check them weekly as well.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: linux-rust
+
+jobs:
+  check:
+    # 22.04 carries the oldest system libraries we support (FFmpeg 4.4).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libdbus-1-dev libpulse-dev \
+            libavcodec-dev libavutil-dev libxkbcommon-dev libwayland-dev
+
+      - name: read toolchain pins
+        run: |
+          echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+          echo "msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: install pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
+          components: clippy
+
+      # Formatting uses nightly rustfmt (imports_granularity is unstable); miri
+      # runs the tests that touch no FFI.
+      - name: install nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, miri, rust-src
+
+      - name: install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.msrv }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: linux-rust
+
+      - name: fmt
+        run: cargo +nightly fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: msrv
+        run: cargo +${{ env.msrv }} check --locked
+
+      # Undefined-behavior check over the pure parsing and DSP tests. Tests that
+      # call into FFmpeg, PulseAudio or D-Bus are out of reach for miri.
+      - name: miri
+        run: "cargo +nightly miri test --locked -- bluetooth:: audio::agc"
+
+  deny:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: linux-rust/Cargo.toml
+          command: check advisories bans licenses sources
+
+  nix:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # Builds the package and runs the clippy, test and cargo-deny checks with
+      # the same pinned toolchain.
+      - name: nix flake check
+        working-directory: .
+        run: nix flake check --print-build-logs
