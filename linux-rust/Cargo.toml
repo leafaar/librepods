@@ -27,6 +27,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # AAC-ELD decode for the hi-res microphone. System libavcodec/libavutil via
 # pkg-config (no bundled build); avformat/swscale/etc. are not needed.
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec"] }
+thiserror = "2"
+anyhow = "1"
 
 [lints.rust]
 # Edition 2024 only warns; every unsafe operation must sit in its own block
@@ -65,3 +67,7 @@ lto = true
 codegen-units = 8
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["test-util"] }
