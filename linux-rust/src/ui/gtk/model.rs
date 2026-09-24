@@ -21,7 +21,10 @@ use {
         ui::{
             connect::{ConnectRequests, ConnectStatus, sidebar_status},
             format::{live_case_level, validate_device_name},
-            gtk::battery::{Batteries, batteries},
+            gtk::{
+                battery::{Batteries, batteries},
+                controls::{self, ControlChange, Settling},
+            },
             messages::BluetoothUIMessage,
         },
         utils::{AppSettings, PreferredCodec, ThemePreference},
@@ -62,6 +65,16 @@ pub(crate) enum Input {
     Setting(SettingChange),
     /// A message for the user, such as a command that failed.
     Toast(String),
+    // AirPods settings sections (controls.rs).
+    /// A change in the press and hold, calls, microphone, accessibility,
+    /// Adaptive Audio or sleep settings.
+    AirPodsControl(String, ControlChange),
+    /// The settle delay of a slider change ran out.
+    ControlSettled {
+        mac: String,
+        identifier: ControlCommandIdentifiers,
+        generation: u64,
+    },
 }
 
 /// Work for the app to do after an update.
@@ -105,6 +118,13 @@ pub(crate) enum Effect {
     ApplyTheme(ThemePreference),
     PresentWindow,
     Toast(String),
+    // AirPods settings sections (controls.rs).
+    /// Come back with `Input::ControlSettled` after controls::SETTLE_DELAY.
+    SettleControl {
+        mac: String,
+        identifier: ControlCommandIdentifiers,
+        generation: u64,
+    },
 }
 
 /// What a connected device reported when the UI first saw it.
@@ -317,6 +337,8 @@ pub(crate) struct Model {
     settings: AppSettings,
     /// Hint for the name field of the device being renamed.
     name_hint: Option<(String, NameHint)>,
+    /// Slider values of the AirPods settings waiting to be sent.
+    settling: Settling,
 }
 
 impl Model {
@@ -331,6 +353,7 @@ impl Model {
             selection: Selection::None,
             settings,
             name_hint: None,
+            settling: Settling::default(),
         };
         model.set_devices(devices);
         model
@@ -402,6 +425,19 @@ impl Model {
             },
             Input::Setting(change) => self.change_setting(change),
             Input::Toast(message) => vec![Effect::Toast(message)],
+            // AirPods settings sections (controls.rs).
+            Input::AirPodsControl(mac, change) => match self.airpods.get_mut(&mac) {
+                Some(airpods) => controls::apply(mac, airpods, &mut self.settling, change),
+                None => Vec::new(),
+            },
+            Input::ControlSettled {
+                mac,
+                identifier,
+                generation,
+            } => {
+                let connected = self.airpods.contains_key(&mac);
+                controls::settled(mac, connected, &mut self.settling, identifier, generation)
+            },
         }
     }
 

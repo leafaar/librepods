@@ -13,6 +13,7 @@ use {
         ui::gtk::{
             battery::{Batteries, Level},
             model::{AirPods, Input, Model, NameHint},
+            pages::airpods_settings::ControlGroup,
             widgets::{
                 CurrentDevice, Dispatch, Guarded, clear_box, combo_row, switch_row, value_row,
             },
@@ -62,9 +63,13 @@ impl AirPodsPage {
             // and the microphone test (ui/airpods.rs, audio/mic_test.rs) go
             // here. The conversation awareness switch in NoiseControlSection
             // must be locked while a capture manages it.
-            // Extension point: the settings sections backported from
-            // ui/airpods_settings.rs and bluetooth/settings.rs go here. They
-            // read AirPods::control_values and send Effect::SendControl.
+            // AirPods settings sections (pages/airpods_settings.rs).
+            Box::new(ControlGroup::press_and_hold(&cx)),
+            Box::new(ControlGroup::calls(&cx)),
+            Box::new(ControlGroup::microphone(&cx)),
+            Box::new(ControlGroup::sleep(&cx)),
+            Box::new(ControlGroup::accessibility(&cx)),
+            Box::new(ControlGroup::adaptive_audio(&cx)),
             Box::new(InfoSection::new(&cx)),
         ];
         let page = adw::PreferencesPage::new();
