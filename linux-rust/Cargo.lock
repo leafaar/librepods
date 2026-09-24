@@ -2334,6 +2334,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "aes",
+ "anyhow",
  "bluer",
  "clap",
  "dbus",
@@ -2347,6 +2348,8 @@ dependencies = [
  "libpulse-binding",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",

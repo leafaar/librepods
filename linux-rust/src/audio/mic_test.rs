@@ -7,7 +7,8 @@
 use {
     crate::audio::{
         eld::{ELD_CHANNELS, ELD_SAMPLE_RATE},
-        output::{SOURCE_NAME, connect, connect_cancellable, wait_for},
+        output::SOURCE_NAME,
+        pulse::{connect, connect_cancellable, wait_for},
     },
     libpulse_binding::{
         def::{BufferAttr, Retval},
@@ -25,6 +26,7 @@ use {
         thread::{self, JoinHandle, sleep},
         time::{Duration, Instant},
     },
+    thiserror::Error,
 };
 
 /// Longest recording kept; about 38 MB of 64 kHz mono s16.
@@ -53,21 +55,67 @@ fn spec() -> Spec {
     }
 }
 
+/// Why the microphone test could not record or play. The UI shows the
+/// message as is, so it is written for the user.
+#[derive(Clone, Debug, Error)]
+pub enum MicTestError {
+    #[error("Could not reach the sound server")]
+    SoundServerUnreachable,
+    #[error("Lost the connection to the sound server")]
+    ConnectionLost,
+    #[error("The sound server did not open the stream in time")]
+    StreamTimeout,
+    #[error("The sound server refused the stream")]
+    StreamRefused,
+    #[error("Could not create a recording stream")]
+    CreateRecordStream,
+    #[error("Could not create a playback stream")]
+    CreatePlaybackStream,
+    #[error("The Hi-Res microphone input is not available")]
+    SourceUnavailable,
+    #[error("Could not play on the default output")]
+    OutputUnavailable,
+    #[error("Recording failed")]
+    RecordingFailed,
+    #[error("Playback failed")]
+    PlaybackFailed,
+    #[error("Recording lost")]
+    RecordingLost,
+    #[error("The recorder crashed")]
+    RecorderCrashed,
+    #[error("No sound came from the AirPods microphone")]
+    NoSound,
+    // io::Error is not Clone; the Player hands its error out by clone.
+    #[error("Could not start the recorder: {0}")]
+    StartRecorder(Arc<std::io::Error>),
+    #[error("Could not start playback: {0}")]
+    StartPlayback(Arc<std::io::Error>),
+}
+
 fn bytes_to_duration(bytes: usize) -> Duration {
     let frames = bytes / BYTES_PER_FRAME;
     Duration::from_secs_f64(frames as f64 / f64::from(ELD_SAMPLE_RATE))
 }
 
+/// Byte offset of `d` into the recording, always on a frame boundary.
 fn duration_to_bytes(d: Duration) -> usize {
     let frames = (d.as_secs_f64() * f64::from(ELD_SAMPLE_RATE)) as usize;
     frames * BYTES_PER_FRAME
 }
 
-fn iterate(mainloop: &mut Mainloop, block: bool) -> Result<(), String> {
+/// Round a byte offset down to the start of its frame.
+fn align_to_frame(bytes: usize) -> usize {
+    bytes - bytes % BYTES_PER_FRAME
+}
+
+/// Byte offset for a seek to `to`, clamped to the end of a `len` byte recording.
+fn seek_offset(to: Duration, len: usize) -> usize {
+    duration_to_bytes(to).min(len)
+}
+
+fn iterate(mainloop: &mut Mainloop, block: bool) -> Result<(), MicTestError> {
     match mainloop.iterate(block) {
-        IterateResult::Quit(_) | IterateResult::Err(_) => {
-            Err("Lost the connection to the sound server".to_string())
-        },
+        IterateResult::Quit(_) | IterateResult::Err(_) => Err(MicTestError::ConnectionLost),
         IterateResult::Success(_) => Ok(()),
     }
 }
@@ -80,20 +128,20 @@ fn wait_ready(
     mainloop: &mut Mainloop,
     stream: &Stream,
     cancelled: impl Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<(), MicTestError> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if cancelled() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("The sound server did not open the stream in time".to_string());
+            return Err(MicTestError::StreamTimeout);
         }
         iterate(mainloop, false)?;
         match stream.get_state() {
             StreamState::Ready => return Ok(()),
             StreamState::Failed | StreamState::Terminated => {
-                return Err("The sound server refused the stream".to_string());
+                return Err(MicTestError::StreamRefused);
             },
             _ => sleep(IDLE_SLEEP),
         }
@@ -104,7 +152,7 @@ pub struct Recorder {
     stop: Arc<AtomicBool>,
     pcm: Arc<Mutex<Vec<u8>>>,
     // Err holds why the recording thread could not be started.
-    thread: Result<JoinHandle<Result<(), String>>, String>,
+    thread: Result<JoinHandle<Result<(), MicTestError>>, MicTestError>,
 }
 
 impl Recorder {
@@ -118,13 +166,13 @@ impl Recorder {
             thread::Builder::new()
                 .name("mic-test-record".into())
                 .spawn(move || record_loop(&stop, &pcm))
-                .map_err(|e| format!("Could not start the recorder: {e}"))
+                .map_err(|e| MicTestError::StartRecorder(Arc::new(e)))
         };
         Recorder { stop, pcm, thread }
     }
 
     pub fn elapsed(&self) -> Duration {
-        bytes_to_duration(self.pcm.lock().map(|p| p.len()).unwrap_or(0))
+        bytes_to_duration(self.pcm.lock().map_or(0, |p| p.len()))
     }
 
     /// The thread ended by itself: it hit MAX_RECORDING or failed.
@@ -137,35 +185,35 @@ impl Recorder {
 
     /// Stop and return the recording. Returns quickly: the thread checks the
     /// flag every few milliseconds, also while connecting to the sound server.
-    pub fn stop(self) -> Result<Vec<u8>, String> {
+    pub fn stop(self) -> Result<Vec<u8>, MicTestError> {
         self.stop.store(true, Ordering::Relaxed);
         self.thread?
             .join()
-            .map_err(|_| "The recorder crashed".to_string())??;
-        let pcm = std::mem::take(&mut *self.pcm.lock().map_err(|_| "Recording lost")?);
+            .map_err(|_| MicTestError::RecorderCrashed)??;
+        let pcm = std::mem::take(&mut *self.pcm.lock().map_err(|_| MicTestError::RecordingLost)?);
         if pcm.is_empty() {
-            return Err("No sound came from the AirPods microphone".to_string());
+            return Err(MicTestError::NoSound);
         }
         Ok(pcm)
     }
 }
 
-fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
+fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), MicTestError> {
     let spec = spec();
     let max = duration_to_bytes(MAX_RECORDING);
     let stopped = || stop.load(Ordering::Relaxed);
-    let Some((mut mainloop, mut context)) = connect_cancellable(stopped) else {
+    let Ok((mut mainloop, mut context)) = connect_cancellable(stopped) else {
         // Stopped while connecting: an empty recording, not a server error.
         if stopped() {
             return Ok(());
         }
-        return Err("Could not reach the sound server".to_string());
+        return Err(MicTestError::SoundServerUnreachable);
     };
     let mut stream = Stream::new(&mut context, "Microphone test", &spec, None)
-        .ok_or_else(|| "Could not create a recording stream".to_string())?;
+        .ok_or(MicTestError::CreateRecordStream)?;
     stream
         .connect_record(Some(SOURCE_NAME), None, StreamFlagSet::NOFLAGS)
-        .map_err(|_| "The Hi-Res microphone input is not available".to_string())?;
+        .map_err(|_| MicTestError::SourceUnavailable)?;
     wait_ready(&mut mainloop, &stream, stopped)?;
 
     let result = loop {
@@ -183,7 +231,7 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
             },
             Ok(PeekResult::Data(data)) => {
                 let full = {
-                    let mut pcm = pcm.lock().map_err(|_| "Recording lost".to_string())?;
+                    let mut pcm = pcm.lock().map_err(|_| MicTestError::RecordingLost)?;
                     let room = max.saturating_sub(pcm.len());
                     pcm.extend_from_slice(&data[..data.len().min(room)]);
                     pcm.len() >= max
@@ -193,7 +241,7 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
                     break Ok(());
                 }
             },
-            Err(_) => break Err("Recording failed".to_string()),
+            Err(_) => break Err(MicTestError::RecordingFailed),
         }
     };
     let _ = stream.disconnect();
@@ -211,7 +259,7 @@ pub struct Player {
     commands: Sender<Command>,
     position: Arc<AtomicUsize>,
     playing: Arc<AtomicBool>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<Mutex<Option<MicTestError>>>,
     len: usize,
 }
 
@@ -242,7 +290,7 @@ impl Player {
             if let Err(e) = spawned
                 && let Ok(mut slot) = error.lock()
             {
-                *slot = Some(format!("Could not start playback: {e}"));
+                *slot = Some(MicTestError::StartPlayback(Arc::new(e)));
             }
         }
         Player {
@@ -267,7 +315,7 @@ impl Player {
     }
 
     pub fn seek(&self, to: Duration) {
-        let bytes = duration_to_bytes(to).min(self.len);
+        let bytes = seek_offset(to, self.len);
         // Update now so the slider does not jump back before the thread catches up.
         self.position.store(bytes, Ordering::Relaxed);
         let _ = self.commands.send(Command::Seek(bytes));
@@ -285,7 +333,7 @@ impl Player {
         bytes_to_duration(self.len)
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<MicTestError> {
         self.error.lock().ok().and_then(|e| e.clone())
     }
 }
@@ -323,7 +371,7 @@ fn play_loop(
     position: &AtomicUsize,
     playing: &AtomicBool,
     ready_at: Instant,
-) -> Result<(), String> {
+) -> Result<(), MicTestError> {
     let mut pending = VecDeque::new();
     if !wait_for_playback_slot(commands, ready_at, &mut pending) {
         return Ok(());
@@ -331,9 +379,9 @@ fn play_loop(
 
     let spec = spec();
     let (mut mainloop, mut context) =
-        connect().ok_or_else(|| "Could not reach the sound server".to_string())?;
+        connect().map_err(|_| MicTestError::SoundServerUnreachable)?;
     let mut stream = Stream::new(&mut context, "Microphone test playback", &spec, None)
-        .ok_or_else(|| "Could not create a playback stream".to_string())?;
+        .ok_or(MicTestError::CreatePlaybackStream)?;
     let target = u32::try_from(duration_to_bytes(PLAYBACK_BUFFER)).unwrap_or(u32::MAX);
     let attr = BufferAttr {
         maxlength: u32::MAX,
@@ -344,7 +392,7 @@ fn play_loop(
     };
     stream
         .connect_playback(None, Some(&attr), StreamFlagSet::ADJUST_LATENCY, None, None)
-        .map_err(|_| "Could not play on the default output".to_string())?;
+        .map_err(|_| MicTestError::OutputUnavailable)?;
     wait_ready(&mut mainloop, &stream, || false)?;
 
     let mut offset = position.load(Ordering::Relaxed);
@@ -358,17 +406,18 @@ fn play_loop(
             Ok(Command::Pause) => {
                 playing.store(false, Ordering::Relaxed);
                 let mut op = stream.flush(None);
-                wait_for(&mut mainloop, &mut op);
+                // A flush that did not finish only leaves some queued audio to
+                // play out; the position below is right either way.
+                let _ = wait_for(&mut mainloop, &mut op);
                 // The flush dropped the queued audio that was not heard yet, so
                 // resume from the heard position rather than the write offset.
-                let heard = position.load(Ordering::Relaxed).min(pcm.len());
-                offset = heard - heard % BYTES_PER_FRAME;
+                offset = align_to_frame(position.load(Ordering::Relaxed).min(pcm.len()));
             },
             Ok(Command::Seek(to)) => {
-                offset = to - to % BYTES_PER_FRAME;
+                offset = align_to_frame(to);
                 position.store(offset, Ordering::Relaxed);
                 let mut op = stream.flush(None);
-                wait_for(&mut mainloop, &mut op);
+                let _ = wait_for(&mut mainloop, &mut op);
             },
             Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {},
@@ -381,7 +430,8 @@ fn play_loop(
         }
         if offset >= pcm.len() {
             let mut op = stream.drain(None);
-            wait_for(&mut mainloop, &mut op);
+            // An unfinished drain cuts off the last few milliseconds at most.
+            let _ = wait_for(&mut mainloop, &mut op);
             playing.store(false, Ordering::Relaxed);
             position.store(pcm.len(), Ordering::Relaxed);
             continue;
@@ -393,7 +443,7 @@ fn play_loop(
         }
         stream
             .write(&pcm[offset..offset + n], None, 0, SeekMode::Relative)
-            .map_err(|_| "Playback failed".to_string())?;
+            .map_err(|_| MicTestError::PlaybackFailed)?;
         offset += n;
         // Report what is being heard, not what was queued: back off by the buffer.
         let queued = duration_to_bytes(PLAYBACK_BUFFER);
@@ -402,4 +452,73 @@ fn play_loop(
     let _ = stream.disconnect();
     mainloop.quit(Retval(0));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ONE_SECOND_BYTES: usize = ELD_SAMPLE_RATE as usize * BYTES_PER_FRAME;
+
+    #[test]
+    fn one_second_of_audio_converts_both_ways() {
+        assert_eq!(duration_to_bytes(Duration::from_secs(1)), ONE_SECOND_BYTES);
+        assert_eq!(bytes_to_duration(ONE_SECOND_BYTES), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_partial_frame_does_not_count_as_audio() {
+        assert_eq!(bytes_to_duration(BYTES_PER_FRAME - 1), Duration::ZERO);
+        assert_eq!(
+            bytes_to_duration(BYTES_PER_FRAME * 64 + 1),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn durations_convert_to_whole_frames() {
+        // 1.5 samples at 64 kHz rounds down to one frame.
+        let d = Duration::from_nanos(23_438);
+        assert_eq!(duration_to_bytes(d), BYTES_PER_FRAME);
+        assert_eq!(duration_to_bytes(d) % BYTES_PER_FRAME, 0);
+    }
+
+    #[test]
+    fn offsets_align_down_to_the_frame_start() {
+        assert_eq!(align_to_frame(0), 0);
+        assert_eq!(align_to_frame(BYTES_PER_FRAME), BYTES_PER_FRAME);
+        assert_eq!(
+            align_to_frame(3 * BYTES_PER_FRAME + BYTES_PER_FRAME - 1),
+            3 * BYTES_PER_FRAME
+        );
+    }
+
+    #[test]
+    fn seek_is_clamped_to_the_recording() {
+        let len = 2 * ONE_SECOND_BYTES;
+
+        assert_eq!(seek_offset(Duration::from_secs(1), len), ONE_SECOND_BYTES);
+        assert_eq!(seek_offset(Duration::from_secs(10), len), len);
+        assert_eq!(seek_offset(Duration::ZERO, len), 0);
+    }
+
+    #[test]
+    fn max_recording_fits_in_memory_budget() {
+        // About 38 MB of 64 kHz mono s16, as documented on MAX_RECORDING.
+        assert_eq!(duration_to_bytes(MAX_RECORDING), 300 * ONE_SECOND_BYTES);
+        assert!(duration_to_bytes(MAX_RECORDING) < 40_000_000);
+    }
+
+    #[test]
+    fn errors_read_as_sentences_for_the_user() {
+        assert_eq!(
+            MicTestError::NoSound.to_string(),
+            "No sound came from the AirPods microphone"
+        );
+        let io = std::io::Error::other("no threads");
+        assert_eq!(
+            MicTestError::StartRecorder(Arc::new(io)).to_string(),
+            "Could not start the recorder: no threads"
+        );
+    }
 }
