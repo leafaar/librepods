@@ -1277,34 +1277,8 @@ impl AACPManager {
         target_mac_address: &str,
         streaming_state: bool,
     ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(138);
-        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
-        buffer.extend_from_slice(&[0x82, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"PlayingApp");
-        buffer.push(0x56);
-        buffer.extend_from_slice(b"com.google.ios.youtube");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"HostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-        while buffer.len() < 138 {
-            buffer.push(0x00);
-        }
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
+        let packet =
+            media_information_payload(self_mac_address, target_mac_address, streaming_state)?;
         self.send_data_packet(&packet).await
     }
 
@@ -1375,7 +1349,7 @@ impl AACPManager {
         buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x4E, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.extend_from_slice(&[0x48, 0x69]);
+        buffer.push(0x48);
         buffer.extend_from_slice(b"idleTime");
         buffer.extend_from_slice(&[0x08, 0x47]);
         buffer.extend_from_slice(b"newTipi");
@@ -1523,9 +1497,88 @@ fn rename_payload(name: &str) -> Result<Vec<u8>> {
     Ok(packet)
 }
 
+/// Smart routing media information for `target_mac_address`.
+///
+/// After the target MAC comes a little-endian u16 with the number of bytes
+/// that follow it, not counting the zero padding; every other smart routing
+/// packet here follows that rule. Each string is prefixed with 0x40 plus its
+/// length (0x4A before the 10 bytes of "PlayingApp", 0x46 before "btName").
+fn media_information_payload(
+    self_mac_address: &str,
+    target_mac_address: &str,
+    streaming_state: bool,
+) -> Result<Vec<u8>> {
+    // The 0x51 tag below is for a 17 character address.
+    mac_to_wire(self_mac_address)?;
+    let (state_tag, state): (u8, &[u8]) = if streaming_state {
+        (0x43, b"YES")
+    } else {
+        (0x42, b"NO")
+    };
+
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(&[0x01, 0xE5, 0x4A]);
+    body.extend_from_slice(b"PlayingApp");
+    body.push(0x56);
+    body.extend_from_slice(b"com.google.ios.youtube");
+    body.push(0x52);
+    body.extend_from_slice(b"HostStreamingState");
+    body.push(state_tag);
+    body.extend_from_slice(state);
+    body.push(0x49);
+    body.extend_from_slice(b"btAddress");
+    body.push(0x51);
+    body.extend_from_slice(self_mac_address.as_bytes());
+    body.push(0x46);
+    body.extend_from_slice(b"btName");
+    body.push(0x43);
+    body.extend_from_slice(b"Mac");
+    body.push(0x58);
+    body.extend_from_slice(b"otherDevice");
+    body.extend_from_slice(b"AudioCategory");
+    body.extend_from_slice(&[0x31, 0x2D, 0x01]);
+    let body_len = u16::try_from(body.len())
+        .map_err(|_| invalid_input(format!("media information is {} bytes", body.len())))?;
+
+    let mut packet = Vec::with_capacity(2 + 138);
+    packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
+    packet.extend_from_slice(&mac_to_wire(target_mac_address)?);
+    packet.extend_from_slice(&body_len.to_le_bytes());
+    packet.extend_from_slice(&body);
+    packet.resize(packet.len().max(2 + 138), 0x00);
+    Ok(packet)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_information_length_counts_the_bytes_after_it() {
+        for streaming in [false, true] {
+            let packet =
+                media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", streaming)
+                    .unwrap();
+            assert_eq!(packet.len(), 2 + 138);
+            assert_eq!(packet[2..8], [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]);
+            let len = usize::from(u16::from_le_bytes([packet[8], packet[9]]));
+            let body = &packet[10..10 + len];
+            assert!(body.ends_with(&[0x31, 0x2D, 0x01]));
+            assert!(packet[10 + len..].iter().all(|&b| b == 0));
+            let name = body.windows(7).position(|w| w == b"\x46btName");
+            assert!(name.is_some(), "btName has no string tag");
+        }
+    }
+
+    #[test]
+    fn media_information_tags_the_streaming_state_by_length() {
+        let yes = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", true)
+            .unwrap();
+        assert!(yes.windows(4).any(|w| w == b"\x43YES"));
+        let no = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", false)
+            .unwrap();
+        assert!(no.windows(3).any(|w| w == b"\x42NO"));
+    }
 
     #[test]
     fn mac_to_wire_reverses_the_bytes() {
