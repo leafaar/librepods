@@ -1,13 +1,16 @@
-// use ksni::TrayMethods; // provides the spawn method
-
 use {
     crate::{
         bluetooth::aacp::{BatteryStatus, ControlCommandIdentifiers},
         ui::messages::BluetoothUIMessage,
         utils::get_app_settings_path,
     },
-    ab_glyph::{Font, ScaleFont},
-    ksni::{Icon, ToolTip},
+    ab_glyph::{Font, FontRef, PxScale, ScaleFont},
+    image::{ImageBuffer, Rgba},
+    imageproc::drawing::draw_text_mut,
+    ksni::{
+        Icon, MenuItem, ToolTip,
+        menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem},
+    },
     tokio::sync::mpsc::UnboundedSender,
 };
 
@@ -52,7 +55,7 @@ impl ksni::Tray for MyTray {
     }
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
-            icon_name: "".to_string(),
+            icon_name: String::new(),
             icon_pixmap: vec![],
             title: "Battery Status".to_string(),
             description: self.battery_description(),
@@ -62,7 +65,6 @@ impl ksni::Tray for MyTray {
         self.open_window();
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::*;
         let allow_off = self.allow_off_option == Some(0x01);
         let options = if allow_off {
             vec![
@@ -107,10 +109,7 @@ impl ksni::Tray for MyTray {
                 selected,
                 select: Box::new(move |this: &mut Self, current| {
                     if let Some(tx) = &this.command_tx {
-                        let value = options_clone
-                            .get(current)
-                            .map(|&(_, val)| val)
-                            .unwrap_or(0x02);
+                        let value = options_clone.get(current).map_or(0x02, |&(_, val)| val);
                         let _ = tx.send((ControlCommandIdentifiers::ListeningMode, vec![value]));
                     }
                 }),
@@ -121,7 +120,6 @@ impl ksni::Tray for MyTray {
                         ..Default::default()
                     })
                     .collect(),
-                ..Default::default()
             }
             .into(),
             MenuItem::Separator,
@@ -134,7 +132,7 @@ impl ksni::Tray for MyTray {
                         && let Some(is_enabled) = this.conversation_detect_enabled
                     {
                         let new_state = !is_enabled;
-                        let value = if !new_state { 0x02 } else { 0x01 };
+                        let value = if new_state { 0x01 } else { 0x02 };
                         let _ = tx.send((
                             ControlCommandIdentifiers::ConversationDetectConfig,
                             vec![value],
@@ -228,7 +226,7 @@ fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
             } else {
                 ""
             };
-            format!("{}%{}", l, mark)
+            format!("{l}%{mark}")
         },
         None => "-".to_string(),
     }
@@ -237,29 +235,22 @@ fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
 /// Draw the tray icon. `level` None draws "-" in text mode and an empty ring
 /// otherwise, so an unknown battery never looks like an empty one.
 fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
-    use {
-        ab_glyph::{FontRef, PxScale},
-        image::{ImageBuffer, Rgba},
-        imageproc::drawing::draw_text_mut,
-    };
-
     let width = 64;
     let height = 64;
 
     let mut img = ImageBuffer::from_fn(width, height, |_, _| Rgba([0u8, 0u8, 0u8, 0u8]));
 
     let font_data = include_bytes!("../../assets/font/DejaVuSans.ttf");
-    let font = match FontRef::try_from_slice(font_data) {
-        Ok(f) => f,
-        Err(_) => {
-            return Icon {
-                width: width as i32,
-                height: height as i32,
-                data: vec![0u8; (width * height * 4) as usize],
-            };
-        },
+    let Ok(font) = FontRef::try_from_slice(font_data) else {
+        return Icon {
+            width: width as i32,
+            height: height as i32,
+            data: vec![0u8; (width * height * 4) as usize],
+        };
     };
-    if !text_mode {
+    if text_mode {
+        draw_level_text(&mut img, &font, level, charging);
+    } else {
         let center_x = width as f32 / 2.0;
         let center_y = height as f32 / 2.0;
         let inner_radius = 22.0;
@@ -310,27 +301,6 @@ fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
             let y = ((height as f32 - scale.y) / 2.0).max(0.0) as i32;
             draw_text_mut(&mut img, color, x, y, scale, &font, emoji);
         }
-    } else {
-        // battery text
-        let text = level.map_or_else(|| "-".to_string(), |l| l.to_string());
-        let text = text.as_str();
-        let scale = PxScale::from(48.0);
-        let color = if charging {
-            Rgba([0u8, 255u8, 0u8, 255u8])
-        } else {
-            Rgba([255u8, 255u8, 255u8, 255u8])
-        };
-
-        let scaled_font = font.as_scaled(scale);
-        let mut text_width = 0.0;
-        for c in text.chars() {
-            let glyph_id = font.glyph_id(c);
-            text_width += scaled_font.h_advance(glyph_id);
-        }
-        let x = ((width as f32 - text_width) / 2.0).max(0.0) as i32;
-        let y = ((height as f32 - scale.y) / 2.0).max(0.0) as i32;
-
-        draw_text_mut(&mut img, color, x, y, scale, &font, text);
     }
 
     let mut data = Vec::with_capacity((width * height * 4) as usize);
@@ -346,6 +316,34 @@ fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
         height: height as i32,
         data,
     }
+}
+
+/// Text mode: the level as a number, green while charging, "-" when unknown.
+fn draw_level_text(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    font: &FontRef<'_>,
+    level: Option<u8>,
+    charging: bool,
+) {
+    let text = level.map_or_else(|| "-".to_string(), |l| l.to_string());
+    let text = text.as_str();
+    let scale = PxScale::from(48.0);
+    let color = if charging {
+        Rgba([0u8, 255u8, 0u8, 255u8])
+    } else {
+        Rgba([255u8, 255u8, 255u8, 255u8])
+    };
+
+    let scaled_font = font.as_scaled(scale);
+    let mut text_width = 0.0;
+    for c in text.chars() {
+        let glyph_id = font.glyph_id(c);
+        text_width += scaled_font.h_advance(glyph_id);
+    }
+    let x = ((img.width() as f32 - text_width) / 2.0).max(0.0) as i32;
+    let y = ((img.height() as f32 - scale.y) / 2.0).max(0.0) as i32;
+
+    draw_text_mut(img, color, x, y, scale, font, text);
 }
 
 #[cfg(test)]
