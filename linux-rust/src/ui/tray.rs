@@ -1,12 +1,9 @@
 use {
     crate::{
         bluetooth::aacp::{BatteryStatus, ControlCommandIdentifiers},
-        ui::messages::BluetoothUIMessage,
+        ui::{messages::BluetoothUIMessage, tray_icon},
         utils::get_app_settings_path,
     },
-    ab_glyph::{Font, FontRef, PxScale, ScaleFont},
-    image::{ImageBuffer, Rgba},
-    imageproc::drawing::draw_text_mut,
     ksni::{
         Icon, MenuItem, ToolTip,
         menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem},
@@ -232,118 +229,13 @@ fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
     }
 }
 
-/// Draw the tray icon. `level` None draws "-" in text mode and an empty ring
-/// otherwise, so an unknown battery never looks like an empty one.
 fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
-    let width = 64;
-    let height = 64;
-
-    let mut img = ImageBuffer::from_fn(width, height, |_, _| Rgba([0u8, 0u8, 0u8, 0u8]));
-
-    let font_data = include_bytes!("../../assets/font/DejaVuSans.ttf");
-    let Ok(font) = FontRef::try_from_slice(font_data) else {
-        return Icon {
-            width: width as i32,
-            height: height as i32,
-            data: vec![0u8; (width * height * 4) as usize],
-        };
-    };
-    if text_mode {
-        draw_level_text(&mut img, &font, level, charging);
-    } else {
-        let center_x = width as f32 / 2.0;
-        let center_y = height as f32 / 2.0;
-        let inner_radius = 22.0;
-        let outer_radius = 28.0;
-
-        // ring background
-        for y in 0..height {
-            for x in 0..width {
-                let dx = x as f32 - center_x;
-                let dy = y as f32 - center_y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist > inner_radius && dist <= outer_radius {
-                    img.put_pixel(x, y, Rgba([128u8, 128u8, 128u8, 255u8]));
-                }
-            }
-        }
-
-        // ring, left grey when the level is unknown
-        if let Some(level) = level {
-            let percentage = f32::from(level) / 100.0;
-            for y in 0..height {
-                for x in 0..width {
-                    let dx = x as f32 - center_x;
-                    let dy = y as f32 - center_y;
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    if dist > inner_radius && dist <= outer_radius {
-                        let angle = dy.atan2(dx);
-                        let angle_from_top = (angle + std::f32::consts::PI / 2.0)
-                            .rem_euclid(2.0 * std::f32::consts::PI);
-                        if angle_from_top <= percentage * 2.0 * std::f32::consts::PI {
-                            img.put_pixel(x, y, Rgba([0u8, 255u8, 0u8, 255u8]));
-                        }
-                    }
-                }
-            }
-        }
-        if charging {
-            let emoji = "⚡";
-            let scale = PxScale::from(48.0);
-            let color = Rgba([0u8, 255u8, 0u8, 255u8]);
-            let scaled_font = font.as_scaled(scale);
-            let mut emoji_width = 0.0;
-            for c in emoji.chars() {
-                let glyph_id = font.glyph_id(c);
-                emoji_width += scaled_font.h_advance(glyph_id);
-            }
-            let x = ((width as f32 - emoji_width) / 2.0).max(0.0) as i32;
-            let y = ((height as f32 - scale.y) / 2.0).max(0.0) as i32;
-            draw_text_mut(&mut img, color, x, y, scale, &font, emoji);
-        }
-    }
-
-    let mut data = Vec::with_capacity((width * height * 4) as usize);
-    for pixel in img.pixels() {
-        data.push(pixel[3]);
-        data.push(pixel[0]);
-        data.push(pixel[1]);
-        data.push(pixel[2]);
-    }
-
+    let pixmap = tray_icon::render(level, text_mode, charging);
     Icon {
-        width: width as i32,
-        height: height as i32,
-        data,
+        width: pixmap.width as i32,
+        height: pixmap.height as i32,
+        data: pixmap.argb,
     }
-}
-
-/// Text mode: the level as a number, green while charging, "-" when unknown.
-fn draw_level_text(
-    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    font: &FontRef<'_>,
-    level: Option<u8>,
-    charging: bool,
-) {
-    let text = level.map_or_else(|| "-".to_string(), |l| l.to_string());
-    let text = text.as_str();
-    let scale = PxScale::from(48.0);
-    let color = if charging {
-        Rgba([0u8, 255u8, 0u8, 255u8])
-    } else {
-        Rgba([255u8, 255u8, 255u8, 255u8])
-    };
-
-    let scaled_font = font.as_scaled(scale);
-    let mut text_width = 0.0;
-    for c in text.chars() {
-        let glyph_id = font.glyph_id(c);
-        text_width += scaled_font.h_advance(glyph_id);
-    }
-    let x = ((img.width() as f32 - text_width) / 2.0).max(0.0) as i32;
-    let y = ((img.height() as f32 - scale.y) / 2.0).max(0.0) as i32;
-
-    draw_text_mut(img, color, x, y, scale, font, text);
 }
 
 #[cfg(test)]

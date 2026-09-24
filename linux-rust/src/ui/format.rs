@@ -32,7 +32,7 @@ pub fn mmss(d: Duration) -> String {
 
 /// The level of a battery entry, or None when the component is disconnected or
 /// the level is out of range.
-fn known_level(info: &BatteryInfo) -> Option<u8> {
+pub fn known_level(info: &BatteryInfo) -> Option<u8> {
     (info.status != BatteryStatus::Disconnected && info.level <= 100).then_some(info.level)
 }
 
