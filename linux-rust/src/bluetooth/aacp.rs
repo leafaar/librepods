@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant, sleep};
 
 const PSM: u16 = 0x1001;
@@ -392,6 +392,10 @@ impl AACPManagerState {
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
+    /// Tasks that serve this connection (event handling, subscribers, the
+    /// playback listener). They hold clones of the manager, so they never end on
+    /// their own; recv_thread aborts them when the link goes away.
+    connection_tasks: Arc<std::sync::Mutex<Vec<AbortHandle>>>,
     hires_enabled: Arc<AtomicBool>,
     hires_mic: Arc<Mutex<Option<crate::audio::hires_mic::HiResMic>>>,
     /// Wakes the hi-res monitor so it re-polls promptly when the feature is
@@ -408,6 +412,7 @@ impl AACPManager {
         AACPManager {
             state: Arc::new(Mutex::new(AACPManagerState::new())),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
+            connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             hires_enabled: Arc::new(AtomicBool::new(
                 crate::utils::AppSettings::load().hires_mic_enabled,
             )),
@@ -477,6 +482,26 @@ impl AACPManager {
 
     pub fn mic_app(&self) -> Option<String> {
         self.mic_status.app()
+    }
+
+    /// Spawn a task that lives as long as this connection.
+    pub fn spawn_connection_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.track_connection_task(tokio::spawn(task).abort_handle());
+    }
+
+    /// Stop `handle` when this connection ends.
+    pub fn track_connection_task(&self, handle: AbortHandle) {
+        if let Ok(mut tasks) = self.connection_tasks.lock() {
+            tasks.push(handle);
+        }
+    }
+
+    fn stop_connection_tasks(&self) {
+        if let Ok(mut tasks) = self.connection_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
     }
 
     pub fn runtime(&self) -> &tokio::runtime::Handle {
@@ -1436,23 +1461,24 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 manager.receive_packet(data).await;
             }
             Err(e) => {
-                debug!("Read error: {}", e);
-                info!(
-                    "We have probably disconnected, clearing state variables (owns=false, connected_devices=empty, control_command_status_list=empty)."
-                );
-                let mut state = manager.state.lock().await;
-                state.owns = false;
-                state.connected_devices.clear();
-                state.control_command_status_list.clear();
+                info!("Read error, the AirPods probably disconnected: {}", e);
                 break;
             }
         }
     }
+    // Both exits end the connection: nothing read from it is current any more.
     {
         let mut state = manager.state.lock().await;
         state.sender = None;
+        state.audio_tx = None;
+        state.owns = false;
+        state.connected_devices.clear();
+        state.control_command_status_list.clear();
+        state.ear_detection_status.clear();
+        state.battery_info.clear();
     }
     manager.disarm_hires_mic().await;
+    manager.stop_connection_tasks();
 }
 
 async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {

@@ -125,7 +125,7 @@ impl AirPodsDevice {
         }
 
         let aacp_manager_clone = aacp_manager.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some((id, value)) = command_rx.recv().await {
                 if let Err(e) = aacp_manager_clone.send_control_command(id, &value).await {
                     log::error!("Failed to send control command: {}", e);
@@ -138,15 +138,18 @@ impl AirPodsDevice {
         // until playback starts - so freshly connected buds stay silent, and
         // the microphone has no transport either. Claim a profile right away.
         let mc_profile = media_controller.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             mc_profile.lock().await.activate_a2dp_profile().await;
         });
 
         let mc_listener = media_controller.lock().await;
         let aacp_manager_clone_listener = aacp_manager.clone();
-        mc_listener
+        if let Some(listener) = mc_listener
             .start_playback_listener(aacp_manager_clone_listener, command_tx.clone())
-            .await;
+            .await
+        {
+            aacp_manager.track_connection_task(listener);
+        }
         drop(mc_listener);
 
         let (listening_mode_tx, mut listening_mode_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -157,12 +160,12 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some(value) = listening_mode_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
                         .update(|tray: &mut MyTray| {
-                            tray.listening_mode = Some(value[0]);
+                            tray.listening_mode = value.first().copied();
                         })
                         .await;
                 }
@@ -174,7 +177,7 @@ impl AirPodsDevice {
             .subscribe_to_control_command(ControlCommandIdentifiers::AllowOffOption, allow_off_tx)
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some(value) = allow_off_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -195,7 +198,7 @@ impl AirPodsDevice {
             )
             .await;
         let tray_handle_clone = tray_handle.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some(value) = conversation_detect_rx.recv().await {
                 if let Some(handle) = &tray_handle_clone {
                     handle
@@ -215,7 +218,7 @@ impl AirPodsDevice {
             )
             .await;
         let mc_clone_owns = media_controller.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
@@ -231,7 +234,7 @@ impl AirPodsDevice {
         let local_mac_events = local_mac.clone();
         let ui_tx_clone = ui_tx.clone();
         let command_tx_clone = command_tx.clone();
-        tokio::spawn(async move {
+        aacp_manager.spawn_connection_task(async move {
             while let Some(event) = rx.recv().await {
                 let event_clone = event.clone();
                 match event {

@@ -113,11 +113,11 @@ impl MediaController {
             crate::bluetooth::aacp::ControlCommandIdentifiers,
             Vec<u8>,
         )>,
-    ) {
+    ) -> Option<AbortHandle> {
         let mut state = self.state.lock().await;
         if state.playback_listener_running {
             debug!("Playback listener already running");
-            return;
+            return None;
         }
         state.playback_listener_running = true;
         let connected_device_mac = state.connected_device_mac.clone();
@@ -133,7 +133,9 @@ impl MediaController {
                 .playback_listener_loop(aacp_manager, control_tx)
                 .await;
         });
-        listeners.insert(connected_device_mac, listener.abort_handle());
+        let handle = listener.abort_handle();
+        listeners.insert(connected_device_mac, handle.clone());
+        Some(handle)
     }
 
     async fn playback_listener_loop(
