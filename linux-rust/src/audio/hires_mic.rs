@@ -123,6 +123,9 @@ impl HiResMic {
 // thread, started when an app opens the mic.
 struct Capture {
     decode_thread: Option<JoinHandle<()>>,
+    // Delayed A2DP reset after START; aborted on stop so it cannot fire after
+    // the stop-time reset.
+    start_reset: TokioHandle<()>,
 }
 
 async fn monitor_loop(
@@ -203,6 +206,16 @@ async fn monitor_loop(
             _ => {}
         }
 
+        // A capture that failed to restart leaves no capture to stop, so the
+        // arm above never runs; restore conversation detection once the
+        // recorder is gone. While it is still recording we keep retrying.
+        if capture.is_none()
+            && !recording
+            && let Some(prev) = old_convo_state.take()
+        {
+            aacp.set_conversation_detection(prev).await;
+        }
+
         // Once disabled and nothing is recording from the source, unload it.
         if !enabled && !recording {
             break;
@@ -211,9 +224,9 @@ async fn monitor_loop(
 
     if let Some(c) = capture.take() {
         stop_capture(c, &aacp, &addr).await;
-        if let Some(prev) = old_convo_state.take() {
-            aacp.set_conversation_detection(prev).await;
-        }
+    }
+    if let Some(prev) = old_convo_state.take() {
+        aacp.set_conversation_detection(prev).await;
     }
     status.reset();
 }
@@ -236,17 +249,19 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
     info!("[aacp] microphone stream started");
 
     let reset_addr = addr.to_string();
-    tokio::spawn(async move {
+    let start_reset = tokio::spawn(async move {
         tokio::time::sleep(A2DP_RESET_DELAY).await;
         let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&reset_addr)).await;
     });
 
     Some(Capture {
         decode_thread: Some(decode_thread),
+        start_reset,
     })
 }
 
 async fn stop_capture(mut capture: Capture, aacp: &AACPManager, addr: &str) {
+    capture.start_reset.abort();
     if let Err(e) = aacp.send_stop_audio().await {
         warn!("failed to send 0x58 STOP: {}", e);
     }

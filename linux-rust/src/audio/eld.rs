@@ -23,6 +23,8 @@ pub struct EldDecoder {
     inbuf: Vec<u8>,
 }
 
+// SAFETY: the FFmpeg objects are owned exclusively by this struct and have no
+// thread affinity; `&mut self` on every method means one thread uses them at a time.
 unsafe impl Send for EldDecoder {}
 
 #[inline]
@@ -33,6 +35,9 @@ fn f_to_s16(s: f32) -> i16 {
 impl EldDecoder {
     // Open the AAC-ELD decoder. Returns None on failure.
     pub fn new() -> Option<Self> {
+        // SAFETY: every pointer is null-checked right after allocation before it is
+        // dereferenced; extradata is allocated with the padding FFmpeg requires and
+        // ownership passes to ctx, which frees it in avcodec_free_context.
         unsafe {
             // stop libavcodec from spamming stderr
             ff::av_log_set_level(ff::AV_LOG_FATAL);
@@ -84,8 +89,10 @@ impl EldDecoder {
         }
     }
 
-    // Free all FFmpeg resources.
-    unsafe fn free(&mut self) {
+    // Free all FFmpeg resources. The av_*_free calls null the pointers they take,
+    // so a second call (Drop after a failed new) is a no-op.
+    fn free(&mut self) {
+        // SAFETY: each pointer is either null or owned by self and still live.
         unsafe {
             if !self.frame.is_null() {
                 ff::av_frame_free(&mut self.frame);
@@ -105,6 +112,11 @@ impl EldDecoder {
         if au.is_empty() || au.len() > ELD_INBUF_MAX {
             return None;
         }
+        // SAFETY: ctx/pkt/frame are live (new() only returns a fully built decoder).
+        // au.len() <= ELD_INBUF_MAX, so the copy plus PAD zero bytes fits inbuf. The
+        // packet is not refcounted, so avcodec_send_packet copies the data. Plane
+        // pointers are read only for the reported format, channel count and
+        // nb_samples, which FFmpeg guarantees are backed by the frame buffers.
         unsafe {
             self.inbuf[..au.len()].copy_from_slice(au);
             self.inbuf[au.len()..au.len() + PAD].fill(0);
@@ -167,6 +179,6 @@ impl EldDecoder {
 
 impl Drop for EldDecoder {
     fn drop(&mut self) {
-        unsafe { self.free() };
+        self.free();
     }
 }

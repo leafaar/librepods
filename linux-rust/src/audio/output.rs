@@ -4,11 +4,12 @@ use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
-use libpulse_binding::operation::State as OperationState;
+use libpulse_binding::operation::{Operation, State as OperationState};
 use log::{error, info, warn};
 use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -19,6 +20,14 @@ use crate::audio::agc::Agc;
 
 pub const SOURCE_NAME: &str = "AirPodsHiRes";
 
+// O_NONBLOCK from asm-generic/fcntl.h, shared by x86 and arm64. Spelled out to avoid
+// pulling in libc for one flag.
+const O_NONBLOCK: i32 = 0o4000;
+
+// Writes of at most PIPE_BUF bytes to a pipe are atomic: all or nothing, so a
+// full pipe never leaves half a sample behind and the s16 stream stays aligned.
+const PIPE_BUF: usize = 4096;
+
 // FIFO the pipe-source reads from and that Output writes PCM into.
 fn fifo_path() -> String {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -28,8 +37,6 @@ fn fifo_path() -> String {
 pub struct VirtualMic {
     module: u32,
 }
-
-unsafe impl Send for VirtualMic {}
 
 impl VirtualMic {
     pub fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
@@ -78,14 +85,19 @@ pub struct Output {
     agc: Option<Agc>,
 }
 
-unsafe impl Send for Output {}
-
 impl Output {
     pub fn open(_sample_rate: u32, _channels: u8) -> Option<Output> {
         // O_RDWR never blocks on a FIFO and keeps the pipe from ever seeing
-        // "all writers closed"; we only ever write to it.
+        // "all writers closed"; we only ever write to it. O_NONBLOCK keeps the
+        // decode thread from hanging when the source stops draining the pipe
+        // (it suspends once the last recorder leaves, before the monitor notices).
         let path = fifo_path();
-        let fifo = match OpenOptions::new().read(true).write(true).open(&path) {
+        let fifo = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 error!("could not open hi-res fifo {}: {}", path, e);
@@ -119,14 +131,27 @@ impl Output {
             .map(|&s| (s as f32 / 32768.0).abs())
             .fold(0.0f32, f32::max);
 
+        // SAFETY: the pointer and length cover exactly the initialised i16 slice,
+        // u8 has no alignment requirement and every byte pattern is a valid u8.
         let bytes = unsafe {
             std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
         };
 
-        self.fifo
-            .write_all(bytes)
-            .map(|_| peak)
-            .map_err(|e| error!("hi-res fifo write broke: {}", e))
+        for chunk in bytes.chunks(PIPE_BUF) {
+            match self.fifo.write(chunk) {
+                Ok(_) => {}
+                // Nobody is draining the pipe: drop the rest of this block
+                // rather than block the decode thread.
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                    break;
+                }
+                Err(e) => {
+                    error!("hi-res fifo write broke: {}", e);
+                    return Err(());
+                }
+            }
+        }
+        Ok(peak)
     }
 }
 
@@ -144,9 +169,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
 
     let app = Rc::new(RefCell::new(None::<String>));
     let idx = index.get();
@@ -165,9 +188,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
                 }
             }
         });
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
+        wait_for(&mut mainloop, &op);
     }
     mainloop.quit(Retval(0));
 
@@ -183,7 +204,7 @@ pub fn reset_a2dp(bdaddr: &str) {
         return;
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
-    let Some((mut mainloop, mut context)) = connect() else {
+    let Some((mut mainloop, context)) = connect() else {
         return;
     };
     let mut introspect = context.introspect();
@@ -201,9 +222,7 @@ pub fn reset_a2dp(bdaddr: &str) {
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
 
     let Some(current_profile) = current_profile.borrow().clone() else {
         warn!("[pw] no active profile on {}; skipping A2DP reset", card);
@@ -220,14 +239,10 @@ pub fn reset_a2dp(bdaddr: &str) {
         card, current_profile
     );
     let op = introspect.set_card_profile_by_name(&card, "off", None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
 
     let op = introspect.set_card_profile_by_name(&card, &current_profile, None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
     mainloop.quit(Retval(0));
 
     // resume all media players after the reset
@@ -283,6 +298,16 @@ fn resume_media_players(services: &[String]) {
     }
 }
 
+// Block on the mainloop until `op` finishes. A blocking iterate sleeps until the
+// server replies instead of spinning a core; a dead connection ends the wait.
+fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &Operation<T>) {
+    while op.get_state() == OperationState::Running {
+        if let IterateResult::Quit(_) | IterateResult::Err(_) = mainloop.iterate(true) {
+            break;
+        }
+    }
+}
+
 fn connect() -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
     let mut context = Context::new(&mainloop, "LibrePods-HiResMic")?;
@@ -290,7 +315,7 @@ fn connect() -> Option<(Mainloop, Context)> {
         .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
         .ok()?;
     loop {
-        match mainloop.iterate(false) {
+        match mainloop.iterate(true) {
             IterateResult::Quit(_) | IterateResult::Err(_) => return None,
             IterateResult::Success(_) => {}
         }
@@ -322,9 +347,7 @@ fn unload_stale_modules() {
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
     mainloop.quit(Retval(0));
 
     for index in stale.borrow().iter() {
@@ -334,16 +357,14 @@ fn unload_stale_modules() {
 }
 
 fn load_module(name: &str, args: &str) -> Option<u32> {
-    let (mut mainloop, mut context) = connect()?;
+    let (mut mainloop, context) = connect()?;
     let idx: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
     let mut introspect = context.introspect();
     let op = introspect.load_module(name, args, {
         let idx = idx.clone();
         move |index| idx.set(index)
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    wait_for(&mut mainloop, &op);
     mainloop.quit(Retval(0));
 
     match idx.get() {
@@ -356,12 +377,10 @@ fn unload_module(index: u32) {
     if index == u32::MAX {
         return;
     }
-    if let Some((mut mainloop, mut context)) = connect() {
+    if let Some((mut mainloop, context)) = connect() {
         let mut introspect = context.introspect();
         let op = introspect.unload_module(index, |_| {});
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
+        wait_for(&mut mainloop, &op);
         mainloop.quit(Retval(0));
     }
 }
