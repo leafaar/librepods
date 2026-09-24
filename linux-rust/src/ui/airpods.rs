@@ -6,6 +6,7 @@ use {
         devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState},
         ui::{
             equalizer::equalizer_section,
+            format::{mmss, validate_device_name},
             window::{Message, MicTest},
         },
     },
@@ -20,7 +21,7 @@ use {
             scrollable, slider, text, text_input, toggler,
         },
     },
-    std::{collections::HashMap, sync::Arc, time::Duration},
+    std::{collections::HashMap, sync::Arc},
     tracing::error,
 };
 
@@ -606,26 +607,6 @@ pub fn airpods_view<'a>(
     container(scrollable(content).height(Length::Fill)).height(Length::Fill)
 }
 
-/// Longest name the AirPods accept in a rename packet, in bytes.
-const MAX_NAME_BYTES: usize = 32;
-
-/// The name to send, trimmed, or a short hint saying why it cannot be sent.
-pub(crate) fn validate_device_name(name: &str) -> Result<&str, &'static str> {
-    let name = name.trim();
-    if name.is_empty() {
-        Err("Name can't be empty")
-    } else if name.len() > MAX_NAME_BYTES {
-        Err("Name is too long")
-    } else {
-        Ok(name)
-    }
-}
-
-fn mmss(d: Duration) -> String {
-    let secs = d.as_secs();
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 fn dim_text<'a>(content: String) -> iced::widget::Text<'a> {
     text(content).size(12).style(|theme: &Theme| {
         let mut style = text::Style::default();
@@ -687,7 +668,7 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
                         position.as_secs_f32(),
                         Message::MicTestSeek
                     )
-                    .step(0.1),
+                    .step(0.1_f32),
                     dim_text(format!("{} / {}", mmss(position), mmss(duration))),
                 ]
                 .align_y(Center)
@@ -767,31 +748,4 @@ fn level_meter<'a>(level: f32, app: Option<String>) -> iced::widget::Container<'
         bottom: 6.0,
         ..Padding::ZERO
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mmss_pads_seconds() {
-        assert_eq!(mmss(Duration::ZERO), "0:00");
-        assert_eq!(mmss(Duration::from_millis(59_999)), "0:59");
-        assert_eq!(mmss(Duration::from_secs(65)), "1:05");
-        assert_eq!(mmss(Duration::from_secs(300)), "5:00");
-        assert_eq!(mmss(Duration::from_secs(3600)), "60:00");
-    }
-
-    #[test]
-    fn device_name_is_trimmed_and_bounded() {
-        assert_eq!(validate_device_name("  Pods  "), Ok("Pods"));
-        assert!(validate_device_name("").is_err());
-        assert!(validate_device_name("   ").is_err());
-        let longest = "a".repeat(MAX_NAME_BYTES);
-        assert_eq!(validate_device_name(&longest), Ok(longest.as_str()));
-        assert!(validate_device_name(&"a".repeat(MAX_NAME_BYTES + 1)).is_err());
-        // Eleven three-byte characters are 33 bytes: the limit is in bytes, not chars.
-        assert!(validate_device_name(&"\u{20AC}".repeat(11)).is_err());
-        assert!(validate_device_name(&"\u{20AC}".repeat(10)).is_ok());
-    }
 }

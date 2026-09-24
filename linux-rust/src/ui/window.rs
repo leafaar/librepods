@@ -2,10 +2,7 @@ use {
     crate::{
         audio::{mic_test, output},
         bluetooth::{
-            aacp::{
-                AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
-                ControlCommandIdentifiers,
-            },
+            aacp::{AACPEvent, AACPManager, BatteryInfo, ControlCommandIdentifiers},
             att::ATTHandles,
             managers::DeviceManagers,
         },
@@ -14,8 +11,10 @@ use {
             NothingAncMode, NothingState,
         },
         ui::{
-            airpods::{airpods_view, validate_device_name},
+            airpods::airpods_view,
+            connect::{ConnectRequests, ConnectStatus, sidebar_status},
             equalizer::EqualizerState,
+            format::{battery_parts, live_case_level, validate_device_name},
             messages::BluetoothUIMessage,
             nothing::nothing_view,
         },
@@ -23,8 +22,8 @@ use {
     },
     bluer::Address,
     iced::{
-        Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
-        Subscription, Task, Theme,
+        Background, Border, Center, Element, Font, Length, Padding, Settings, Size, Subscription,
+        Task, Theme,
         border::Radius,
         daemon,
         overlay::menu,
@@ -35,14 +34,7 @@ use {
         },
         window,
     },
-    std::{
-        collections::HashMap,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::Duration,
-    },
+    std::{collections::HashMap, sync::Arc, time::Duration},
     tokio::sync::{Mutex, RwLock, mpsc::UnboundedReceiver},
     tracing::{debug, error, warn},
 };
@@ -111,12 +103,7 @@ pub struct App {
     a2dp_reset: bool,
     auto_switch_on_playback: bool,
     preferred_codec: PreferredCodec,
-    // Manual connect requests from the UI or tray, keyed by MAC; cleared once
-    // the device connects.
-    connect_status: HashMap<String, ConnectStatus>,
-    // Numbers each connect request, so a late result or timeout from an older
-    // request does not touch a newer one.
-    connect_attempt: u64,
+    connects: ConnectRequests,
     mic_test: MicTest,
     // Media players paused for the microphone test, resumed when it ends.
     mic_test_paused: Vec<String>,
@@ -152,25 +139,6 @@ impl MicTest {
         matches!(
             self,
             MicTest::Starting | MicTest::Recording(_) | MicTest::Stopping | MicTest::Ready(_)
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-enum ConnectStatus {
-    /// The connect call for this attempt is running.
-    Connecting(u64),
-    /// The connect call returned; waiting for DeviceConnected, which comes once
-    /// the AACP session is set up.
-    SettingUp(u64),
-    Failed(String),
-}
-
-impl ConnectStatus {
-    fn in_progress(&self) -> bool {
-        matches!(
-            self,
-            ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)
         )
     }
 }
@@ -351,8 +319,7 @@ impl App {
                 a2dp_reset,
                 auto_switch_on_playback,
                 preferred_codec,
-                connect_status: HashMap::new(),
-                connect_attempt: 0,
+                connects: ConnectRequests::default(),
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
                 mic_test_take: 0,
@@ -503,36 +470,16 @@ impl App {
             },
             Message::MicTestDone => self.end_mic_test(),
             Message::ConnectFinished(mac, attempt, result) => {
-                if !matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting(a)) if *a == attempt)
-                {
-                    return Task::none();
-                }
-                match result {
-                    // Stay in "Connecting" until DeviceConnected arrives, or the
-                    // panel would offer the Connect button again in between.
-                    Ok(()) => {
-                        self.connect_status
-                            .insert(mac.clone(), ConnectStatus::SettingUp(attempt));
-                        Task::perform(tokio::time::sleep(CONNECT_SETUP_TIMEOUT), move |_| {
-                            Message::ConnectSetupTimedOut(mac, attempt)
-                        })
-                    },
-                    Err(e) => {
-                        self.connect_status.insert(mac, ConnectStatus::Failed(e));
-                        Task::none()
-                    },
+                if self.connects.finished(&mac, attempt, result) {
+                    Task::perform(tokio::time::sleep(CONNECT_SETUP_TIMEOUT), move |()| {
+                        Message::ConnectSetupTimedOut(mac, attempt)
+                    })
+                } else {
+                    Task::none()
                 }
             },
             Message::ConnectSetupTimedOut(mac, attempt) => {
-                if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(a)) if *a == attempt)
-                {
-                    self.connect_status.insert(
-                        mac,
-                        ConnectStatus::Failed(
-                            "Connected, but the AirPods did not respond. Try again.".to_string(),
-                        ),
-                    );
-                }
+                self.connects.setup_timed_out(&mac, attempt);
                 Task::none()
             },
             Message::UiChannelClosed => Task::none(),
@@ -587,7 +534,7 @@ impl App {
                         if !already_connected {
                             self.bluetooth_state.connected_devices.push(mac.clone());
                         }
-                        self.connect_status.remove(&mac);
+                        self.connects.connected(&mac);
 
                         // self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                         //     conversation_awareness_enabled: false,
@@ -687,12 +634,7 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        if matches!(
-                            self.connect_status.get(&mac),
-                            Some(ConnectStatus::SettingUp(_))
-                        ) {
-                            self.connect_status.remove(&mac);
-                        }
+                        self.connects.disconnected(&mac);
                         if self.name_draft.as_ref().is_some_and(|(m, _)| *m == mac) {
                             self.name_draft = None;
                         }
@@ -831,18 +773,6 @@ impl App {
                             },
                             _ => {},
                         }
-                        Task::batch(vec![wait_task])
-                    },
-                    BluetoothUIMessage::ATTNotification(mac, handle, value) => {
-                        debug!(
-                            "ATT Notification for {}: handle=0x{:04X}, value={:?}",
-                            mac, handle, value
-                        );
-
-                        // TODO: Handle Nothing's ANC Mode changes here
-
-                        let ui_rx = Arc::clone(&self.ui_rx);
-                        let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         Task::batch(vec![wait_task])
                     },
                 }
@@ -1098,28 +1028,21 @@ impl App {
     }
 
     fn start_connect(&mut self, mac: String) -> Task<Message> {
-        if self
-            .connect_status
-            .get(&mac)
-            .is_some_and(ConnectStatus::in_progress)
-        {
+        if self.connects.in_progress(&mac) {
             return Task::none();
         }
         let Ok(addr) = mac.parse::<Address>() else {
             error!("Cannot connect, invalid address {}", mac);
             return Task::none();
         };
-        self.connect_attempt += 1;
-        let attempt = self.connect_attempt;
-        self.connect_status
-            .insert(mac.clone(), ConnectStatus::Connecting(attempt));
+        let attempt = self.connects.start(mac.clone());
         Task::perform(crate::auto_switch::connect_airpods(addr), move |result| {
             Message::ConnectFinished(mac, attempt, result)
         })
     }
 
     fn disconnected_view(&self, mac: &str) -> iced::widget::Container<'_, Message> {
-        let (status, connecting) = match self.connect_status.get(mac) {
+        let (status, connecting) = match self.connects.get(mac) {
             Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
                 ("Connecting…".to_string(), true)
             }
@@ -1195,13 +1118,7 @@ impl App {
                                 _ => text("Connected").size(12).into(),
                             }
                         } else {
-                            text(match self.connect_status.get(mac_addr) {
-                                Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
-                                    "Connecting…"
-                                }
-                                Some(ConnectStatus::Failed(_)) => "Couldn't connect",
-                                None => "Not connected",
-                            })
+                            text(sidebar_status(self.connects.get(mac_addr)))
                             .size(12)
                             .into()
                         };
@@ -2086,65 +2003,6 @@ fn load_devices() -> HashMap<String, DeviceData> {
     })
 }
 
-const CHARGING_MARK: &str = "\u{1002E6}";
-
-/// The level of a battery entry, or None when the component is disconnected or
-/// the level is out of range.
-fn known_level(info: &BatteryInfo) -> Option<u8> {
-    (info.status != BatteryStatus::Disconnected && info.level <= 100).then_some(info.level)
-}
-
-/// "80%" with a charging mark, or "-" when the component is absent or disconnected.
-fn battery_text(info: Option<&BatteryInfo>) -> String {
-    match info.and_then(|b| known_level(b).map(|level| (level, b.status))) {
-        Some((level, status)) => {
-            let mark = if status.is_charging() {
-                CHARGING_MARK
-            } else {
-                ""
-            };
-            format!("{}%{}", level, mark)
-        },
-        None => "-".to_string(),
-    }
-}
-
-/// The case level a battery report carries, if any. AirPods only know the case
-/// level while a bud sits in it: with both buds out, the case entry reports
-/// Disconnected with a level of 0 or 255.
-fn live_case_level(battery: &[BatteryInfo]) -> Option<u8> {
-    battery
-        .iter()
-        .find(|b| b.component == BatteryComponent::Case)
-        .and_then(known_level)
-}
-
-/// The sidebar battery line as (text, stale) parts. Headphones show a single
-/// level. For earbuds, a case that cannot report falls back to `last_case`,
-/// marked stale so it is drawn dimmed.
-fn battery_parts(battery: &[BatteryInfo], last_case: Option<u8>) -> Vec<(String, bool)> {
-    let find = |component| battery.iter().find(|b| b.component == component);
-    if let Some(headphone) = find(BatteryComponent::Headphone) {
-        return vec![(format!("􀺹 {}", battery_text(Some(headphone))), false)];
-    }
-    let (case, stale) = match (live_case_level(battery), last_case) {
-        (Some(_), _) => (battery_text(find(BatteryComponent::Case)), false),
-        (None, Some(level)) => (format!("{}%", level), true),
-        (None, None) => ("-".to_string(), false),
-    };
-    vec![
-        (
-            format!("\u{1018E5} {}", battery_text(find(BatteryComponent::Left))),
-            false,
-        ),
-        (
-            format!("\u{1018E8} {}", battery_text(find(BatteryComponent::Right))),
-            false,
-        ),
-        (format!("\u{100E6C} {}", case), stale),
-    ]
-}
-
 async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>>>) -> Message {
     let mut rx = ui_rx.lock().await;
     match rx.recv().await {
@@ -2178,109 +2036,3 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(component: BatteryComponent, level: u8, status: BatteryStatus) -> BatteryInfo {
-        BatteryInfo {
-            component,
-            level,
-            status,
-        }
-    }
-
-    fn texts(parts: &[(String, bool)]) -> Vec<&str> {
-        parts.iter().map(|(t, _)| t.as_str()).collect()
-    }
-
-    #[test]
-    fn battery_text_marks_charging_and_unknown() {
-        let charging = entry(BatteryComponent::Left, 40, BatteryStatus::Charging);
-        let optimized = entry(BatteryComponent::Left, 80, BatteryStatus::OptimizedCharging);
-        let idle = entry(BatteryComponent::Left, 100, BatteryStatus::NotCharging);
-        let gone = entry(BatteryComponent::Left, 0, BatteryStatus::Disconnected);
-        let bogus = entry(BatteryComponent::Left, 255, BatteryStatus::NotCharging);
-        assert_eq!(battery_text(Some(&charging)), format!("40%{CHARGING_MARK}"));
-        assert_eq!(
-            battery_text(Some(&optimized)),
-            format!("80%{CHARGING_MARK}")
-        );
-        assert_eq!(battery_text(Some(&idle)), "100%");
-        assert_eq!(battery_text(Some(&gone)), "-");
-        assert_eq!(battery_text(Some(&bogus)), "-");
-        assert_eq!(battery_text(None), "-");
-    }
-
-    #[test]
-    fn case_level_is_remembered_only_when_reported() {
-        let in_case = [entry(
-            BatteryComponent::Case,
-            60,
-            BatteryStatus::NotCharging,
-        )];
-        let buds_out = [entry(
-            BatteryComponent::Case,
-            0,
-            BatteryStatus::Disconnected,
-        )];
-        let buds_out_255 = [entry(
-            BatteryComponent::Case,
-            255,
-            BatteryStatus::Disconnected,
-        )];
-        let bad_level = [entry(BatteryComponent::Case, 101, BatteryStatus::Charging)];
-        assert_eq!(live_case_level(&in_case), Some(60));
-        assert_eq!(live_case_level(&buds_out), None);
-        assert_eq!(live_case_level(&buds_out_255), None);
-        assert_eq!(live_case_level(&bad_level), None);
-        assert_eq!(live_case_level(&[]), None);
-    }
-
-    #[test]
-    fn case_falls_back_to_last_known_level() {
-        let battery = [
-            entry(BatteryComponent::Left, 90, BatteryStatus::NotCharging),
-            entry(BatteryComponent::Right, 85, BatteryStatus::NotCharging),
-            entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected),
-        ];
-        let parts = battery_parts(&battery, Some(60));
-        assert_eq!(
-            texts(&parts),
-            ["\u{1018E5} 90%", "\u{1018E8} 85%", "\u{100E6C} 60%"]
-        );
-        assert!(parts[2].1);
-
-        let parts = battery_parts(&battery, None);
-        assert_eq!(parts[2], ("\u{100E6C} -".to_string(), false));
-    }
-
-    #[test]
-    fn live_case_level_wins_over_last_known() {
-        let battery = [
-            entry(BatteryComponent::Left, 90, BatteryStatus::Charging),
-            entry(BatteryComponent::Case, 50, BatteryStatus::NotCharging),
-        ];
-        let parts = battery_parts(&battery, Some(70));
-        assert_eq!(
-            texts(&parts),
-            [
-                format!("\u{1018E5} 90%{CHARGING_MARK}").as_str(),
-                "\u{1018E8} -",
-                "\u{100E6C} 50%"
-            ]
-        );
-        assert!(!parts[2].1);
-    }
-
-    #[test]
-    fn headphones_show_one_level() {
-        let battery = [entry(
-            BatteryComponent::Headphone,
-            30,
-            BatteryStatus::NotCharging,
-        )];
-        assert_eq!(texts(&battery_parts(&battery, Some(70))), ["􀺹 30%"]);
-    }
-}

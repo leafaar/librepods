@@ -3,9 +3,8 @@ use crate::bluetooth::aacp::AACPEvent;
 #[derive(Debug, Clone)]
 pub enum BluetoothUIMessage {
     OpenWindow,
-    DeviceConnected(String),               // mac
-    DeviceDisconnected(String),            // mac
-    AACPUIEvent(String, AACPEvent),        // mac, event
-    ATTNotification(String, u16, Vec<u8>), // mac, handle, data
-    ConnectAirPods,                        // tray: connect known AirPods to this PC
+    DeviceConnected(String),        // mac
+    DeviceDisconnected(String),     // mac
+    AACPUIEvent(String, AACPEvent), // mac, event
+    ConnectAirPods,                 // tray: connect known AirPods to this PC
 }
