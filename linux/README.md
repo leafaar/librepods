@@ -1,8 +1,9 @@
-# LibrePods on Linux
+# LibrePods on Linux (old Qt app)
 
-A new rewrite is being worked upon. Please look at the list of features in the root README to see what's supported in the new version. 
-
-The rewrite can be found in the `linux/rust` branch [here](https://github.com/kavishdevar/librepods/tree/linux/rust/linux-rust). Follow the development in [PR #241](https://github.com/kavishdevar/librepods/pull/241). 
+> [!NOTE]
+> In this fork the maintained Linux app is [`linux-rust/`](../linux-rust/), a native GNOME
+> app; see the [top-level README](../README.md). This directory is upstream's older Qt app,
+> kept for reference and not maintained here.
 
 
 ## Installation

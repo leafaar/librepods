@@ -1,236 +1,181 @@
-> [!WARNING]
-> librepods.org is not an official website of the LibrePods project. It inaccurately claims to be the official website of the project by claiming copyrights and using the LibrePods logo in the footer. And at the same time, they say that the project is not affiliated with the LibrePods project or its developers.
-> 
-> Please report any other such websites to [me@kavish.xyz](mailto:me@kavish.xyz)
- 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./imgs/banner-dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="./imgs/banner.png" />
-  <img alt="LibrePods" src="./imgs/banner.png" />
-</picture>
+# LibrePods for Linux (unofficial fork)
 
-<div align="center" style="margin: 20px 0px;">
-<a href="https://github.com/kavishdevar/librepods/releases/latest">
-  <img src="https://img.shields.io/github/downloads/kavishdevar/librepods/total?label=GitHub%20Downloads" />
-</a>
-<a href="https://github.com/kavishdevar/librepods/actions/workflows/ci-android.yml">
-  <img src="https://github.com/kavishdevar/librepods/actions/workflows/ci-android.yml/badge.svg" />
-</a>
-<a href="https://github.com/kavishdevar/librepods/actions/workflows/ci-linux-rust.yml">
-  <img src="https://github.com/kavishdevar/librepods/actions/workflows/ci-linux-rust.yml/badge.svg" />
-</a>
-<a href="https://github.com/kavishdevar/librepods/issues">
-  <img src="https://img.shields.io/github/issues/kavishdevar/librepods" />  
-</a>
-<a href="https://discord.gg/HhG4ycVum4">
-  <img src="https://img.shields.io/discord/1441416992027574375?logoColor=white&color=5865F2&label=Discord" />
-</a>
-</div>
+[![linux-rust CI](https://github.com/leafaar/librepods/actions/workflows/linux-rust-ci.yml/badge.svg)](https://github.com/leafaar/librepods/actions/workflows/linux-rust-ci.yml)
 
-# What is LibrePods?
+Control your AirPods from Linux like an Apple device does: listening modes, battery, ear
+detection, conversation awareness, the high-quality microphone, switching between your
+phone and your PC, and the settings Apple keeps in iOS.
 
-LibrePods allows you to use AirPods features that are exclusive to Apple devices. It implements the proprietary protocol used to exchange data between AirPods and Apple devices, enabling features like changing noise control modes, fast ear detection, accurate battery status, head gestures, conversational awareness, and more on non-Apple platforms.
+This is an **unofficial fork** of [LibrePods](https://github.com/librepods-org/librepods)
+by Kavish Devar, maintained by [leafaar](https://github.com/leafaar). It is not affiliated
+with or endorsed by the LibrePods project. The fork focuses on the Linux app in
+[`linux-rust/`](linux-rust/); the Android app in [`android/`](android/) is upstream's code,
+unchanged here. For Android, use [upstream](https://github.com/librepods-org/librepods).
 
-# Feature availability
+## What is different from upstream
 
-| Feature                                                     | Linux | Android |
-| ----------------------------------------------------------- | ----- | ------- |
-| Changing Listening Mode                                     | ✅     | ✅       |
-| Ear detection                                               | ✅     | ✅       |
-| Battery status                                              | ✅     | ✅       |
-| Renaming AirPods <details><summary>Note for Android</summary>On Android, you need to re-pair your AirPods after renaming them because Android might not use the latest name.</details>                                            | ✅     | ✅       |
-| Loud Sound Reduction                                        | 🔴     | ⚪       |
-| Head Gestures                                               | ⛔     | ✅       |
-| Conversational Awareness                                    | ✅     | ✅       |
-| Automatically connect to AirPods                            | ✅     | ✅       |
-| Hearing Aid                                                 | 🔴     | ⚪       |
-| Transparency Mode customization                             | 🔴     | ⚪       |
-| Multi-device connectivity (Bluetooth Multipoint; 2 devices only) | ⚪     | ⚪       |
-| <details><summary>Other accessibility configs (click to expand)</summary><ul><li>Press speed</li><li>Press and Hold duration</li><li>Noise Cancellation with single AirPod</li><li>Volume control on swipe</li><li>Volume swipe speed</li></ul></details>       | 🔴     | ✅       |
-| <details><summary>Other general configs</summary><ul><li>Press and Hold to cycle between listening modes/invoke digital assistant (invoking digital assistant needs a recent firmware)</li><li>Configure call controls</li><li>Personalized volume</li><li>Loud Sound Reduction (needs <a href="#vendorid-spoofing">VendorID spoofing</a>)</li><li>Microphone side</li><li>Pause media when falling asleep (needs a recent firmware)</li><li>Enable <code>Off listening mode</code> to switch to <code>Off</code></li></ul></details>                   | 🔴     | ✅       |
-| [Head-tracked Spatial Audio](#spatial-audio)                | ❓     | ❓       |
-| [Heart Rate Monitoring](#heart-rate-monitoring)             | ⛔     | 🔴       |
-| [Find My](#find-my)                                         | ❓     | ❓       |
-| [High quality two-way audio](#high-quality-two-way-audio)   | 🔴     | 🔴       |
+- **A native GNOME app.** The UI is GTK 4 and libadwaita instead of iced: system font,
+  Adwaita icons, follows GNOME's light and dark style, one instance per session, closes to
+  the tray. It works back to GTK 4.6 and libadwaita 1.1 (Ubuntu and Pop!_OS 22.04).
+- **The hi-res microphone works on this branch.** Apple's high-quality AirPods microphone
+  stream (AAC-ELD over AACP) shows up as a PipeWire input while music keeps playing in full
+  quality, with a built-in microphone test (record, play back, seek). It builds against
+  FFmpeg 4.4 through 8.
+- **Switching between your phone and this PC.** A "Connect to this PC" button and tray
+  item, and an optional automatic switch when media starts playing here.
+- **Settings backported from the Android app.** Press and hold, call controls, microphone
+  side, press speed and duration, noise cancellation with one AirPod, tone volume, volume
+  swipe, Adaptive Audio strength, pause when falling asleep, and the custom equalizer.
+- **Reliability fixes.** Malformed packets no longer crash the app, battery shows up after
+  taking the AirPods over from a phone, the case shows its last known level, the audio
+  profile no longer fights playback, AAC is the default codec, and the device files are
+  written atomically.
+- **No dependency advisories.** `cargo deny` passes with no exceptions, the whole crate is
+  clippy-pedantic clean, and CI checks every push.
 
-| Symbol | Meaning                                                             |
-| ------ | ------------------------------------------------------------------- |
-| ✅     | Implemented and works well                                          |
-| ⚪     | Needs [VendorID spoofing](#vendorid-spoofing); use at your own risk |
-| 🔴     | Not implemented yet; planned                                        |
-| ⛔     | Will not be implemented                                             |
-| ❓     | Unknown                                                             |
+## Features
 
-## Find My
+| Feature | Linux (this fork) |
+| --- | --- |
+| Listening modes (Off, Transparency, Adaptive, Noise Cancellation) | ✅ |
+| Battery for each bud and the case (last known case level) | ✅ |
+| Ear detection with automatic play and pause | ✅ |
+| Conversation awareness, personalized volume | ✅ |
+| Rename | ✅ |
+| Hi-res microphone with music kept in full quality | ✅ |
+| Microphone test | ✅ |
+| Connect to this PC, switch on playback | ✅ |
+| Press and hold, calls, microphone side, accessibility, Adaptive Audio strength, sleep detection | ✅ new, report issues |
+| Custom equalizer | ✅ new; needs recent AirPods firmware |
+| Hearing aid, transparency customization, loud sound reduction | ❌ needs VendorID spoofing, see below |
+| Head gestures, spatial audio, heart rate, Find My | ❌ |
 
-The following features related to Find My are planned, but require further RE and might need root on Android:
+### VendorID spoofing
 
-- Add your AirPods to the Find My network
-- Play sound through charging case to find it
-- Notify when leaving behind
-- Toggle case charging sounds
+Some features only unlock when the computer claims to be an Apple device
+(`DeviceID = bluetooth:004C:0000:0000` in `/etc/bluetooth/main.conf`). With current AirPods
+firmware (for example 9A348 on AirPods Pro 3) this causes constant disconnects, so this
+fork does not rely on it and does not ship features that need it.
 
-## Spatial Audio
+## Install
 
-The app does not currently provide head tracking information to Android for the OS to perform HRTF. This has not been explored completely, and it might need root. 
+The app builds from source; AppImage and Flatpak packaging have not been updated for the
+GTK UI yet.
 
-Spatializing stereo sound is beyond this project's scope and will never be available. Many OEMs have an implementation of their own for this.
+### Dependencies
 
-## Heart Rate Monitoring (AirPods Pro 3 and later)
-This is being worked upon, check the #⁠reverse-engineering channel on the LibrePods Discord server for more information. If it is ever implemented, it will most likely need root on Android.
+Ubuntu, Pop!_OS, Debian:
 
-## High quality two-way audio
-On iOS/iPadOS, you can continue using A2DP while AirPods send the audio stream from its microphone over AACP. 
+```bash
+sudo apt install build-essential pkg-config libclang-dev libdbus-1-dev libpulse-dev \
+  libavcodec-dev libavutil-dev libgtk-4-dev libadwaita-1-dev
+```
 
-Since this needs deeper integration with audio on Android, it will most likely need root.
+Fedora:
 
-# Installation
+```bash
+sudo dnf install gcc pkg-config clang-devel dbus-devel pulseaudio-libs-devel \
+  ffmpeg-free-devel gtk4-devel libadwaita-devel
+```
 
-- [**Android**](/android/README.md)
-- [**Linux**](/linux/README.md)
+Arch:
 
-# VendorID Spoofing
+```bash
+sudo pacman -S base-devel clang dbus libpulse ffmpeg gtk4 libadwaita
+```
 
-Turns out, if you change the VendorID in DID Profile to that of Apple, you get access to several special features!
+Rust comes from [rustup](https://rustup.rs); the toolchain is pinned in
+`linux-rust/rust-toolchain.toml` and installed on first build.
 
-You can do this on Linux by editing the DeviceID in `/etc/bluetooth/main.conf`. Add this line to the config file `DeviceID = bluetooth:004C:0000:0000`. For android you can enable the `act as Apple device` setting in the app's settings (shown only when Xposed is available and LibrePods module is enabled).
+### Build and install
 
-## Multi-device Connectivity
+```bash
+git clone https://github.com/leafaar/librepods
+cd librepods/linux-rust
+cargo build --release
+install -Dm755 target/release/librepods ~/.local/bin/librepods
+install -Dm644 assets/icon.png ~/.local/share/icons/hicolor/256x256/apps/me.kavishdevar.librepods.png
+install -Dm644 assets/me.kavishdevar.librepods.desktop ~/.local/share/applications/me.kavishdevar.librepods.desktop
+```
 
-Upto two devices can be simultaneously connected to AirPods, for audio and control both. Seamless connection switching. The same notification shows up on Apple device when Android takes over the AirPods as if it were an Apple device ("Move to iPhone"). Android also shows a popup when the other device takes over.
+To start it with your session, minimized to the tray:
 
-## Accessibility Settings and Hearing Aid
+```bash
+mkdir -p ~/.config/autostart
+sed 's|^Exec=.*|Exec=librepods --start-minimized|' assets/me.kavishdevar.librepods.desktop \
+  > ~/.config/autostart/librepods.desktop
+```
 
-Accessibility settings like customizing transparency mode (amplification, balance, tone, conversation boost, and ambient noise reduction), and loud sound reduction can be configured.
+### Nix
 
-All hearing aid customizations can be done from Android (linux soon), including setting the audiogram result. The app doesn't provide a way to take a hearing test because it requires much more precision. It is much better to use an already available audiogram result. 
+```bash
+nix run github:leafaar/librepods
+```
 
-# Protocol and Reverse Engineering
+## Usage
 
-Please refer to the Wireshark dissector plugin by Nojus ([@pabloaul](https://github.com/pabloaul)) for more information on the protocols used: [pabloaul/apple-wireshark](https://github.com/pabloaul/apple-wireshark)
+Pair the AirPods in your Bluetooth settings first, then open LibrePods.
 
-The dissector had not been used in LibrePods for most of the implementation; I had reverse engineered the protocol myself before this dissector was made. But many (future) features including two-way high quality audio and spatial audio would not have been possible without their RE efforts!
+```text
+librepods [OPTIONS]
+  -d, --debug            Debug logging
+      --no-tray          Run headless: no window and no tray, only the Bluetooth logic
+      --start-minimized  Start with the window hidden in the tray
+      --le-debug         Debug logging for Bluetooth LE (very verbose)
+  -v, --version          Show the version
+```
 
-# Use of AI
+- **Tray.** On GNOME the tray icon needs the AppIndicator extension (on by default on
+  Ubuntu and Pop!_OS). Closing the window keeps the app in the tray.
+- **Hi-res microphone.** Turn it on in the AirPods page, then pick "AirPods_HiRes_Mic" as
+  the microphone in your app. The mic test on the same page records you and plays it back.
+- **Media controls.** With PipeWire, stem presses need WirePlumber's AVRCP player:
 
-## Android app
+  ```ini
+  # ~/.config/wireplumber/wireplumber.conf.d/51-bluez-avrcp.conf
+  monitor.bluez.properties = {
+    bluez5.dummy-avrcp-player = true
+  }
+  ```
 
-These parts of the app were completely AI-generated: 
-- Head Gestures - all of it, including logic and the UI
-- The offset setup with r2+the xposed module (both versions)
-- Troubleshooter and LogCollector
+  Do not run `mpris-proxy` together with WirePlumber.
+- **Logs.** `librepods -d`, or `RUST_LOG=librepods=debug librepods`.
 
-Rest everything- the background service, the Bluetooth manager classes (AACP and ATT), the entire UI, even the smallest components were written manually.
+## Development
 
-Some parts of the UI components were borrowed from [Kyant0's demo app](https://github.com/Kyant0/AndroidLiquidGlass/tree/master/catalog), which is licensed under [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+See [`linux-rust/README.md`](linux-rust/README.md) for the architecture and conventions.
+Every change passes the same checks as CI:
 
-## Linux (rewrite)
+```bash
+cd linux-rust
+cargo +nightly fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo deny check
+nix flake check   # from the repository root
+```
 
-The `aacp.rs` and the `att.rs` files were translated from Kotlin to Rust with AI. Some parts of the `media_controller.rs` file, mainly the pulse integration, was also AI-generated.
+The protocol notes in [`docs/`](docs/) describe the AACP packets the app speaks. The
+Wireshark dissector by [@pabloaul](https://github.com/pabloaul/apple-wireshark) covers the
+wider set of Apple Bluetooth protocols.
 
-# Supporters
+## Credits
 
-A huge thank you to everyone supporting the project!
-
-<table>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/davdroman">
-        <img src="https://github.com/davdroman.png?size=48" width="48" height="48"alt="davdroman"/><br />
-        @davdroman
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/tedsalmon">
-        <img src="https://github.com/tedsalmon.png?size=48" width="48" height="48"alt="tedsalmon"/><br />
-        @tedsalmon
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/wiless">
-        <img src="https://github.com/wiless.png?size=48" width="48" height="48"alt="wiless"/><br />
-        @wiless
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/SmartMsg">
-        <img src="https://github.com/SmartMsg.png?size=48" width="48" height="48"alt="SmartMsg"/><br />
-        @SmartMsg
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/lunaroyster">
-        <img src="https://github.com/lunaroyster.png?size=48" width="48" height="48"alt="lunaroyster"/><br />
-        @lunaroyster
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/ressiwage">
-        <img src="https://github.com/ressiwage.png?size=48" width="48" height="48"alt="ressiwage"/><br />
-        @ressiwage
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/kkjdroid">
-        <img src="https://github.com/kkjdroid.png?size=48" width="48" height="48"alt="kkjdroid"/><br />
-        @kkjdroid
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/CitrusJoules">
-        <img src="https://github.com/CitrusJoules.png?size=48" width="48" height="48"alt="CitrusJoules"/><br />
-        @CitrusJoules
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/DanielReyesDev">
-        <img src="https://github.com/DanielReyesDev.png?size=48" width="48" height="48"alt="DanielReyesDev"/><br />
-        @DanielReyesDev
-      </a>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://github.com/sumitduster">
-        <img src="https://github.com/sumitduster.png?size=48" width="48" height="48"alt="sumitduster"/><br />
-        @sumitduster
-      </a>
-    </td>
-    <td align="center">
-      <a href="https://github.com/GrifTheDev">
-        <img src="https://github.com/GrifTheDev.png?size=48" width="48" height="48"alt="GrifTheDev"/><br />
-        @GrifTheDev
-      </a>
-    </td>
-  </tr>
-</table>
-
-# Special Thanks
-- @tyalie for making the first documentation on the protocol! ([tyalie/AAP-Protocol-Definition](https://github.com/tyalie/AAP-Protocol-Defintion))
-- @rithvikvibhu and folks over at lagrangepoint for helping with the hearing aid feature ([gist](https://gist.github.com/rithvikvibhu/45e24bbe5ade30125f152383daf07016))
-- @devnoname120 for helping with the first root patch
-- @timgromeyer for making the first version of the linux app
-- @hackclub for hosting [High Seas](https://highseas.hackclub.com) and [Low Skies](https://low-skies.hackclub.com)!
-- Of course, everyone who has contributed to the project in any way, including by testing, sharing feedback, or just showing interest!
-
-# Alternates for other platforms:
-- CAPod - A companion app for AirPods on Android. ([play store](https://play.google.com/store/apps/details?id=eu.darken.capod) | [source code](https://github.com/d4rken-org/capod)). Use this if you're using Android version 16 QPR3 or below and are not rooted.
-- MagicPods for Steam Deck ([website](https://magicpods.app/steamdeck/))
-- MagicPods - if you're looking for "LibrePods for Windows"  ([ms store](https://apps.microsoft.com/store/detail/9P6SKKFKSHKM) [installer](https://magicpods.app/installer/MagicPods.appinstaller) | [website](https://magicpods.app/))
-
-# Star History
-
-<a href="https://www.star-history.com/?repos=librepods-org%2Flibrepods&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=librepods-org/librepods&type=date&theme=dark&legend=top-left&sealed_token=CS9QF2Wcx-_EN6M7lBhwvTa2WBd5eB8FbQa5FWt3SV14v1OcQdy2aCGsXxHoytVaoylP_pTxj1h2U-odoXDV_EwTqMxM-MQwG_WpvV_1g_yH-Jh3ux2BuWCmS98LxLqfox2ibLOlFDHu_-geTLFsTmqTc1SjX6-NYxVHXF5DaqnxFOAyjLPL5_WtXVew" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=librepods-org/librepods&type=date&legend=top-left&sealed_token=CS9QF2Wcx-_EN6M7lBhwvTa2WBd5eB8FbQa5FWt3SV14v1OcQdy2aCGsXxHoytVaoylP_pTxj1h2U-odoXDV_EwTqMxM-MQwG_WpvV_1g_yH-Jh3ux2BuWCmS98LxLqfox2ibLOlFDHu_-geTLFsTmqTc1SjX6-NYxVHXF5DaqnxFOAyjLPL5_WtXVew" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=librepods-org/librepods&type=date&legend=top-left&sealed_token=CS9QF2Wcx-_EN6M7lBhwvTa2WBd5eB8FbQa5FWt3SV14v1OcQdy2aCGsXxHoytVaoylP_pTxj1h2U-odoXDV_EwTqMxM-MQwG_WpvV_1g_yH-Jh3ux2BuWCmS98LxLqfox2ibLOlFDHu_-geTLFsTmqTc1SjX6-NYxVHXF5DaqnxFOAyjLPL5_WtXVew" />
- </picture>
-</a>
+- [Kavish Devar](https://github.com/kavishdevar) and the
+  [LibrePods contributors](https://github.com/librepods-org/librepods/graphs/contributors),
+  who wrote LibrePods and reverse engineered the AirPods protocol.
+- Upstream pull requests merged into this fork:
+  - #655 hi-res microphone support, by [@LuanAdemi](https://github.com/LuanAdemi)
+  - #766 A2DP profile handling and codec choice, #775 send path deadlock, by
+    [@injkgz](https://github.com/injkgz)
+  - #724 takeover with two devices connected, by
+    [@RamfiAogusto](https://github.com/RamfiAogusto)
+  - #688 stale playback listeners, #689 takeover state lock, by
+    [@mmatczuk](https://github.com/mmatczuk)
+  - #733 tray startup, by [@harshach](https://github.com/harshach)
+  - #586 scrollable device views, by [@debarkak](https://github.com/debarkak)
+  - #665 open the window from the tray, by
+    [@ousamabenyounes](https://github.com/ousamabenyounes)
 
 # License
 
