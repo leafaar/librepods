@@ -22,11 +22,17 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 aes = "0.9.3"
 futures = "0.3.34"
+thiserror = "2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # AAC-ELD decode for the hi-res microphone. System libavcodec/libavutil via
 # pkg-config (no bundled build); avformat/swscale/etc. are not needed.
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec"] }
+
+[dev-dependencies]
+proptest = "1"
+# Paused clock (tokio::time::pause) for the retry and timeout tests.
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 
 [lints.rust]
 # Edition 2024 only warns; every unsafe operation must sit in its own block
