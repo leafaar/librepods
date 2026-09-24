@@ -1,0 +1,6 @@
+# Pinned stable toolchain for builds, clippy and tests. Formatting uses nightly
+# rustfmt (`cargo +nightly fmt`) because imports_granularity is unstable.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -1,0 +1,11 @@
+# Run with `cargo +nightly fmt`: imports_granularity and group_imports are
+# nightly-only options.
+edition = "2024"
+style_edition = "2024"
+imports_granularity = "One"
+group_imports = "One"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+match_block_trailing_comma = true

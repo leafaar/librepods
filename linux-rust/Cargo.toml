@@ -2,6 +2,8 @@
 name = "librepods"
 version = "0.1.0"
 edition = "2024"
+# Lowest toolchain the crate builds with: iced 0.14 and let chains need 1.88.
+rust-version = "1.88"
 
 [dependencies]
 tokio = {version = "1.50.0", features = ["full"]}
