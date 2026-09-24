@@ -34,6 +34,15 @@ pub struct EldDecoder {
 // thread affinity; `&mut self` on every method means one thread uses them at a time.
 unsafe impl Send for EldDecoder {}
 
+/// A frame's byte plane pointer as a pointer to its samples.
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "FFmpeg allocates frame planes aligned for SIMD (at least 16 bytes), more than any sample type needs"
+)]
+fn sample_ptr<T>(plane: *mut u8) -> *const T {
+    plane.cast::<T>().cast_const()
+}
+
 #[inline]
 fn f_to_s16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
@@ -71,7 +80,7 @@ impl EldDecoder {
             };
 
             // extradata = ASC
-            let extradata = ff::av_mallocz(ELD_ASC.len() + PAD) as *mut u8;
+            let extradata = ff::av_mallocz(ELD_ASC.len() + PAD).cast::<u8>();
             if extradata.is_null() {
                 d.free();
                 return None;
@@ -107,13 +116,13 @@ impl EldDecoder {
         // SAFETY: each pointer is either null or owned by self and still live.
         unsafe {
             if !self.frame.is_null() {
-                ff::av_frame_free(&mut self.frame);
+                ff::av_frame_free(&raw mut self.frame);
             }
             if !self.pkt.is_null() {
-                ff::av_packet_free(&mut self.pkt);
+                ff::av_packet_free(&raw mut self.pkt);
             }
             if !self.ctx.is_null() {
-                ff::avcodec_free_context(&mut self.ctx);
+                ff::avcodec_free_context(&raw mut self.ctx);
             }
         }
     }
@@ -166,32 +175,31 @@ impl EldDecoder {
             out.reserve(total);
 
             let data = &(*self.frame).data;
+            let planes = &data[..nch];
             match (*self.frame).format {
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_FLTP as c_int => {
                     // native aac: planar float
                     for i in 0..ns {
-                        for c in 0..nch {
-                            let plane = data[c] as *const f32;
-                            out.push(f_to_s16(*plane.add(i)));
+                        for &plane in planes {
+                            out.push(f_to_s16(*sample_ptr::<f32>(plane).add(i)));
                         }
                     }
                 },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_FLT as c_int => {
-                    let p = data[0] as *const f32;
+                    let p = sample_ptr::<f32>(data[0]);
                     for i in 0..total {
                         out.push(f_to_s16(*p.add(i)));
                     }
                 },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_S16P as c_int => {
                     for i in 0..ns {
-                        for c in 0..nch {
-                            let plane = data[c] as *const i16;
-                            out.push(*plane.add(i));
+                        for &plane in planes {
+                            out.push(*sample_ptr::<i16>(plane).add(i));
                         }
                     }
                 },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_S16 as c_int => {
-                    let p = data[0] as *const i16;
+                    let p = sample_ptr::<i16>(data[0]);
                     for i in 0..total {
                         out.push(*p.add(i));
                     }
@@ -206,5 +214,33 @@ impl EldDecoder {
 impl Drop for EldDecoder {
     fn drop(&mut self) {
         self.free();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_samples_are_clamped_and_rounded_to_s16() {
+        assert_eq!(f_to_s16(0.0), 0);
+        assert_eq!(f_to_s16(1.0), 32767);
+        assert_eq!(f_to_s16(-1.0), -32767);
+        assert_eq!(f_to_s16(2.5), 32767);
+        assert_eq!(f_to_s16(-7.0), -32767);
+        assert_eq!(f_to_s16(0.5), 16384);
+    }
+
+    #[test]
+    fn decoder_rejects_empty_and_oversized_access_units() {
+        // Needs libavcodec's AAC decoder, which the binary links anyway.
+        let Some(mut decoder) = EldDecoder::new() else {
+            return;
+        };
+        let mut out = Vec::new();
+
+        assert_eq!(decoder.decode(&[], &mut out), None);
+        assert_eq!(decoder.decode(&[0; ELD_INBUF_MAX + 1], &mut out), None);
+        assert!(out.is_empty());
     }
 }
