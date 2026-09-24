@@ -5,17 +5,19 @@ use iced::overlay::menu;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
-    Space, button, column, combo_box, container, row, rule, text, text_input, toggler,
+    Space, button, column, combo_box, container, row, rule, slider, text, text_input, toggler,
 };
 use iced::{Background, Border, Center, Color, Length, Padding, Theme};
 use log::error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 // use crate::bluetooth::att::ATTManager;
 use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
-use crate::ui::window::Message;
+use crate::audio::mic_test;
+use crate::ui::window::{Message, MicTest};
 
 pub fn airpods_view<'a>(
     mac: &'a str,
@@ -23,6 +25,7 @@ pub fn airpods_view<'a>(
     state: &'a AirPodsState,
     aacp_manager: Arc<AACPManager>,
     pause_convo: bool,
+    mic_test: &'a MicTest,
     // att_manager: Arc<ATTManager>
 ) -> iced::widget::Container<'a, Message> {
     let mac = mac.to_string();
@@ -374,6 +377,7 @@ pub fn airpods_view<'a>(
         let mic_active = aacp_manager.mic_active();
         let mic_app = aacp_manager.mic_app();
         let level = aacp_manager.mic_level().clamp(0.0, 1.0);
+        let hires_enabled = state.hires_mic_enabled;
 
         let header = row![
             column![
@@ -405,6 +409,9 @@ pub fn airpods_view<'a>(
         let mut content = column![header].spacing(10);
         if mic_active {
             content = content.push(level_meter(level, mic_app));
+        }
+        if hires_enabled {
+            content = content.push(mic_test_row(mic_test));
         }
 
         container(content)
@@ -586,6 +593,93 @@ pub fn airpods_view<'a>(
     .padding(20)
     .center_x(Length::Fill)
     .height(Length::Fill)
+}
+
+fn mmss(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn dim_text<'a>(content: String) -> iced::widget::Text<'a> {
+    text(content).size(12).style(|theme: &Theme| {
+        let mut style = text::Style::default();
+        style.color = Some(theme.palette().text.scale_alpha(0.7));
+        style
+    })
+}
+
+fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> {
+    let title = text("Microphone test").size(14);
+    match mic_test {
+        MicTest::Idle | MicTest::Failed(_) => {
+            let hint = match mic_test {
+                MicTest::Failed(e) => e.clone(),
+                _ => "Record yourself, then play it back to hear what apps receive. Music is paused until you press Done.".to_string(),
+            };
+            column![
+                title,
+                row![
+                    dim_text(hint).width(Length::Fill),
+                    button(text("Record").size(14)).on_press(Message::MicTestRecord),
+                ]
+                .align_y(Center)
+                .spacing(12),
+            ]
+            .spacing(6)
+        }
+        MicTest::Recording(recorder) => column![
+            title,
+            row![
+                text(format!("Recording  {}", mmss(recorder.elapsed())))
+                    .size(14)
+                    .width(Length::Fill),
+                dim_text(format!("max {}", mmss(mic_test::MAX_RECORDING))),
+                button(text("Stop").size(14)).on_press(Message::MicTestStop),
+            ]
+            .align_y(Center)
+            .spacing(12),
+        ]
+        .spacing(6),
+        MicTest::Ready(player) => {
+            let duration = player.duration();
+            let position = player.position().min(duration);
+            let play_pause = if player.is_playing() {
+                button(text("Pause").size(14)).on_press(Message::MicTestPause)
+            } else {
+                button(text("Play").size(14)).on_press(Message::MicTestPlay)
+            };
+            let skip = mic_test::SKIP.as_secs();
+            let mut col = column![
+                title,
+                row![
+                    slider(
+                        0.0..=duration.as_secs_f32(),
+                        position.as_secs_f32(),
+                        Message::MicTestSeek
+                    )
+                    .step(0.1),
+                    dim_text(format!("{} / {}", mmss(position), mmss(duration))),
+                ]
+                .align_y(Center)
+                .spacing(12),
+                row![
+                    button(text(format!("-{skip}s")).size(14)).on_press(Message::MicTestSkip(false)),
+                    play_pause,
+                    button(text(format!("+{skip}s")).size(14)).on_press(Message::MicTestSkip(true)),
+                    Space::new().width(Length::Fill),
+                    button(text("Record again").size(14)).on_press(Message::MicTestRecord),
+                    button(text("Done").size(14)).on_press(Message::MicTestDone),
+                ]
+                .align_y(Center)
+                .spacing(8),
+            ]
+            .spacing(6);
+            if let Some(e) = player.error() {
+                col = col.push(dim_text(e));
+            }
+            col
+        }
+    }
 }
 
 fn level_meter<'a>(level: f32, app: Option<String>) -> iced::widget::Container<'a, Message> {

@@ -280,7 +280,22 @@ pub(crate) fn playing_media_players() -> Vec<String> {
         .collect()
 }
 
-fn resume_media_players(services: &[String]) {
+/// Pause every MPRIS player that is playing and return them, so the caller can
+/// resume exactly those later.
+pub(crate) fn pause_media_players() -> Vec<String> {
+    let players = playing_media_players();
+    let Ok(conn) = Connection::new_session() else {
+        return Vec::new();
+    };
+    for service in &players {
+        let proxy = conn.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_secs(5));
+        let _ =
+            proxy.method_call::<(), _, &str, &str>("org.mpris.MediaPlayer2.Player", "Pause", ());
+    }
+    players
+}
+
+pub(crate) fn resume_media_players(services: &[String]) {
     if services.is_empty() {
         return;
     }
@@ -300,7 +315,7 @@ fn resume_media_players(services: &[String]) {
 
 // Block on the mainloop until `op` finishes. A blocking iterate sleeps until the
 // server replies instead of spinning a core; a dead connection ends the wait.
-fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &Operation<T>) {
+pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &Operation<T>) {
     while op.get_state() == OperationState::Running {
         if let IterateResult::Quit(_) | IterateResult::Err(_) = mainloop.iterate(true) {
             break;
@@ -308,7 +323,7 @@ fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &Operation<T>) {
     }
 }
 
-fn connect() -> Option<(Mainloop, Context)> {
+pub(crate) fn connect() -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
     let mut context = Context::new(&mainloop, "LibrePods-HiResMic")?;
     context

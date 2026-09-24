@@ -6,6 +6,7 @@ use crate::devices::enums::{
     AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
     NothingState,
 };
+use crate::audio::{mic_test, output};
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
@@ -27,6 +28,7 @@ use log::{debug, error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex, RwLock};
 
@@ -91,6 +93,17 @@ pub struct App {
     // Manual connect requests from the UI or tray, keyed by MAC; cleared once
     // the device connects.
     connect_status: HashMap<String, ConnectStatus>,
+    mic_test: MicTest,
+    // Media players paused for the microphone test, resumed when it ends.
+    mic_test_paused: Vec<String>,
+}
+
+/// The microphone test on the AirPods page. Holds the live recorder or player.
+pub enum MicTest {
+    Idle,
+    Recording(mic_test::Recorder),
+    Ready(mic_test::Player),
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +149,13 @@ pub enum Message {
     BluetoothMessage(BluetoothUIMessage),
     ConnectDevice(String),
     ConnectFinished(String, Result<(), String>),
+    MicTestRecord,
+    MicTestStop,
+    MicTestPlay,
+    MicTestPause,
+    MicTestSkip(bool), // true = forward
+    MicTestSeek(f32),  // seconds
+    MicTestDone,
     // ShowNewDialogTab,
     GotPairedDevices(HashMap<String, Address>),
     StartAddDevice(String, Address),
@@ -251,6 +271,8 @@ impl App {
                 a2dp_reset,
                 auto_switch_on_playback,
                 connect_status: HashMap::new(),
+                mic_test: MicTest::Idle,
+                mic_test_paused: Vec::new(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -301,6 +323,54 @@ impl App {
             }
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
             Message::ConnectDevice(mac) => self.start_connect(mac),
+            Message::MicTestRecord => {
+                // Music would play over the recording and the playback, so pause it
+                // for the whole test. Players already paused by an earlier take stay listed.
+                if self.mic_test_paused.is_empty() {
+                    self.mic_test_paused = output::pause_media_players();
+                }
+                self.mic_test = MicTest::Recording(mic_test::Recorder::start());
+                Task::none()
+            }
+            Message::MicTestStop => {
+                self.stop_recording();
+                Task::none()
+            }
+            Message::MicTestPlay => {
+                if let MicTest::Ready(player) = &self.mic_test {
+                    player.play();
+                }
+                Task::none()
+            }
+            Message::MicTestPause => {
+                if let MicTest::Ready(player) = &self.mic_test {
+                    player.pause();
+                }
+                Task::none()
+            }
+            Message::MicTestSkip(forward) => {
+                if let MicTest::Ready(player) = &self.mic_test {
+                    let at = player.position();
+                    let to = if forward {
+                        at + mic_test::SKIP
+                    } else {
+                        at.saturating_sub(mic_test::SKIP)
+                    };
+                    player.seek(to.min(player.duration()));
+                }
+                Task::none()
+            }
+            Message::MicTestSeek(secs) => {
+                if let MicTest::Ready(player) = &self.mic_test {
+                    player.seek(Duration::from_secs_f32(secs.max(0.0)));
+                }
+                Task::none()
+            }
+            Message::MicTestDone => {
+                self.mic_test = MicTest::Idle;
+                output::resume_media_players(&std::mem::take(&mut self.mic_test_paused));
+                Task::none()
+            }
             Message::ConnectFinished(mac, result) => {
                 match result {
                     // DeviceConnected arrives separately once the device is set up.
@@ -313,7 +383,12 @@ impl App {
                 }
                 Task::none()
             }
-            Message::MicLevelTick => Task::none(),
+            Message::MicLevelTick => {
+                if matches!(&self.mic_test, MicTest::Recording(r) if r.finished()) {
+                    self.stop_recording();
+                }
+                Task::none()
+            }
             Message::BluetoothMessage(ui_message) => {
                 match ui_message {
                     BluetoothUIMessage::NoOp => {
@@ -731,6 +806,15 @@ impl App {
         }
     }
 
+    fn stop_recording(&mut self) {
+        if let MicTest::Recording(recorder) = std::mem::replace(&mut self.mic_test, MicTest::Idle) {
+            self.mic_test = match recorder.stop() {
+                Ok(pcm) => MicTest::Ready(mic_test::Player::new(pcm)),
+                Err(e) => MicTest::Failed(e),
+            };
+        }
+    }
+
     fn start_connect(&mut self, mac: String) -> Task<Message> {
         if matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting)) {
             return Task::none();
@@ -996,7 +1080,8 @@ impl App {
                                                                     &devices_list,
                                                                     state,
                                                                     aacp_manager.clone(),
-                                                                    self.hires_mic_pause_convo
+                                                                    self.hires_mic_pause_convo,
+                                                                    &self.mic_test
                                                                 ))
                                                     })
                                                 }
