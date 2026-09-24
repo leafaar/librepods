@@ -1,12 +1,41 @@
 use {
+    crate::devices::enums::{DeviceData, DeviceType},
     aes::{
         Aes128,
         cipher::{Array, BlockCipherEncrypt, KeyInit},
     },
     iced::Theme,
     serde::{Deserialize, Serialize},
-    std::path::PathBuf,
+    std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
+    },
+    thiserror::Error,
+    tracing::{error, info},
 };
+
+/// A failure reading or writing one of the JSON files under the config and
+/// data directories. The cause is part of the message because callers log
+/// these with `{}` and nothing else.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("could not read {}: {err}", path.display())]
+    Read { path: PathBuf, err: io::Error },
+    #[error("{} is not valid JSON: {err}", path.display())]
+    Parse {
+        path: PathBuf,
+        err: serde_json::Error,
+    },
+    #[error("could not encode {}: {err}", path.display())]
+    Encode {
+        path: PathBuf,
+        err: serde_json::Error,
+    },
+    #[error("could not write {}: {err}", path.display())]
+    Write { path: PathBuf, err: io::Error },
+}
 
 pub fn get_devices_path() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
@@ -16,14 +45,12 @@ pub fn get_devices_path() -> PathBuf {
         .join("devices.json")
 }
 
-pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::enums::DeviceType) {
-    use crate::devices::enums::DeviceData;
-
+pub fn ensure_device_registered(mac: &str, name: &str, type_: DeviceType) {
     let result = update_devices_file(|devices| {
         if devices.contains_key(mac) {
             return;
         }
-        tracing::info!("Registering device {} ({}) as {:?}", name, mac, type_);
+        info!("Registering device {} ({}) as {:?}", name, mac, type_);
         devices.insert(
             mac.to_string(),
             DeviceData {
@@ -34,7 +61,7 @@ pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::en
         );
     });
     if let Err(e) = result {
-        tracing::error!("Failed to register device {}: {}", mac, e);
+        error!("Failed to register device {}: {}", mac, e);
     }
 }
 
@@ -49,11 +76,10 @@ pub fn get_preferences_path() -> PathBuf {
 pub fn get_app_settings_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
 
-    let config_dir =
-        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home));
+    let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
 
     let data_dir =
-        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home));
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
 
     let new_path = PathBuf::from(&config_dir)
         .join("librepods")
@@ -132,9 +158,9 @@ fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     result
 }
 
-pub fn ah(k: &[u8; 16], r: &[u8; 3]) -> [u8; 3] {
+pub fn ah(k: &[u8; 16], r: [u8; 3]) -> [u8; 3] {
     let mut r_padded = [0u8; 16];
-    r_padded[..3].copy_from_slice(r);
+    r_padded[..3].copy_from_slice(&r);
     let encrypted = e(k, &r_padded);
     let mut hash = [0u8; 3];
     hash.copy_from_slice(&encrypted[..3]);
@@ -196,6 +222,9 @@ impl std::fmt::Display for MyTheme {
     }
 }
 
+// Each flag is an independent user toggle stored as its own JSON field; folding
+// them into an enum or bit set would change the settings file format.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -230,26 +259,51 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Settings from the default location. A missing or unreadable file gives
+    /// the defaults, and fields missing from the file take their default.
     pub fn load() -> Self {
-        std::fs::read_to_string(get_app_settings_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        SettingsStore::default_location().load().unwrap_or_default()
     }
 
+    /// Save to the default location, logging a failure.
     pub fn save(&self) {
-        let path = get_app_settings_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = SettingsStore::default_location().save(self) {
+            error!("Failed to save app settings: {}", e);
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(e) = write_atomic(&path, &json) {
-                    tracing::error!("Failed to write app settings: {}", e);
-                }
-            },
-            Err(e) => tracing::error!("Failed to serialize app settings: {}", e),
+    }
+}
+
+/// Where the app settings live. Tests point it at a temporary directory.
+#[derive(Clone, Debug)]
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// The settings file under XDG_CONFIG_HOME, migrated from the old location
+    /// on first use.
+    pub fn default_location() -> Self {
+        Self::new(get_app_settings_path())
+    }
+
+    /// A missing file is not an error: it gives the defaults.
+    pub fn load(&self) -> Result<AppSettings, StorageError> {
+        match read_json(&self.path)? {
+            Some(settings) => Ok(settings),
+            None => Ok(AppSettings::default()),
         }
+    }
+
+    pub fn save(&self, settings: &AppSettings) -> Result<(), StorageError> {
+        let json = serde_json::to_string_pretty(settings).map_err(|err| StorageError::Encode {
+            path: self.path.clone(),
+            err,
+        })?;
+        write_atomic(&self.path, &json)
     }
 }
 
@@ -282,40 +336,267 @@ impl From<MyTheme> for Theme {
     }
 }
 
-/// Serializes every read-modify-write of devices.json in this process.
-static DEVICES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes every read-modify-write of devices.json in this process. One lock
+/// for every path: there is one devices file in production, and a test store
+/// only waits a moment longer.
+static DEVICES_FILE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Read devices.json, let `f` change it, and write it back atomically. Every
-/// writer goes through here so no one overwrites the file from a stale copy.
-pub fn update_devices_file(
-    f: impl FnOnce(&mut std::collections::HashMap<String, crate::devices::enums::DeviceData>),
-) -> std::io::Result<()> {
-    let _guard = DEVICES_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = get_devices_path();
-    let mut devices = match std::fs::read_to_string(&path) {
-        // Refuse to write over a file we cannot parse: starting from an empty
-        // map here would silently drop every saved device.
-        Ok(json) => serde_json::from_str(&json).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is not valid, not overwriting it: {e}", path.display()),
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
-        Err(e) => return Err(e),
-    };
-    f(&mut devices);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// The saved devices, keyed by MAC. Tests point it at a temporary directory.
+#[derive(Clone, Debug)]
+pub struct DevicesStore {
+    path: PathBuf,
+}
+
+impl DevicesStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
     }
-    write_atomic(&path, &serde_json::to_string(&devices)?)
+
+    pub fn default_location() -> Self {
+        Self::new(get_devices_path())
+    }
+
+    /// A missing file is not an error: it means no device was saved yet.
+    pub fn load(&self) -> Result<HashMap<String, DeviceData>, StorageError> {
+        Ok(read_json(&self.path)?.unwrap_or_default())
+    }
+
+    /// Read the file, let `f` change it, and write it back atomically. Every
+    /// writer goes through here so no one overwrites the file from a stale
+    /// copy. A file that does not parse is left alone: starting from an empty
+    /// map would silently drop every saved device.
+    pub fn update(
+        &self,
+        f: impl FnOnce(&mut HashMap<String, DeviceData>),
+    ) -> Result<(), StorageError> {
+        // The guarded data is (), so a poisoned lock carries no broken state.
+        let _guard = DEVICES_FILE_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut devices = self.load()?;
+        f(&mut devices);
+        let json = serde_json::to_string(&devices).map_err(|err| StorageError::Encode {
+            path: self.path.clone(),
+            err,
+        })?;
+        write_atomic(&self.path, &json)
+    }
+}
+
+/// Update devices.json in its default location, see [`DevicesStore::update`].
+pub fn update_devices_file(
+    f: impl FnOnce(&mut HashMap<String, DeviceData>),
+) -> Result<(), StorageError> {
+    DevicesStore::default_location().update(f)
+}
+
+/// Parse the JSON file at `path`; Ok(None) when it does not exist.
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, StorageError> {
+    let json = match std::fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(StorageError::Read {
+                path: path.to_path_buf(),
+                err,
+            });
+        },
+    };
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|err| StorageError::Parse {
+            path: path.to_path_buf(),
+            err,
+        })
 }
 
 /// Write to a temp file and rename it into place, so a crash mid-write cannot
 /// leave a truncated file, and a concurrent reader sees the old or the new
-/// contents, never half of one.
-fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+/// contents, never half of one. Creates the parent directory if needed.
+fn write_atomic(path: &Path, contents: &str) -> Result<(), StorageError> {
+    let write_err = |err| StorageError::Write {
+        path: path.to_path_buf(),
+        err,
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(write_err)?;
+    }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
+    std::fs::write(&tmp, contents).map_err(write_err)?;
+    std::fs::rename(&tmp, path).map_err(write_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::devices::enums::{DeviceData, DeviceType},
+        tempfile::TempDir,
+    };
+
+    fn airpods(name: &str) -> DeviceData {
+        DeviceData {
+            name: name.to_string(),
+            type_: DeviceType::AirPods,
+            information: None,
+        }
+    }
+
+    fn devices_store(dir: &TempDir) -> DevicesStore {
+        DevicesStore::new(dir.path().join("librepods").join("devices.json"))
+    }
+
+    #[test]
+    fn missing_devices_file_starts_empty_and_update_creates_it() {
+        let dir = TempDir::new().unwrap();
+        let store = devices_store(&dir);
+
+        assert!(store.load().unwrap().is_empty());
+        store
+            .update(|devices| {
+                devices.insert("AA:BB:CC:DD:EE:FF".to_string(), airpods("Pods"));
+            })
+            .unwrap();
+
+        let devices = store.load().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices["AA:BB:CC:DD:EE:FF"].name, "Pods");
+    }
+
+    #[test]
+    fn update_keeps_other_devices() {
+        let dir = TempDir::new().unwrap();
+        let store = devices_store(&dir);
+        store
+            .update(|d| {
+                d.insert("01".to_string(), airpods("One"));
+            })
+            .unwrap();
+
+        store
+            .update(|d| {
+                d.insert("02".to_string(), airpods("Two"));
+            })
+            .unwrap();
+
+        let devices = store.load().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices["01"].name, "One");
+    }
+
+    #[test]
+    fn unparsable_devices_file_is_not_overwritten() {
+        let dir = TempDir::new().unwrap();
+        let store = devices_store(&dir);
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(&store.path, "{ not json").unwrap();
+        let mut called = false;
+
+        let result = store.update(|_| called = true);
+
+        assert!(matches!(result, Err(StorageError::Parse { .. })));
+        assert!(!called);
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_leaves_no_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sub").join("file.json");
+        write_atomic(&path, "old").unwrap();
+
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("file.json")]);
+    }
+
+    #[test]
+    fn write_error_names_the_path() {
+        let dir = TempDir::new().unwrap();
+        // A regular file where the parent directory should be.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("file.json");
+
+        let err = write_atomic(&path, "x").unwrap_err();
+
+        assert!(matches!(err, StorageError::Write { .. }));
+        assert!(err.to_string().contains("blocker"), "{err}");
+    }
+
+    #[test]
+    fn missing_settings_file_gives_defaults() {
+        let dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(dir.path().join("app_settings.json"));
+
+        let settings = store.load().unwrap();
+
+        assert!(settings.auto_switch_on_playback);
+        assert_eq!(settings.preferred_codec, PreferredCodec::Aac);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(dir.path().join("cfg").join("app_settings.json"));
+        let settings = AppSettings {
+            theme: MyTheme::Nord,
+            hires_mic_agc: false,
+            preferred_codec: PreferredCodec::SbcXq,
+            ..AppSettings::default()
+        };
+
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.theme, MyTheme::Nord);
+        assert!(!loaded.hires_mic_agc);
+        assert_eq!(loaded.preferred_codec, PreferredCodec::SbcXq);
+    }
+
+    #[test]
+    fn settings_fields_missing_from_the_file_take_their_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("app_settings.json");
+        std::fs::write(&path, r#"{"theme":"Nord","a2dp_reset":false}"#).unwrap();
+
+        let settings = SettingsStore::new(path).load().unwrap();
+
+        assert_eq!(settings.theme, MyTheme::Nord);
+        assert!(!settings.a2dp_reset);
+        assert!(settings.hires_mic_enabled);
+        assert_eq!(settings.preferred_codec, PreferredCodec::Aac);
+    }
+
+    #[test]
+    fn unparsable_settings_file_is_a_parse_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("app_settings.json");
+        std::fs::write(&path, r#"{"theme": 5}"#).unwrap();
+
+        let result = SettingsStore::new(path).load();
+
+        assert!(matches!(result, Err(StorageError::Parse { .. })));
+    }
+
+    #[test]
+    fn codec_profile_order_puts_the_preferred_codec_first() {
+        assert_eq!(
+            PreferredCodec::Aac.profile_order(),
+            ["a2dp-sink", "a2dp-sink-sbc_xq", "a2dp-sink-sbc"]
+        );
+        assert_eq!(
+            PreferredCodec::SbcXq.profile_order(),
+            ["a2dp-sink-sbc_xq", "a2dp-sink", "a2dp-sink-sbc"]
+        );
+        assert_eq!(
+            PreferredCodec::Sbc.profile_order(),
+            ["a2dp-sink-sbc", "a2dp-sink", "a2dp-sink-sbc_xq"]
+        );
+    }
 }
