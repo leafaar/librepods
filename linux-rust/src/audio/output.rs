@@ -1,10 +1,12 @@
 //! PipeWire/PulseAudio output for the hi-res microphone
 
 use libpulse_binding::callbacks::ListResult;
+use libpulse_binding::context::introspect::SourceOutputInfo;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::operation::{Operation, State as OperationState};
+use libpulse_binding::proplist::properties;
 use log::{error, info, warn};
 use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
@@ -169,7 +171,31 @@ impl Output {
     }
 }
 
+// Volume panels (pavucontrol's input tab, GNOME Settings' Sound panel) open a
+// peak-detect record stream on every source just to draw its level bar. Those
+// are not recorders and must not start the AirPods mic. libpulse does not report
+// the PEAK_DETECT stream flag, so this is a heuristic on what the stream carries:
+// - PulseAudio serves peak-detect streams with the "peaks" resampler;
+// - PipeWire's pulse server marks them stream.monitor=true;
+// - pavucontrol and libgvc (GNOME Settings) name the stream "Peak detect", a
+//   translatable string, so their application ids are matched as well. Neither
+//   app records audio, so no real recorder is lost by skipping them.
+const LEVEL_METER_NAME: &str = "Peak detect";
+const LEVEL_METER_APPS: [&str; 2] = ["org.PulseAudio.pavucontrol", "org.gnome.VolumeControl"];
+
+fn is_level_meter(item: &SourceOutputInfo) -> bool {
+    let props = &item.proplist;
+    item.resample_method.as_deref() == Some("peaks")
+        || props.get_str("stream.monitor").as_deref() == Some("true")
+        || props.get_str(properties::MEDIA_NAME).as_deref() == Some(LEVEL_METER_NAME)
+        || item.name.as_deref() == Some(LEVEL_METER_NAME)
+        || props
+            .get_str(properties::APPLICATION_ID)
+            .is_some_and(|id| LEVEL_METER_APPS.contains(&id.as_str()))
+}
+
 // Name of the application recording from the virtual source, or None if idle.
+// Corked (paused) streams and level meters do not count as recording.
 pub fn source_consumer(name: &str) -> Option<String> {
     let (mut mainloop, context) = connect()?;
     let introspect = context.introspect();
@@ -192,7 +218,11 @@ pub fn source_consumer(name: &str) -> Option<String> {
             let app = app.clone();
             move |result| {
                 if let ListResult::Item(item) = result {
-                    if item.source == idx && app.borrow().is_none() {
+                    if item.source == idx
+                        && !item.corked
+                        && !is_level_meter(&item)
+                        && app.borrow().is_none()
+                    {
                         let label = item
                             .proplist
                             .get_str("application.name")
