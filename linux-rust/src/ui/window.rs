@@ -10,15 +10,15 @@ use crate::audio::{mic_test, output};
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
-use crate::utils::{AppSettings, MyTheme, get_devices_path};
+use crate::utils::{AppSettings, MyTheme, PreferredCodec, get_devices_path};
 use bluer::Address;
 use iced::border::Radius;
 use iced::overlay::menu;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
-    Space, button, column, combo_box, container, pane_grid, row, rule, scrollable, text,
-    text_input, toggler,
+    Space, button, column, combo_box, container, pane_grid, pick_list, row, rule, scrollable,
+    text, text_input, toggler,
 };
 use iced::{
     Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
@@ -90,6 +90,7 @@ pub struct App {
     hires_mic_pause_convo: bool,
     a2dp_reset: bool,
     auto_switch_on_playback: bool,
+    preferred_codec: PreferredCodec,
     // Manual connect requests from the UI or tray, keyed by MAC; cleared once
     // the device connects.
     connect_status: HashMap<String, ConnectStatus>,
@@ -167,6 +168,7 @@ pub enum Message {
     StemControlChanged(bool),
     A2dpResetChanged(bool),
     AutoSwitchChanged(bool),
+    PreferredCodecChanged(PreferredCodec),
     HiResMicAgcChanged(bool),
     HiResMicPauseConvoChanged(bool),
     MicLevelTick,
@@ -214,6 +216,7 @@ impl App {
         let hires_mic_pause_convo = app_settings.hires_mic_pause_convo;
         let a2dp_reset = app_settings.a2dp_reset;
         let auto_switch_on_playback = app_settings.auto_switch_on_playback;
+        let preferred_codec = app_settings.preferred_codec;
 
         let bluetooth_state = BluetoothState::new();
 
@@ -270,6 +273,7 @@ impl App {
                 hires_mic_pause_convo,
                 a2dp_reset,
                 auto_switch_on_playback,
+                preferred_codec,
                 connect_status: HashMap::new(),
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
@@ -288,6 +292,7 @@ impl App {
             hires_mic_pause_convo: self.hires_mic_pause_convo,
             a2dp_reset: self.a2dp_reset,
             auto_switch_on_playback: self.auto_switch_on_playback,
+            preferred_codec: self.preferred_codec,
         }
         .save();
     }
@@ -790,6 +795,11 @@ impl App {
             }
             Message::AutoSwitchChanged(is_enabled) => {
                 self.auto_switch_on_playback = is_enabled;
+                self.save_settings();
+                Task::none()
+            }
+            Message::PreferredCodecChanged(codec) => {
+                self.preferred_codec = codec;
                 self.save_settings();
                 Task::none()
             }
@@ -1347,6 +1357,45 @@ impl App {
                                         )
                                     .align_y(Center);
 
+                            let preferred_codec_picker = container(
+                                row![
+                                    column![
+                                        text("Preferred audio codec").size(16),
+                                        text("Codec to activate for playback. The others are used as fallbacks if the chosen one is unavailable.").size(12).style(
+                                            |theme: &Theme| {
+                                                let mut style = text::Style::default();
+                                                style.color = Some(theme.palette().text.scale_alpha(0.7));
+                                                style
+                                            }
+                                        ).width(Length::Fill)
+                                    ].width(Length::Fill),
+                                    pick_list(
+                                        PreferredCodec::ALL,
+                                        Some(self.preferred_codec),
+                                        Message::PreferredCodecChanged,
+                                    )
+                                    ]
+                                        .align_y(Center)
+                                        .spacing(12)
+                                    )
+                                        .padding(Padding{
+                                            top: 5.0,
+                                            bottom: 5.0,
+                                            left: 18.0,
+                                            right: 18.0,
+                                        })
+                                        .style(
+                                            |theme: &Theme| {
+                                                let mut style = container::Style::default();
+                                                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+                                                let mut border = Border::default();
+                                                border.color = theme.palette().primary.scale_alpha(0.5);
+                                                style.border = border.rounded(16);
+                                                style
+                                            }
+                                        )
+                                    .align_y(Center);
+
                             let auto_switch_value = self.auto_switch_on_playback;
                             let auto_switch_toggle = container(
                                 row![
@@ -1497,6 +1546,8 @@ impl App {
                                     tray_text_mode_toggle,
                                     Space::new().height(Length::from(20)),
                                     controls_settings_col,
+                                    Space::new().height(Length::from(20)),
+                                    preferred_codec_picker,
                                     Space::new().height(Length::from(20)),
                                     auto_switch_toggle,
                                     Space::new().height(Length::from(20)),
