@@ -12,11 +12,15 @@ const PSM_ATT: u16 = 0x001F;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+const OPCODE_ERROR_RESPONSE: u8 = 0x01;
 const OPCODE_READ_REQUEST: u8 = 0x0A;
+const OPCODE_READ_RESPONSE: u8 = 0x0B;
 const OPCODE_WRITE_REQUEST: u8 = 0x12;
-const OPCODE_HANDLE_VALUE_NTF: u8 = 0x1B;
 const OPCODE_WRITE_RESPONSE: u8 = 0x13;
-const RESPONSE_TIMEOUT: u64 = 5000;
+const OPCODE_HANDLE_VALUE_NTF: u8 = 0x1B;
+const OPCODE_HANDLE_VALUE_IND: u8 = 0x1D;
+const OPCODE_HANDLE_VALUE_CFM: u8 = 0x1E;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,9 +66,40 @@ impl ATTManagerState {
     }
 }
 
+/// What a PDU received while a request is outstanding means for that request.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseMatch<'a> {
+    /// The response to the request, without its opcode.
+    Response(&'a [u8]),
+    /// An Error Response for the request, with the ATT error code.
+    Error(u8),
+    /// Anything else: a late response to an earlier request that timed out,
+    /// or a PDU of a type this client does not handle.
+    Unrelated,
+}
+
+fn match_response(request_opcode: u8, pdu: &[u8]) -> ResponseMatch<'_> {
+    let expected = match request_opcode {
+        OPCODE_READ_REQUEST => OPCODE_READ_RESPONSE,
+        OPCODE_WRITE_REQUEST => OPCODE_WRITE_RESPONSE,
+        _ => return ResponseMatch::Unrelated,
+    };
+    match pdu {
+        [opcode, value @ ..] if *opcode == expected => ResponseMatch::Response(value),
+        // Error Response: opcode, request opcode in error, handle (2), error code.
+        [OPCODE_ERROR_RESPONSE, failed, _, _, code, ..] if *failed == request_opcode => {
+            ResponseMatch::Error(*code)
+        }
+        _ => ResponseMatch::Unrelated,
+    }
+}
+
 #[derive(Clone)]
 pub struct ATTManager {
     state: Arc<Mutex<ATTManagerState>>,
+    /// Received responses. Held for the whole of a request, from send to
+    /// response, so only one request is outstanding at a time as ATT requires
+    /// and a response cannot be taken by another request.
     response_rx: Arc<Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
     response_tx: mpsc::UnboundedSender<Vec<u8>>,
     tasks: Arc<Mutex<JoinSet<()>>>,
@@ -162,8 +197,7 @@ impl ATTManager {
         let lsb = (handle as u16 & 0xFF) as u8;
         let msb = ((handle as u16 >> 8) & 0xFF) as u8;
         let pdu = vec![OPCODE_READ_REQUEST, lsb, msb];
-        self.send_packet(&pdu).await?;
-        self.read_response().await
+        self.request(&pdu).await
     }
 
     pub async fn write(&self, handle: ATTHandles, value: &[u8]) -> Result<()> {
@@ -171,8 +205,7 @@ impl ATTManager {
         let msb = ((handle as u16 >> 8) & 0xFF) as u8;
         let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];
         pdu.extend_from_slice(value);
-        self.send_packet(&pdu).await?;
-        self.read_response().await?;
+        self.request(&pdu).await?;
         Ok(())
     }
 
@@ -181,8 +214,7 @@ impl ATTManager {
         let msb = ((handle as u16 >> 8) & 0xFF) as u8;
         let mut pdu = vec![OPCODE_WRITE_REQUEST, lsb, msb];
         pdu.extend_from_slice(value);
-        self.send_packet(&pdu).await?;
-        self.read_response().await?;
+        self.request(&pdu).await?;
         Ok(())
     }
 
@@ -207,19 +239,49 @@ impl ATTManager {
         }
     }
 
-    async fn read_response(&self) -> Result<Vec<u8>> {
-        debug!("Waiting for response...");
+    /// Send a request PDU and wait for its response, returned without the
+    /// opcode. An Error Response for the request is returned as an error.
+    async fn request(&self, pdu: &[u8]) -> Result<Vec<u8>> {
+        let request_opcode = *pdu
+            .first()
+            .expect("read and write build their PDU starting with the opcode");
         let mut rx = self.response_rx.lock().await;
-        match tokio::time::timeout(Duration::from_millis(RESPONSE_TIMEOUT), rx.recv()).await {
-            Ok(Some(resp)) => Ok(resp),
-            Ok(None) => Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Response channel closed",
-            ))),
-            Err(_) => Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Response timeout",
-            ))),
+        // Responses still queued answer requests that already gave up.
+        while let Ok(stale) = rx.try_recv() {
+            debug!("Dropping stale response: {}", hex::encode(&stale));
+        }
+        self.send_packet(pdu).await?;
+
+        debug!("Waiting for response...");
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            let resp = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(resp)) => resp,
+                Ok(None) => {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Response channel closed",
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Response timeout",
+                    )));
+                }
+            };
+            match match_response(request_opcode, &resp) {
+                ResponseMatch::Response(value) => return Ok(value.to_vec()),
+                ResponseMatch::Error(code) => {
+                    return Err(Error::from(std::io::Error::other(format!(
+                        "ATT error {:#04x} for request {:#04x}",
+                        code, request_opcode
+                    ))));
+                }
+                ResponseMatch::Unrelated => {
+                    debug!("Ignoring unrelated PDU: {}", hex::encode(&resp));
+                }
+            }
         }
     }
 }
@@ -238,10 +300,17 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
                 if data.is_empty() {
                     continue;
                 }
-                if data[0] == OPCODE_HANDLE_VALUE_NTF {
-                    // Notification: opcode, 2-byte handle, value.
+                if data[0] == OPCODE_HANDLE_VALUE_NTF || data[0] == OPCODE_HANDLE_VALUE_IND {
+                    // Notification or indication: opcode, 2-byte handle, value.
                     if data.len() < 3 {
                         continue;
+                    }
+                    if data[0] == OPCODE_HANDLE_VALUE_IND {
+                        // The server sends no further indication until this
+                        // one is confirmed.
+                        if let Err(e) = manager.send_packet(&[OPCODE_HANDLE_VALUE_CFM]).await {
+                            error!("Failed to confirm indication: {}", e);
+                        }
                     }
                     let handle = (data[1] as u16) | ((data[2] as u16) << 8);
                     let value = data[3..].to_vec();
@@ -251,11 +320,9 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
                             let _ = listener.send(value.clone());
                         }
                     }
-                } else if data[0] == OPCODE_WRITE_RESPONSE {
-                    let _ = manager.response_tx.send(vec![]);
                 } else {
-                    // Response
-                    let _ = manager.response_tx.send(data[1..].to_vec());
+                    // A response; request() matches it to what it sent.
+                    let _ = manager.response_tx.send(data.to_vec());
                 }
             }
             Err(e) => {
@@ -277,4 +344,61 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
     }
     info!("send thread finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_response_returns_value() {
+        assert_eq!(
+            match_response(OPCODE_READ_REQUEST, &[OPCODE_READ_RESPONSE, 0x01, 0x02]),
+            ResponseMatch::Response(&[0x01, 0x02])
+        );
+    }
+
+    #[test]
+    fn write_response_is_empty() {
+        assert_eq!(
+            match_response(OPCODE_WRITE_REQUEST, &[OPCODE_WRITE_RESPONSE]),
+            ResponseMatch::Response(&[])
+        );
+    }
+
+    #[test]
+    fn error_response_for_the_request_is_an_error() {
+        let pdu = [OPCODE_ERROR_RESPONSE, OPCODE_WRITE_REQUEST, 0x02, 0x80, 0x03];
+        assert_eq!(
+            match_response(OPCODE_WRITE_REQUEST, &pdu),
+            ResponseMatch::Error(0x03)
+        );
+    }
+
+    #[test]
+    fn late_or_foreign_pdus_are_unrelated() {
+        // A read response arriving after its request timed out, while a write waits.
+        assert_eq!(
+            match_response(OPCODE_WRITE_REQUEST, &[OPCODE_READ_RESPONSE, 0x01]),
+            ResponseMatch::Unrelated
+        );
+        // An error for an earlier read, while a write waits.
+        let pdu = [OPCODE_ERROR_RESPONSE, OPCODE_READ_REQUEST, 0x02, 0x80, 0x0A];
+        assert_eq!(
+            match_response(OPCODE_WRITE_REQUEST, &pdu),
+            ResponseMatch::Unrelated
+        );
+        // A truncated error response.
+        assert_eq!(
+            match_response(
+                OPCODE_READ_REQUEST,
+                &[OPCODE_ERROR_RESPONSE, OPCODE_READ_REQUEST]
+            ),
+            ResponseMatch::Unrelated
+        );
+        assert_eq!(
+            match_response(OPCODE_READ_REQUEST, &[]),
+            ResponseMatch::Unrelated
+        );
+    }
 }
