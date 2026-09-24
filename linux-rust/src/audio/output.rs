@@ -13,6 +13,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dbus::blocking::Connection;
@@ -220,7 +222,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
                 if let ListResult::Item(item) = result {
                     if item.source == idx
                         && !item.corked
-                        && !is_level_meter(&item)
+                        && !is_level_meter(item)
                         && app.borrow().is_none()
                     {
                         let label = item
@@ -240,11 +242,31 @@ pub fn source_consumer(name: &str) -> Option<String> {
     result
 }
 
+// Serializes A2DP resets. A reset reads the active card profile, switches to
+// "off" and back; if two ran at once, the second could read "off" as the profile
+// to restore and leave the card off. Resets are started from different blocking
+// threads (the delayed reset after a capture starts, and the one after it stops)
+// that share no owner, and the card is a single system-wide resource, so one
+// process-wide lock is the simplest correct guard.
+static A2DP_RESET_LOCK: Mutex<()> = Mutex::new(());
+
 // A2DP transport reset:
 // We found that in some cases A2DP has to be suspended and resumed after a 0x58 mic start/stop
 // to avoid a corrupted transport state of the airpods.
-pub fn reset_a2dp(bdaddr: &str) {
+//
+// `cancel` is checked before each step up to switching the card off; once the
+// card is off it is always switched back.
+pub fn reset_a2dp(bdaddr: &str, cancel: Option<&AtomicBool>) {
+    // A flag with no other data riding on it, so Relaxed is enough.
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     if !crate::utils::AppSettings::load().a2dp_reset {
+        return;
+    }
+    // The guarded data is (), so a poisoned lock carries no broken state.
+    let _guard = A2DP_RESET_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cancelled() {
         return;
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
@@ -273,10 +295,25 @@ pub fn reset_a2dp(bdaddr: &str) {
         mainloop.quit(Retval(0));
         return;
     };
+    // Already off: another reset was interrupted or the user turned the card
+    // off. Restoring "off" would do nothing useful, so leave it alone.
+    if current_profile == "off" {
+        warn!("[pw] {} profile is off; skipping A2DP reset", card);
+        mainloop.quit(Retval(0));
+        return;
+    }
+    if cancelled() {
+        mainloop.quit(Retval(0));
+        return;
+    }
 
     // Resetting the a2dp transport can pause media players do to setting the crad profile to off
     // Get all active media players
     let players = playing_media_players();
+    if cancelled() {
+        mainloop.quit(Retval(0));
+        return;
+    }
 
     info!(
         "[pw] reset A2DP transport: {} off -> {}",

@@ -24,6 +24,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// If no audio SDUs arrive for this long while a capture is active, the stream
 /// is considered stalled and the capture is torn down and restarted.
 const STALL_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Delay before the first capture retry after a stall or a failed start; every
+/// further failure in a row doubles it.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+/// Failed starts or stalls in a row after which the monitor stops retrying until
+/// the recorder closes the microphone and opens it again.
+const MAX_CAPTURE_FAILURES: u32 = 5;
+/// A capture that delivered audio for this long before stalling was healthy, so
+/// its stall starts the failure count over.
+const HEALTHY_RUN: Duration = Duration::from_secs(30);
+/// Consecutive AU decode errors (about 375 ms of audio) after which the decoder
+/// is treated as wedged and recreated.
+const DECODER_RESET_ERRORS: u32 = 50;
 const LEVEL_RELEASE: f32 = 0.85;
 
 #[derive(Clone, Default)]
@@ -122,10 +134,66 @@ impl HiResMic {
 // A live capture session: the playback stream feeding the sink plus its decode
 // thread, started when an app opens the mic.
 struct Capture {
-    decode_thread: Option<JoinHandle<()>>,
+    decode_thread: JoinHandle<()>,
     // Delayed A2DP reset after START; aborted on stop so it cannot fire after
     // the stop-time reset.
     start_reset: TokioHandle<()>,
+    // Aborting start_reset does not stop a reset already running on the blocking
+    // pool, so stop_capture also sets this flag, which reset_a2dp checks before
+    // each step.
+    start_reset_cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+// Retry schedule for starting the capture while a recorder has the mic open:
+// exponential backoff, then give up until the recorder leaves.
+#[derive(Default)]
+struct CaptureRetry {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl CaptureRetry {
+    fn gave_up(&self) -> bool {
+        self.failures >= MAX_CAPTURE_FAILURES
+    }
+
+    fn may_start(&self, now: Instant) -> bool {
+        !self.gave_up() && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    // Record a failed start or a stall. Returns the delay before the next
+    // attempt, or None once the monitor has given up.
+    fn failed(&mut self, now: Instant) -> Option<Duration> {
+        self.failures = self.failures.saturating_add(1);
+        if self.gave_up() {
+            self.retry_at = None;
+            return None;
+        }
+        let delay = RETRY_BASE_DELAY.saturating_mul(1 << (self.failures - 1).min(16));
+        self.retry_at = Some(now + delay);
+        Some(delay)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn capture_failed(retry: &mut CaptureRetry, what: &str) {
+    match retry.failed(Instant::now()) {
+        Some(delay) => warn!(
+            "[hires] {} ({}/{}), retrying in {}s",
+            what,
+            retry.failures,
+            MAX_CAPTURE_FAILURES,
+            delay.as_secs()
+        ),
+        None => error!(
+            "[hires] {} ({} failures in a row), giving up until the recorder closes and reopens the microphone",
+            what, MAX_CAPTURE_FAILURES
+        ),
+    }
 }
 
 async fn monitor_loop(
@@ -137,6 +205,7 @@ async fn monitor_loop(
     vmic: VirtualMic,
 ) {
     let mut capture: Option<Capture> = None;
+    let mut retry = CaptureRetry::default();
     // Conversation detection value saved while we override it off for capture.
     let mut old_convo_state: Option<bool> = None;
     info!(
@@ -157,54 +226,65 @@ async fn monitor_loop(
         let enabled = aacp.hires_mic_enabled();
         let recording = app.is_some();
 
-        match (enabled, recording, capture.is_some()) {
-            (true, true, false) => {
+        capture = match (enabled, recording, capture.take()) {
+            (true, true, None) if retry.may_start(Instant::now()) => {
                 info!("[hires] recorder detected ({:?}), starting capture", app);
-                if let Some(c) = start_capture(&aacp, &addr, &status).await {
-                    status.set_capture(app);
-                    capture = Some(c);
-
-                    // Only disable (and remember to restore) if it was on.
-                    if crate::utils::AppSettings::load().hires_mic_pause_convo
-                        && aacp.conversation_detection_enabled().await
-                    {
-                        old_convo_state = Some(true);
-                        aacp.set_conversation_detection(false).await;
+                match start_capture(&aacp, &addr, &status).await {
+                    Some(c) => {
+                        status.set_capture(app);
+                        // Only disable (and remember to restore) if it was on.
+                        if old_convo_state.is_none()
+                            && crate::utils::AppSettings::load().hires_mic_pause_convo
+                            && aacp.conversation_detection_enabled().await
+                        {
+                            old_convo_state = Some(true);
+                            aacp.set_conversation_detection(false).await;
+                        }
+                        Some(c)
+                    }
+                    None => {
+                        status.reset();
+                        capture_failed(&mut retry, "capture start failed");
+                        None
                     }
                 }
             }
-            (true, true, true) => {
+            (true, true, Some(c)) => {
                 status.set_capture(app);
                 let stalled = status.since_last_sdu().is_some_and(|d| d > STALL_TIMEOUT);
                 if stalled {
-                    warn!(
-                        "[hires] no audio from device for {}ms, restarting capture",
-                        STALL_TIMEOUT.as_millis()
-                    );
-                    stop_capture(capture.take().unwrap(), &aacp, &addr).await;
-                    capture = start_capture(&aacp, &addr, &status).await;
-                    if capture.is_none() {
-                        warn!("[hires] capture restart failed; will retry on next poll");
-                        status.reset();
+                    let healthy = c.started.elapsed() >= HEALTHY_RUN;
+                    stop_capture(c, &aacp, &addr).await;
+                    status.reset();
+                    if healthy {
+                        retry.reset();
                     }
+                    capture_failed(
+                        &mut retry,
+                        &format!("no audio from device for {}ms", STALL_TIMEOUT.as_millis()),
+                    );
+                    None
+                } else {
+                    Some(c)
                 }
             }
             // Disabled while capturing: end the 0x58 stream now.
             // The virtual source stays up feeding silence, so an active
             // recorder isn't dropped onto the AirPods' HFP mic (handsfree).
-            (_, _, true) => {
+            (_, _, Some(c)) => {
                 info!(
                     "[hires] stopping capture (enabled={}, recording={})",
                     enabled, recording
                 );
-                stop_capture(capture.take().unwrap(), &aacp, &addr).await;
+                stop_capture(c, &aacp, &addr).await;
                 if let Some(prev) = old_convo_state.take() {
                     aacp.set_conversation_detection(prev).await;
                 }
                 status.reset();
+                None
             }
-            _ => {}
-        }
+            (_, _, None) => None,
+        };
 
         // A capture that failed to restart leaves no capture to stop, so the
         // arm above never runs; restore conversation detection once the
@@ -214,6 +294,10 @@ async fn monitor_loop(
             && let Some(prev) = old_convo_state.take()
         {
             aacp.set_conversation_detection(prev).await;
+        }
+        // The recorder left: its next open gets a fresh set of attempts.
+        if !recording {
+            retry.reset();
         }
 
         // Once disabled and nothing is recording from the source, unload it.
@@ -240,7 +324,10 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
     // Start the stall grace period now; the device should deliver SDUs (which
     // refresh this) well within STALL_TIMEOUT.
     status.mark_sdu();
-    let decode_thread = spawn_decode_thread(rx, decoder, output, status.clone());
+    let Some(decode_thread) = spawn_decode_thread(rx, decoder, output, status.clone()) else {
+        aacp.clear_audio_channel().await;
+        return None;
+    };
 
     if let Err(e) = aacp.send_start_audio().await {
         error!("failed to send 0x58 START: {}", e);
@@ -249,90 +336,167 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
     }
     info!("[aacp] microphone stream started");
 
-    let reset_addr = addr.to_string();
-    let start_reset = tokio::spawn(async move {
-        tokio::time::sleep(A2DP_RESET_DELAY).await;
-        let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&reset_addr)).await;
+    let start_reset_cancel = Arc::new(AtomicBool::new(false));
+    let start_reset = tokio::spawn({
+        let cancel = start_reset_cancel.clone();
+        let addr = addr.to_string();
+        async move {
+            tokio::time::sleep(A2DP_RESET_DELAY).await;
+            let _ =
+                tokio::task::spawn_blocking(move || output::reset_a2dp(&addr, Some(&cancel))).await;
+        }
     });
 
     Some(Capture {
-        decode_thread: Some(decode_thread),
+        decode_thread,
         start_reset,
+        start_reset_cancel,
+        started: Instant::now(),
     })
 }
 
-async fn stop_capture(mut capture: Capture, aacp: &AACPManager, addr: &str) {
+async fn stop_capture(capture: Capture, aacp: &AACPManager, addr: &str) {
+    // The flag is the whole message, so Relaxed is enough.
+    capture.start_reset_cancel.store(true, Ordering::Relaxed);
     capture.start_reset.abort();
     if let Err(e) = aacp.send_stop_audio().await {
         warn!("failed to send 0x58 STOP: {}", e);
     }
     aacp.clear_audio_channel().await;
 
-    if let Some(handle) = capture.decode_thread.take() {
-        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
-    }
+    let handle = capture.decode_thread;
+    let _ = tokio::task::spawn_blocking(move || handle.join()).await;
 
+    // Waits in reset_a2dp for a start reset that is already switching the card.
     let addr = addr.to_string();
-    let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&addr)).await;
+    let _ = tokio::task::spawn_blocking(move || output::reset_a2dp(&addr, None)).await;
 }
 
 fn spawn_decode_thread(
+    rx: mpsc::Receiver<Vec<u8>>,
+    decoder: EldDecoder,
+    output: Output,
+    status: MicStatus,
+) -> Option<JoinHandle<()>> {
+    match std::thread::Builder::new()
+        .name("hires-decode".into())
+        .spawn(move || decode_loop(rx, decoder, output, status))
+    {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            error!("could not spawn the hi-res decode thread: {}", e);
+            None
+        }
+    }
+}
+
+fn decode_loop(
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut decoder: EldDecoder,
     mut output: Output,
     status: MicStatus,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("hires-decode".into())
-        .spawn(move || {
-            let mut frames: u64 = 0;
-            let mut errors: u64 = 0;
-            let mut env: f32 = 0.0;
-            let mut pcm: Vec<i16> = Vec::with_capacity(4096);
+) {
+    let mut frames: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
+    let mut env: f32 = 0.0;
+    let mut pcm: Vec<i16> = Vec::with_capacity(4096);
 
-            while let Some(sdu) = rx.blocking_recv() {
-                pcm.clear();
-                aacp_audio::demux_type58(&sdu, |au| match decoder.decode(au, &mut pcm) {
-                    Some(_) => frames += 1,
-                    None => {
-                        // insert a silent frame
-                        errors += 1;
-                        pcm.resize(pcm.len() + ELD_FRAME_SAMPLES * ELD_CHANNELS as usize, 0);
-                    }
-                });
-
-                let peak = if pcm.is_empty() {
-                    0.0
-                } else {
-                    match output.write(&mut pcm) {
-                        Ok(peak) => peak,
-                        Err(()) => {
-                            warn!("hi-res output broke; stopping decode loop");
-                            break;
+    while let Some(sdu) = rx.blocking_recv() {
+        pcm.clear();
+        aacp_audio::demux_type58(&sdu, |au| {
+            // An empty AU carries no audio, so there is nothing to decode or fill.
+            if au.is_empty() {
+                return;
+            }
+            match decoder.decode(au, &mut pcm) {
+                Some(_) => {
+                    frames += 1;
+                    consecutive_errors = 0;
+                }
+                None => {
+                    // insert a silent frame
+                    errors += 1;
+                    consecutive_errors += 1;
+                    pcm.resize(pcm.len() + ELD_FRAME_SAMPLES * ELD_CHANNELS as usize, 0);
+                    // A decoder stuck in a bad state fails every AU and would
+                    // otherwise produce silence until the capture ends.
+                    if consecutive_errors >= DECODER_RESET_ERRORS {
+                        consecutive_errors = 0;
+                        match EldDecoder::new() {
+                            Some(fresh) => {
+                                warn!(
+                                    "[audio] {} decode errors in a row, recreated the AAC-ELD decoder",
+                                    DECODER_RESET_ERRORS
+                                );
+                                decoder = fresh;
+                            }
+                            None => warn!(
+                                "[audio] {} decode errors in a row and the AAC-ELD decoder could not be recreated",
+                                DECODER_RESET_ERRORS
+                            ),
                         }
                     }
-                };
-
-                env = if peak >= env {
-                    peak
-                } else {
-                    env * LEVEL_RELEASE
-                };
-                status.set_level(env);
-
-                if frames > 0 && frames % 400 == 0 {
-                    let secs = frames as f64 * ELD_FRAME_SAMPLES as f64 / ELD_SAMPLE_RATE as f64;
-                    info!(
-                        "[audio] {} frames ({:.0}s), {} errors, level {:.2}",
-                        frames, secs, errors, env
-                    );
                 }
             }
-            status.set_level(0.0);
+        });
+
+        let peak = if pcm.is_empty() {
+            0.0
+        } else {
+            match output.write(&mut pcm) {
+                Ok(peak) => peak,
+                Err(()) => {
+                    warn!("hi-res output broke; stopping decode loop");
+                    break;
+                }
+            }
+        };
+
+        env = if peak >= env {
+            peak
+        } else {
+            env * LEVEL_RELEASE
+        };
+        status.set_level(env);
+
+        if frames > 0 && frames % 400 == 0 {
+            let secs = frames as f64 * ELD_FRAME_SAMPLES as f64 / ELD_SAMPLE_RATE as f64;
             info!(
-                "[audio] hi-res decode loop ended ({} frames, {} errors)",
-                frames, errors
+                "[audio] {} frames ({:.0}s), {} errors, level {:.2}",
+                frames, secs, errors, env
             );
-        })
-        .expect("failed to spawn hires-decode thread")
+        }
+    }
+    status.set_level(0.0);
+    info!(
+        "[audio] hi-res decode loop ended ({} frames, {} errors)",
+        frames, errors
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_retry_backs_off_then_gives_up() {
+        let t0 = Instant::now();
+        let mut retry = CaptureRetry::default();
+        assert!(retry.may_start(t0));
+
+        let mut now = t0;
+        for attempt in 1..MAX_CAPTURE_FAILURES {
+            let delay = retry.failed(now).expect("still retrying");
+            assert_eq!(delay, RETRY_BASE_DELAY * (1 << (attempt - 1)));
+            assert!(!retry.may_start(now + delay - Duration::from_millis(1)));
+            now += delay;
+            assert!(retry.may_start(now));
+        }
+        assert_eq!(retry.failed(now), None);
+        assert!(!retry.may_start(now + Duration::from_secs(3600)));
+
+        retry.reset();
+        assert!(retry.may_start(now));
+    }
 }
