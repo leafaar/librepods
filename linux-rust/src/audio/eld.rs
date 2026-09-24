@@ -3,8 +3,10 @@
 //! See https://ffmpeg-d.dpldocs.info/v3.1.1/ffmpeg.libavcodec.avcodec.AVCodecContext.html
 
 use ffmpeg_sys_next as ff;
+use log::{info, warn};
 use std::os::raw::c_int;
 use std::ptr;
+use std::sync::Once;
 
 pub const ELD_SAMPLE_RATE: u32 = 64000;
 pub const ELD_FRAME_SAMPLES: usize = 480;
@@ -16,11 +18,16 @@ const ELD_INBUF_MAX: usize = 512;
 
 const PAD: usize = ff::AV_INPUT_BUFFER_PADDING_SIZE as usize;
 
+// av_log_set_level sets a process-wide global, so it only needs to run once.
+static QUIET_AV_LOG: Once = Once::new();
+
 pub struct EldDecoder {
     ctx: *mut ff::AVCodecContext,
     pkt: *mut ff::AVPacket,
     frame: *mut ff::AVFrame,
     inbuf: Vec<u8>,
+    // Set once the first frame's output sample rate has been logged.
+    rate_logged: bool,
 }
 
 // SAFETY: the FFmpeg objects are owned exclusively by this struct and have no
@@ -35,13 +42,17 @@ fn f_to_s16(s: f32) -> i16 {
 impl EldDecoder {
     // Open the AAC-ELD decoder. Returns None on failure.
     pub fn new() -> Option<Self> {
+        // Stop libavcodec from spamming stderr.
+        QUIET_AV_LOG.call_once(|| {
+            // SAFETY: av_log_set_level only stores an int in libavutil's global log
+            // level; it takes no pointers and has no other precondition.
+            unsafe { ff::av_log_set_level(ff::AV_LOG_FATAL) };
+        });
+
         // SAFETY: every pointer is null-checked right after allocation before it is
         // dereferenced; extradata is allocated with the padding FFmpeg requires and
         // ownership passes to ctx, which frees it in avcodec_free_context.
         unsafe {
-            // stop libavcodec from spamming stderr
-            ff::av_log_set_level(ff::AV_LOG_FATAL);
-
             let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_AAC);
             if codec.is_null() {
                 return None;
@@ -56,6 +67,7 @@ impl EldDecoder {
                 pkt: ptr::null_mut(),
                 frame: ptr::null_mut(),
                 inbuf: vec![0u8; ELD_INBUF_MAX + PAD],
+                rate_logged: false,
             };
 
             // extradata = ASC
@@ -107,7 +119,8 @@ impl EldDecoder {
     }
 
     // Decode one access unit, appending interleaved i16 PCM to `out`.
-    // Returns the number of samples appended, or None on a decode error.
+    // Returns the number of samples appended, or None on a decode error or a frame
+    // whose channel count is not ELD_CHANNELS.
     pub fn decode(&mut self, au: &[u8], out: &mut Vec<i16>) -> Option<usize> {
         if au.is_empty() || au.len() > ELD_INBUF_MAX {
             return None;
@@ -115,8 +128,9 @@ impl EldDecoder {
         // SAFETY: ctx/pkt/frame are live (new() only returns a fully built decoder).
         // au.len() <= ELD_INBUF_MAX, so the copy plus PAD zero bytes fits inbuf. The
         // packet is not refcounted, so avcodec_send_packet copies the data. Plane
-        // pointers are read only for the reported format, channel count and
-        // nb_samples, which FFmpeg guarantees are backed by the frame buffers.
+        // pointers are read only for the reported format and nb_samples, and only
+        // when the channel count equals ELD_CHANNELS, so every plane index stays
+        // inside the 8-entry data array and is backed by the frame buffers.
         unsafe {
             self.inbuf[..au.len()].copy_from_slice(au);
             self.inbuf[au.len()..au.len() + PAD].fill(0);
@@ -132,8 +146,20 @@ impl EldDecoder {
 
             let nch = (*self.frame).channels;
             let ns = (*self.frame).nb_samples;
-            if nch <= 0 || ns <= 0 {
+            if nch != ELD_CHANNELS || ns <= 0 {
                 return None;
+            }
+            if !self.rate_logged {
+                self.rate_logged = true;
+                let rate = (*self.frame).sample_rate;
+                if u32::try_from(rate) == Ok(ELD_SAMPLE_RATE) {
+                    info!("[audio] AAC-ELD decoder output: {} Hz", rate);
+                } else {
+                    warn!(
+                        "[audio] AAC-ELD decoder output is {} Hz, expected {} Hz",
+                        rate, ELD_SAMPLE_RATE
+                    );
+                }
             }
             let (nch, ns) = (nch as usize, ns as usize);
             let total = ns * nch;

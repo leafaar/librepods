@@ -4,8 +4,9 @@
 //! Recorder and Player each run a pulse stream on their own thread and share
 //! only atomics and the PCM buffer with the UI, which polls them on its tick.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use libpulse_binding::stream::{
 };
 
 use crate::audio::eld::{ELD_CHANNELS, ELD_SAMPLE_RATE};
-use crate::audio::output::{SOURCE_NAME, connect, wait_for};
+use crate::audio::output::{SOURCE_NAME, connect, connect_cancellable, wait_for};
 
 /// Longest recording kept; about 38 MB of 64 kHz mono s16.
 pub const MAX_RECORDING: Duration = Duration::from_secs(300);
@@ -33,6 +34,8 @@ const PLAYBACK_DELAY: Duration = Duration::from_secs(2);
 /// Small playback buffer so pause and seek take effect quickly and the reported
 /// position is close to what is being heard.
 const PLAYBACK_BUFFER: Duration = Duration::from_millis(100);
+/// Longest the sound server may take to make a new stream ready.
+const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const BYTES_PER_FRAME: usize = 2 * ELD_CHANNELS as usize;
 
@@ -63,15 +66,30 @@ fn iterate(mainloop: &mut Mainloop, block: bool) -> Result<(), String> {
     }
 }
 
-fn wait_ready(mainloop: &mut Mainloop, stream: &Stream) -> Result<(), String> {
+// Wait until the stream is ready, the server refuses it, READY_TIMEOUT passes or
+// `cancelled` returns true (which returns Ok so the caller's loop sees its own
+// stop condition). Polls rather than blocking in iterate(true), which would wait
+// forever on a server that stopped answering.
+fn wait_ready(
+    mainloop: &mut Mainloop,
+    stream: &Stream,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        iterate(mainloop, true)?;
+        if cancelled() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("The sound server did not open the stream in time".to_string());
+        }
+        iterate(mainloop, false)?;
         match stream.get_state() {
             StreamState::Ready => return Ok(()),
             StreamState::Failed | StreamState::Terminated => {
                 return Err("The sound server refused the stream".to_string());
             }
-            _ => {}
+            _ => sleep(IDLE_SLEEP),
         }
     }
 }
@@ -79,7 +97,8 @@ fn wait_ready(mainloop: &mut Mainloop, stream: &Stream) -> Result<(), String> {
 pub struct Recorder {
     stop: Arc<AtomicBool>,
     pcm: Arc<Mutex<Vec<u8>>>,
-    thread: JoinHandle<Result<(), String>>,
+    // Err holds why the recording thread could not be started.
+    thread: Result<JoinHandle<Result<(), String>>, String>,
 }
 
 impl Recorder {
@@ -90,7 +109,10 @@ impl Recorder {
         let thread = {
             let stop = stop.clone();
             let pcm = pcm.clone();
-            thread::spawn(move || record_loop(&stop, &pcm))
+            thread::Builder::new()
+                .name("mic-test-record".into())
+                .spawn(move || record_loop(&stop, &pcm))
+                .map_err(|e| format!("Could not start the recorder: {e}"))
         };
         Recorder { stop, pcm, thread }
     }
@@ -101,14 +123,17 @@ impl Recorder {
 
     /// The thread ended by itself: it hit MAX_RECORDING or failed.
     pub fn finished(&self) -> bool {
-        self.thread.is_finished()
+        match &self.thread {
+            Ok(handle) => handle.is_finished(),
+            Err(_) => true,
+        }
     }
 
-    /// Stop and return the recording. Returns quickly: the loop checks the flag
-    /// every few milliseconds.
+    /// Stop and return the recording. Returns quickly: the thread checks the
+    /// flag every few milliseconds, also while connecting to the sound server.
     pub fn stop(self) -> Result<Vec<u8>, String> {
         self.stop.store(true, Ordering::Relaxed);
-        self.thread
+        self.thread?
             .join()
             .map_err(|_| "The recorder crashed".to_string())??;
         let pcm = std::mem::take(&mut *self.pcm.lock().map_err(|_| "Recording lost")?);
@@ -122,14 +147,20 @@ impl Recorder {
 fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
     let spec = spec();
     let max = duration_to_bytes(MAX_RECORDING);
-    let (mut mainloop, mut context) =
-        connect().ok_or_else(|| "Could not reach the sound server".to_string())?;
+    let stopped = || stop.load(Ordering::Relaxed);
+    let Some((mut mainloop, mut context)) = connect_cancellable(stopped) else {
+        // Stopped while connecting: an empty recording, not a server error.
+        if stopped() {
+            return Ok(());
+        }
+        return Err("Could not reach the sound server".to_string());
+    };
     let mut stream = Stream::new(&mut context, "Microphone test", &spec, None)
         .ok_or_else(|| "Could not create a recording stream".to_string())?;
     stream
         .connect_record(Some(SOURCE_NAME), None, StreamFlagSet::NOFLAGS)
         .map_err(|_| "The Hi-Res microphone input is not available".to_string())?;
-    wait_ready(&mut mainloop, &stream)?;
+    wait_ready(&mut mainloop, &stream, stopped)?;
 
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -191,14 +222,22 @@ impl Player {
             let playing = playing.clone();
             let error = error.clone();
             let ready_at = Instant::now() + PLAYBACK_DELAY;
-            thread::spawn(move || {
-                if let Err(e) = play_loop(&pcm, &rx, &position, &playing, ready_at) {
-                    playing.store(false, Ordering::Relaxed);
-                    if let Ok(mut slot) = error.lock() {
-                        *slot = Some(e);
+            let thread_error = error.clone();
+            let spawned = thread::Builder::new()
+                .name("mic-test-play".into())
+                .spawn(move || {
+                    if let Err(e) = play_loop(&pcm, &rx, &position, &playing, ready_at) {
+                        playing.store(false, Ordering::Relaxed);
+                        if let Ok(mut slot) = thread_error.lock() {
+                            *slot = Some(e);
+                        }
                     }
-                }
-            });
+                });
+            if let Err(e) = spawned
+                && let Ok(mut slot) = error.lock()
+            {
+                *slot = Some(format!("Could not start playback: {e}"));
+            }
         }
         Player {
             commands,
@@ -247,6 +286,31 @@ impl Player {
 
 // Dropping the Player drops the command sender, which ends the playback thread.
 
+// Wait until `ready_at`, queueing any commands that arrive meanwhile. Returns
+// false if the Player was dropped, so no stream is opened for nobody.
+fn wait_for_playback_slot(
+    commands: &Receiver<Command>,
+    ready_at: Instant,
+    pending: &mut VecDeque<Command>,
+) -> bool {
+    loop {
+        let left = ready_at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            match commands.try_recv() {
+                Ok(cmd) => pending.push_back(cmd),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        } else {
+            match commands.recv_timeout(left) {
+                Ok(cmd) => pending.push_back(cmd),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+}
+
 fn play_loop(
     pcm: &[u8],
     commands: &Receiver<Command>,
@@ -254,7 +318,10 @@ fn play_loop(
     playing: &AtomicBool,
     ready_at: Instant,
 ) -> Result<(), String> {
-    sleep(ready_at.saturating_duration_since(Instant::now()));
+    let mut pending = VecDeque::new();
+    if !wait_for_playback_slot(commands, ready_at, &mut pending) {
+        return Ok(());
+    }
 
     let spec = spec();
     let (mut mainloop, mut context) =
@@ -272,16 +339,24 @@ fn play_loop(
     stream
         .connect_playback(None, Some(&attr), StreamFlagSet::ADJUST_LATENCY, None, None)
         .map_err(|_| "Could not play on the default output".to_string())?;
-    wait_ready(&mut mainloop, &stream)?;
+    wait_ready(&mut mainloop, &stream, || false)?;
 
     let mut offset = position.load(Ordering::Relaxed);
     loop {
-        match commands.try_recv() {
+        let command = match pending.pop_front() {
+            Some(cmd) => Ok(cmd),
+            None => commands.try_recv(),
+        };
+        match command {
             Ok(Command::Play) => playing.store(true, Ordering::Relaxed),
             Ok(Command::Pause) => {
                 playing.store(false, Ordering::Relaxed);
                 let mut op = stream.flush(None);
                 wait_for(&mut mainloop, &mut op);
+                // The flush dropped the queued audio that was not heard yet, so
+                // resume from the heard position rather than the write offset.
+                let heard = position.load(Ordering::Relaxed).min(pcm.len());
+                offset = heard - heard % BYTES_PER_FRAME;
             }
             Ok(Command::Seek(to)) => {
                 offset = to - to % BYTES_PER_FRAME;

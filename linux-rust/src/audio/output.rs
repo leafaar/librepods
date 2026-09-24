@@ -1,16 +1,20 @@
 //! PipeWire/PulseAudio output for the hi-res microphone
 
 use libpulse_binding::callbacks::ListResult;
+use libpulse_binding::context::introspect::SourceOutputInfo;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::operation::{Operation, State as OperationState};
+use libpulse_binding::proplist::properties;
 use log::{error, info, warn};
 use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dbus::blocking::Connection;
@@ -39,7 +43,23 @@ pub struct VirtualMic {
 }
 
 impl VirtualMic {
-    pub fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
+    /// Load the pipe-source. The sound server round trips block for up to
+    /// PULSE_TIMEOUT each, so they run on the blocking pool, not on the async
+    /// worker that awaits this.
+    pub async fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
+        tokio::task::spawn_blocking(move || Self::open_blocking(sample_rate, channels))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Unload the pipe-source on the blocking pool. Dropping a VirtualMic
+    /// instead does the same work on the current thread.
+    pub async fn close(self) {
+        let _ = tokio::task::spawn_blocking(move || drop(self)).await;
+    }
+
+    fn open_blocking(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
         unload_stale_modules();
 
         let chan_map = if channels == 1 {
@@ -86,7 +106,7 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn open(_sample_rate: u32, _channels: u8) -> Option<Output> {
+    pub fn open(sample_rate: u32, _channels: u8) -> Option<Output> {
         // O_RDWR never blocks on a FIFO and keeps the pipe from ever seeing
         // "all writers closed"; we only ever write to it. O_NONBLOCK keeps the
         // decode thread from hanging when the source stops draining the pipe
@@ -107,24 +127,20 @@ impl Output {
 
         let agc = crate::utils::AppSettings::load()
             .hires_mic_agc
-            .then(Agc::new);
+            .then(|| Agc::new(sample_rate));
         if agc.is_none() {
             info!("[pw] AGC disabled; passing through raw hi-res capture");
         }
         Some(Output { fifo, agc })
     }
 
-    // Write s16 PCM into the FIFO, returning the (post-AGC) peak
-    pub fn write(&mut self, pcm: &[i16]) -> Result<f32, ()> {
-        let processed;
-        let pcm: &[i16] = if let Some(agc) = &mut self.agc {
-            let mut buf = pcm.to_vec();
-            agc.process(&mut buf);
-            processed = buf;
-            &processed
-        } else {
-            pcm
-        };
+    // Write s16 PCM into the FIFO, returning the (post-AGC) peak. AGC runs in
+    // place on `pcm`.
+    pub fn write(&mut self, pcm: &mut [i16]) -> Result<f32, ()> {
+        if let Some(agc) = &mut self.agc {
+            agc.process(pcm);
+        }
+        let pcm: &[i16] = pcm;
 
         let peak = pcm
             .iter()
@@ -137,17 +153,19 @@ impl Output {
             std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
         };
 
-        for chunk in bytes.chunks(PIPE_BUF) {
-            match self.fifo.write(chunk) {
-                Ok(_) => {}
-                // Nobody is draining the pipe: drop the rest of this block
-                // rather than block the decode thread.
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                    break;
-                }
-                Err(e) => {
-                    error!("hi-res fifo write broke: {}", e);
-                    return Err(());
+        'chunks: for chunk in bytes.chunks(PIPE_BUF) {
+            loop {
+                match self.fifo.write(chunk) {
+                    Ok(_) => break,
+                    // A signal arrived before anything was written: retry this chunk.
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    // Nobody is draining the pipe: drop the rest of this block
+                    // rather than block the decode thread.
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break 'chunks,
+                    Err(e) => {
+                        error!("hi-res fifo write broke: {}", e);
+                        return Err(());
+                    }
                 }
             }
         }
@@ -155,7 +173,31 @@ impl Output {
     }
 }
 
+// Volume panels (pavucontrol's input tab, GNOME Settings' Sound panel) open a
+// peak-detect record stream on every source just to draw its level bar. Those
+// are not recorders and must not start the AirPods mic. libpulse does not report
+// the PEAK_DETECT stream flag, so this is a heuristic on what the stream carries:
+// - PulseAudio serves peak-detect streams with the "peaks" resampler;
+// - PipeWire's pulse server marks them stream.monitor=true;
+// - pavucontrol and libgvc (GNOME Settings) name the stream "Peak detect", a
+//   translatable string, so their application ids are matched as well. Neither
+//   app records audio, so no real recorder is lost by skipping them.
+const LEVEL_METER_NAME: &str = "Peak detect";
+const LEVEL_METER_APPS: [&str; 2] = ["org.PulseAudio.pavucontrol", "org.gnome.VolumeControl"];
+
+fn is_level_meter(item: &SourceOutputInfo) -> bool {
+    let props = &item.proplist;
+    item.resample_method.as_deref() == Some("peaks")
+        || props.get_str("stream.monitor").as_deref() == Some("true")
+        || props.get_str(properties::MEDIA_NAME).as_deref() == Some(LEVEL_METER_NAME)
+        || item.name.as_deref() == Some(LEVEL_METER_NAME)
+        || props
+            .get_str(properties::APPLICATION_ID)
+            .is_some_and(|id| LEVEL_METER_APPS.contains(&id.as_str()))
+}
+
 // Name of the application recording from the virtual source, or None if idle.
+// Corked (paused) streams and level meters do not count as recording.
 pub fn source_consumer(name: &str) -> Option<String> {
     let (mut mainloop, context) = connect()?;
     let introspect = context.introspect();
@@ -178,7 +220,11 @@ pub fn source_consumer(name: &str) -> Option<String> {
             let app = app.clone();
             move |result| {
                 if let ListResult::Item(item) = result {
-                    if item.source == idx && app.borrow().is_none() {
+                    if item.source == idx
+                        && !item.corked
+                        && !is_level_meter(item)
+                        && app.borrow().is_none()
+                    {
                         let label = item
                             .proplist
                             .get_str("application.name")
@@ -196,11 +242,31 @@ pub fn source_consumer(name: &str) -> Option<String> {
     result
 }
 
+// Serializes A2DP resets. A reset reads the active card profile, switches to
+// "off" and back; if two ran at once, the second could read "off" as the profile
+// to restore and leave the card off. Resets are started from different blocking
+// threads (the delayed reset after a capture starts, and the one after it stops)
+// that share no owner, and the card is a single system-wide resource, so one
+// process-wide lock is the simplest correct guard.
+static A2DP_RESET_LOCK: Mutex<()> = Mutex::new(());
+
 // A2DP transport reset:
 // We found that in some cases A2DP has to be suspended and resumed after a 0x58 mic start/stop
 // to avoid a corrupted transport state of the airpods.
-pub fn reset_a2dp(bdaddr: &str) {
+//
+// `cancel` is checked before each step up to switching the card off; once the
+// card is off it is always switched back.
+pub fn reset_a2dp(bdaddr: &str, cancel: Option<&AtomicBool>) {
+    // A flag with no other data riding on it, so Relaxed is enough.
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     if !crate::utils::AppSettings::load().a2dp_reset {
+        return;
+    }
+    // The guarded data is (), so a poisoned lock carries no broken state.
+    let _guard = A2DP_RESET_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cancelled() {
         return;
     }
     let card = format!("bluez_card.{}", bdaddr.replace(':', "_"));
@@ -229,10 +295,25 @@ pub fn reset_a2dp(bdaddr: &str) {
         mainloop.quit(Retval(0));
         return;
     };
+    // Already off: another reset was interrupted or the user turned the card
+    // off. Restoring "off" would do nothing useful, so leave it alone.
+    if current_profile == "off" {
+        warn!("[pw] {} profile is off; skipping A2DP reset", card);
+        mainloop.quit(Retval(0));
+        return;
+    }
+    if cancelled() {
+        mainloop.quit(Retval(0));
+        return;
+    }
 
     // Resetting the a2dp transport can pause media players do to setting the crad profile to off
     // Get all active media players
     let players = playing_media_players();
+    if cancelled() {
+        mainloop.quit(Retval(0));
+        return;
+    }
 
     info!(
         "[pw] reset A2DP transport: {} off -> {}",
@@ -344,6 +425,11 @@ pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>
 
 /// Connect to the sound server, giving up after PULSE_TIMEOUT.
 pub(crate) fn connect() -> Option<(Mainloop, Context)> {
+    connect_cancellable(|| false)
+}
+
+/// Like connect(), but also gives up as soon as `cancelled` returns true.
+pub(crate) fn connect_cancellable(cancelled: impl Fn() -> bool) -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
     let mut context = Context::new(&mainloop, "LibrePods")?;
     context
@@ -351,6 +437,9 @@ pub(crate) fn connect() -> Option<(Mainloop, Context)> {
         .ok()?;
     let deadline = Instant::now() + PULSE_TIMEOUT;
     loop {
+        if cancelled() {
+            return None;
+        }
         if Instant::now() >= deadline {
             warn!("[pw] could not connect to the sound server in time");
             return None;
