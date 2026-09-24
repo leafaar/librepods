@@ -256,8 +256,10 @@ impl App {
         // stem_control: Arc<AtomicBool>,
     ) -> (Self, Task<Message>) {
         let (mut panes, first_pane) = pane_grid::State::new(Pane::Sidebar);
-        let split = panes.split(pane_grid::Axis::Vertical, first_pane, Pane::Content);
-        panes.resize(split.unwrap().1, 0.2);
+        if let Some((_, split)) = panes.split(pane_grid::Axis::Vertical, first_pane, Pane::Content)
+        {
+            panes.resize(split, 0.2);
+        }
 
         let wait_task = Task::perform(wait_for_message(Arc::clone(&ui_rx)), |msg| msg);
 
@@ -582,10 +584,10 @@ impl App {
                         let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                         match type_ {
                             Some(DeviceType::AirPods) => {
-                                let managers = Arc::clone(&self.device_managers);
-                                let device_managers = managers.blocking_read();
-                                let device_manager = device_managers.get(&mac).unwrap();
-                                let aacp_manager = device_manager.get_aacp().unwrap();
+                                let Some(aacp_manager) = self.aacp_manager(&mac) else {
+                                    error!("No AACP manager for connected AirPods {}", mac);
+                                    return wait_task;
+                                };
                                 let aacp_manager_state = aacp_manager.state.clone();
                                 let state = aacp_manager_state.blocking_lock();
                                 debug!("AACP manager found for AirPods device {}", mac);
