@@ -1,6 +1,7 @@
 use crate::bluetooth::aacp::BatteryInfo;
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::nothing::NothingInformation;
+use crate::ui::equalizer::EqualizerState;
 use iced::widget::combo_box;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +65,7 @@ pub struct AirPodsState {
     /// Last known raw value per control command id, as reported by the AirPods or
     /// last set from the settings page.
     pub control_values: HashMap<u8, Vec<u8>>,
+    pub custom_eq: EqualizerState,
 }
 
 #[derive(Clone, Debug)]
