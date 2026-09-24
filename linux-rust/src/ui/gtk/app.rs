@@ -63,6 +63,9 @@ pub fn run(
     backend: Handle,
     options: Options,
 ) -> glib::ExitCode {
+    // On X11 the window class comes from the program name, not the application
+    // id; GNOME matches it against the .desktop file to pick the dock icon.
+    glib::set_prgname(Some(APP_ID));
     let app = adw::Application::builder().application_id(APP_ID).build();
     // Read before the main loop starts, so the first frame is complete and
     // the loop never waits on the disk for them.

@@ -97,7 +97,6 @@
 
               doCheck = false;
 
-
               meta = {
                 description = "AirPods liberated from Apple's ecosystem";
                 homepage = "https://github.com/kavishdevar/librepods";
