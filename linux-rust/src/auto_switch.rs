@@ -6,17 +6,21 @@
 //! MPRIS players and, when playback starts, connects paired AirPods that are not
 //! connected; the existing takeover path then claims audio as the device comes up.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
-use std::str::FromStr;
-use std::time::{Duration, Instant};
-
-use bluer::{Adapter, Address};
-use tracing::{debug, info, warn};
-
-use crate::audio::output::playing_media_players;
-use crate::devices::enums::{DeviceData, DeviceType};
-use crate::utils::{AppSettings, get_devices_path};
+use {
+    crate::{
+        audio::output::playing_media_players,
+        devices::enums::{DeviceData, DeviceType},
+        utils::{AppSettings, get_devices_path},
+    },
+    bluer::{Adapter, Address},
+    std::{
+        collections::{HashMap, HashSet},
+        str::FromStr,
+        sync::{LazyLock, Mutex},
+        time::{Duration, Instant},
+    },
+    tracing::{debug, info, warn},
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -149,7 +153,7 @@ async fn connect_device(adapter: &Adapter, addr: Address) -> Result<(), String> 
             // Otherwise a later reconnect the user did not ask for would still
             // take the audio.
             clear_takeover_request(&addr.to_string());
-        }
+        },
     }
     result
 }
@@ -174,7 +178,7 @@ async fn connect_if_away(adapter: &Adapter, addr: Address) -> bool {
         return false;
     };
     match (device.is_paired().await, device.is_connected().await) {
-        (Ok(true), Ok(false)) => {}
+        (Ok(true), Ok(false)) => {},
         _ => return false,
     }
 

@@ -1,11 +1,13 @@
-use crate::bluetooth::aacp::BatteryInfo;
-use crate::devices::airpods::AirPodsInformation;
-use crate::devices::nothing::NothingInformation;
-use crate::ui::equalizer::EqualizerState;
-use iced::widget::combo_box;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fmt::Display;
+use {
+    crate::{
+        bluetooth::aacp::BatteryInfo,
+        devices::{airpods::AirPodsInformation, nothing::NothingInformation},
+        ui::equalizer::EqualizerState,
+    },
+    iced::widget::combo_box,
+    serde::{Deserialize, Serialize},
+    std::{collections::HashMap, fmt::Display},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DeviceType {

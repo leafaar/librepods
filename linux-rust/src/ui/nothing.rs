@@ -1,12 +1,16 @@
-use crate::devices::enums::{DeviceData, DeviceInformation, NothingState};
-use crate::ui::window::Message;
-use iced::border::Radius;
-use iced::overlay::menu;
-use iced::widget::combo_box;
-use iced::widget::text_input;
-use iced::widget::{Space, column, container, row, scrollable, text};
-use iced::{Background, Border, Length, Theme};
-use std::collections::HashMap;
+use {
+    crate::{
+        devices::enums::{DeviceData, DeviceInformation, NothingState},
+        ui::window::Message,
+    },
+    iced::{
+        Background, Border, Length, Theme,
+        border::Radius,
+        overlay::menu,
+        widget::{Space, column, combo_box, container, row, scrollable, text, text_input},
+    },
+    std::collections::HashMap,
+};
 
 pub fn nothing_view<'a>(
     mac: &'a str,
@@ -59,7 +63,9 @@ pub fn nothing_view<'a>(
                     &state.anc_mode_state,
                     "Select Noise Control Mode",
                     Some(&state.anc_mode.clone()),
-                    move |selected_mode| Message::NothingAncModeSelected(mac.clone(), selected_mode),
+                    move |selected_mode| {
+                        Message::NothingAncModeSelected(mac.clone(), selected_mode)
+                    },
                 )
                 .width(Length::from(200))
                 .input_style(|theme: &Theme, _status| text_input::Style {
@@ -92,7 +98,7 @@ pub fn nothing_view<'a>(
                     selected_background: Background::Color(
                         theme.palette().primary.scale_alpha(0.3),
                     ),
-                    shadow: Default::default()
+                    shadow: Default::default(),
                 })
             }
         ]
@@ -131,6 +137,5 @@ pub fn nothing_view<'a>(
     .padding(20)
     .center_x(Length::Fill);
 
-    container(scrollable(content).height(Length::Fill))
-        .height(Length::Fill)
+    container(scrollable(content).height(Length::Fill)).height(Length::Fill)
 }

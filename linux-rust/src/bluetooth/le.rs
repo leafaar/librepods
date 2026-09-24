@@ -1,22 +1,28 @@
-use crate::bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus};
-use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::ui::messages::BluetoothUIMessage;
-use crate::ui::tray::MyTray;
-use crate::utils::{ah, get_devices_path, get_preferences_path};
-use aes::Aes128;
-use aes::cipher::Array;
-use aes::cipher::{BlockCipherDecrypt, KeyInit};
-use bluer::monitor::{Monitor, MonitorEvent, Pattern};
-use bluer::{Address, DeviceEvent, DeviceProperty, Session};
-use futures::{Stream, StreamExt};
-use hex;
-use tracing::{debug, info, warn};
-use serde_json;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::SystemTime;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::JoinHandle;
+use {
+    crate::{
+        bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus},
+        devices::enums::{DeviceData, DeviceInformation, DeviceType},
+        ui::{messages::BluetoothUIMessage, tray::MyTray},
+        utils::{ah, get_devices_path, get_preferences_path},
+    },
+    aes::{
+        Aes128,
+        cipher::{Array, BlockCipherDecrypt, KeyInit},
+    },
+    bluer::{
+        Address, DeviceEvent, DeviceProperty, Session,
+        monitor::{Monitor, MonitorEvent, Pattern},
+    },
+    futures::{Stream, StreamExt},
+    hex, serde_json,
+    std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex, PoisonError},
+        time::SystemTime,
+    },
+    tokio::{sync::mpsc::UnboundedSender, task::JoinHandle},
+    tracing::{debug, info, warn},
+};
 
 /// Upper bound for the matched and rejected address caches. AirPods and every
 /// other Apple device nearby rotate their resolvable private address about
@@ -158,20 +164,20 @@ async fn connect_airpods(attempts: &ConnectAttempts, airpods_mac: &str) {
     match output {
         Ok(output) if output.status.success() => {
             info!("Successfully connected to AirPods {}", airpods_mac);
-        }
+        },
         Ok(output) => {
             info!(
                 "Failed to connect to AirPods {}: {}",
                 airpods_mac,
                 String::from_utf8_lossy(&output.stderr)
             );
-        }
+        },
         Err(e) => {
             info!(
                 "Failed to execute bluetoothctl to connect to AirPods {}: {}",
                 airpods_mac, e
             );
-        }
+        },
     }
 }
 
@@ -223,7 +229,7 @@ pub async fn start_le_monitor(
                     listener.abort();
                 }
                 continue;
-            }
+            },
             _ => continue,
         };
 
@@ -290,7 +296,7 @@ pub async fn start_le_monitor(
             Err(e) => {
                 warn!("Cannot listen to advertisements from {}: {}", addr, e);
                 continue;
-            }
+            },
         };
 
         listeners.retain(|_, l| !l.is_finished());
@@ -514,9 +520,10 @@ async fn watch_advertisements(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::bluetooth::aacp::AirPodsLEKeys;
-    use crate::devices::airpods::AirPodsInformation;
+    use {
+        super::*,
+        crate::{bluetooth::aacp::AirPodsLEKeys, devices::airpods::AirPodsInformation},
+    };
 
     // Bluetooth Core Specification, Vol 3 Part H, D.7 (ah random address hash):
     // IRK ec0234a357c8ad05341010a60a397d9b, prand 708194, hash 0dfbaa. The key

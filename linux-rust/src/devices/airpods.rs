@@ -1,14 +1,18 @@
-use crate::bluetooth::aacp::ControlCommandIdentifiers;
-use crate::bluetooth::aacp::{AACPEvent, AACPManager, AirPodsLEKeys, ProximityKeyType};
-use crate::media_controller::MediaController;
-use crate::ui::messages::BluetoothUIMessage;
-use crate::ui::tray::MyTray;
-use bluer::Address;
-use ksni::Handle;
-use tracing::{debug, error, info};
-use serde::{Deserialize, Serialize};
-use tokio::time::{Duration, sleep};
-use crate::utils::get_app_settings_path;
+use {
+    crate::{
+        bluetooth::aacp::{
+            AACPEvent, AACPManager, AirPodsLEKeys, ControlCommandIdentifiers, ProximityKeyType,
+        },
+        media_controller::MediaController,
+        ui::{messages::BluetoothUIMessage, tray::MyTray},
+        utils::get_app_settings_path,
+    },
+    bluer::Address,
+    ksni::Handle,
+    serde::{Deserialize, Serialize},
+    tokio::time::{Duration, sleep},
+    tracing::{debug, error, info},
+};
 
 // AirPods taken over from another device (the Connect button, auto-switch) can
 // answer the first setup with information, keys and control commands but never

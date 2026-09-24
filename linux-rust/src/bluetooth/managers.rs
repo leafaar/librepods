@@ -1,6 +1,7 @@
-use crate::bluetooth::aacp::AACPManager;
-use crate::bluetooth::att::ATTManager;
-use std::sync::Arc;
+use {
+    crate::bluetooth::{aacp::AACPManager, att::ATTManager},
+    std::sync::Arc,
+};
 
 pub struct DeviceManagers {
     att: Option<Arc<ATTManager>>,

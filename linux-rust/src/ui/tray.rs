@@ -1,12 +1,15 @@
 // use ksni::TrayMethods; // provides the spawn method
 
-use ab_glyph::{Font, ScaleFont};
-use ksni::{Icon, ToolTip};
-use tokio::sync::mpsc::UnboundedSender;
-
-use crate::bluetooth::aacp::{BatteryStatus, ControlCommandIdentifiers};
-use crate::ui::messages::BluetoothUIMessage;
-use crate::utils::get_app_settings_path;
+use {
+    crate::{
+        bluetooth::aacp::{BatteryStatus, ControlCommandIdentifiers},
+        ui::messages::BluetoothUIMessage,
+        utils::get_app_settings_path,
+    },
+    ab_glyph::{Font, ScaleFont},
+    ksni::{Icon, ToolTip},
+    tokio::sync::mpsc::UnboundedSender,
+};
 
 #[derive(Debug)]
 pub struct MyTray {
@@ -148,7 +151,7 @@ impl ksni::Tray for MyTray {
                 activate: Box::new(|this: &mut Self| match &this.shutdown_tx {
                     Some(tx) => {
                         let _ = tx.send(());
-                    }
+                    },
                     None => std::process::exit(0),
                 }),
                 ..Default::default()
@@ -226,7 +229,7 @@ fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
                 ""
             };
             format!("{}%{}", l, mark)
-        }
+        },
         None => "-".to_string(),
     }
 }
@@ -234,9 +237,11 @@ fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
 /// Draw the tray icon. `level` None draws "-" in text mode and an empty ring
 /// otherwise, so an unknown battery never looks like an empty one.
 fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
-    use ab_glyph::{FontRef, PxScale};
-    use image::{ImageBuffer, Rgba};
-    use imageproc::drawing::draw_text_mut;
+    use {
+        ab_glyph::{FontRef, PxScale},
+        image::{ImageBuffer, Rgba},
+        imageproc::drawing::draw_text_mut,
+    };
 
     let width = 64;
     let height = 64;
@@ -252,7 +257,7 @@ fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
                 height: height as i32,
                 data: vec![0u8; (width * height * 4) as usize],
             };
-        }
+        },
     };
     if !text_mode {
         let center_x = width as f32 / 2.0;
@@ -370,7 +375,10 @@ mod tests {
 
         <MyTray as ksni::Tray>::activate(&mut tray, TRAY_ACTIVATION_X, TRAY_ACTIVATION_Y);
 
-        assert!(matches!(ui_rx.try_recv(), Ok(BluetoothUIMessage::OpenWindow)));
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Ok(BluetoothUIMessage::OpenWindow)
+        ));
     }
 
     const TRAY_ACTIVATION_X: i32 = 0;

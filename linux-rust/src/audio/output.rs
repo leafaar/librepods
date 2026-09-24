@@ -1,26 +1,30 @@
 //! PipeWire/PulseAudio output for the hi-res microphone
 
-use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::context::introspect::SourceOutputInfo;
-use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
-use libpulse_binding::def::Retval;
-use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
-use libpulse_binding::operation::{Operation, State as OperationState};
-use libpulse_binding::proplist::properties;
-use tracing::{error, info, warn};
-use std::cell::{Cell, RefCell};
-use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::rc::Rc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-use dbus::blocking::Connection;
-use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-
-use crate::audio::agc::Agc;
+use {
+    crate::audio::agc::Agc,
+    dbus::blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
+    libpulse_binding::{
+        callbacks::ListResult,
+        context::{Context, FlagSet as ContextFlagSet, introspect::SourceOutputInfo},
+        def::Retval,
+        mainloop::standard::{IterateResult, Mainloop},
+        operation::{Operation, State as OperationState},
+        proplist::properties,
+    },
+    std::{
+        cell::{Cell, RefCell},
+        fs::{File, OpenOptions},
+        io::{ErrorKind, Write},
+        os::unix::fs::OpenOptionsExt,
+        rc::Rc,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
+    },
+    tracing::{error, info, warn},
+};
 
 pub const SOURCE_NAME: &str = "AirPodsHiRes";
 
@@ -81,7 +85,7 @@ impl VirtualMic {
             None => {
                 warn!("could not load module-pipe-source");
                 return None;
-            }
+            },
         };
 
         info!(
@@ -122,7 +126,7 @@ impl Output {
             Err(e) => {
                 error!("could not open hi-res fifo {}: {}", path, e);
                 return None;
-            }
+            },
         };
 
         let agc = crate::utils::AppSettings::load()
@@ -158,14 +162,14 @@ impl Output {
                 match self.fifo.write(chunk) {
                     Ok(_) => break,
                     // A signal arrived before anything was written: retry this chunk.
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {},
                     // Nobody is draining the pipe: drop the rest of this block
                     // rather than block the decode thread.
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break 'chunks,
                     Err(e) => {
                         error!("hi-res fifo write broke: {}", e);
                         return Err(());
-                    }
+                    },
                 }
             }
         }
@@ -408,7 +412,7 @@ pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>
         match op.get_state() {
             OperationState::Done => return true,
             OperationState::Cancelled => return false,
-            OperationState::Running => {}
+            OperationState::Running => {},
         }
         if Instant::now() >= deadline {
             warn!("[pw] sound server did not answer in time");
@@ -418,7 +422,7 @@ pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>
         match mainloop.iterate(false) {
             IterateResult::Quit(_) | IterateResult::Err(_) => return false,
             IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
-            IterateResult::Success(_) => {}
+            IterateResult::Success(_) => {},
         }
     }
 }
@@ -447,13 +451,13 @@ pub(crate) fn connect_cancellable(cancelled: impl Fn() -> bool) -> Option<(Mainl
         match mainloop.iterate(false) {
             IterateResult::Quit(_) | IterateResult::Err(_) => return None,
             IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
-            IterateResult::Success(_) => {}
+            IterateResult::Success(_) => {},
         }
         match context.get_state() {
             libpulse_binding::context::State::Ready => break,
             libpulse_binding::context::State::Failed
             | libpulse_binding::context::State::Terminated => return None,
-            _ => {}
+            _ => {},
         }
     }
     Some((mainloop, context))

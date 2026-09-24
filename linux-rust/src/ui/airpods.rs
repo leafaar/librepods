@@ -1,23 +1,28 @@
-use crate::bluetooth::aacp::{AACPManager, ControlCommandIdentifiers};
-use iced::Alignment::End;
-use iced::border::Radius;
-use iced::overlay::menu;
-use iced::widget::button::Style;
-use iced::widget::rule::FillMode;
-use iced::widget::{
-    Space, button, column, combo_box, container, row, rule, scrollable, slider, text, text_input,
-    toggler,
-};
-use iced::{Background, Border, Center, Color, Length, Padding, Theme};
-use tracing::error;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 // use crate::bluetooth::att::ATTManager;
-use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
-use crate::audio::mic_test;
-use crate::ui::equalizer::equalizer_section;
-use crate::ui::window::{Message, MicTest};
+use {
+    crate::{
+        audio::mic_test,
+        bluetooth::aacp::{AACPManager, ControlCommandIdentifiers},
+        devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState},
+        ui::{
+            equalizer::equalizer_section,
+            window::{Message, MicTest},
+        },
+    },
+    iced::{
+        Alignment::End,
+        Background, Border, Center, Color, Length, Padding, Theme,
+        border::Radius,
+        overlay::menu,
+        widget::{
+            Space, button, column, combo_box, container, row,
+            rule::{self, FillMode},
+            scrollable, slider, text, text_input, toggler,
+        },
+    },
+    std::{collections::HashMap, sync::Arc, time::Duration},
+    tracing::error,
+};
 
 pub fn airpods_view<'a>(
     mac: &'a str,
@@ -123,7 +128,9 @@ pub fn airpods_view<'a>(
                                         &[selected_mode_c.to_byte()],
                                     )
                                     .await
-                                    .unwrap_or_else(|e| error!("Failed to send Noise Control Mode command: {}", e));
+                                    .unwrap_or_else(|e| {
+                                        error!("Failed to send Noise Control Mode command: {}", e)
+                                    });
                             });
                             let mut state = state_clone.clone();
                             state.noise_control_mode = selected_mode.clone();
@@ -464,7 +471,7 @@ pub fn airpods_view<'a>(
                     Space::new().width(Length::Fill),
                     button(text(airpods_info.serial_number.clone()).size(16))
                         .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
+                            let mut style = button::Style::default();
                             style.text_color = theme.palette().text;
                             style.background = Some(Background::Color(Color::TRANSPARENT));
                             style
@@ -481,7 +488,7 @@ pub fn airpods_view<'a>(
                     Space::new().width(Length::Fill),
                     button(text(airpods_info.left_serial_number.clone()).size(16))
                         .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
+                            let mut style = button::Style::default();
                             style.text_color = theme.palette().text;
                             style.background = Some(Background::Color(Color::TRANSPARENT));
                             style
@@ -500,7 +507,7 @@ pub fn airpods_view<'a>(
                     Space::new().width(Length::Fill),
                     button(text(airpods_info.right_serial_number.clone()).size(16))
                         .style(|theme: &Theme, _status| {
-                            let mut style = Style::default();
+                            let mut style = button::Style::default();
                             style.text_color = theme.palette().text;
                             style.background = Some(Background::Color(Color::TRANSPARENT));
                             style
@@ -596,8 +603,7 @@ pub fn airpods_view<'a>(
     .padding(20)
     .center_x(Length::Fill);
 
-    container(scrollable(content).height(Length::Fill))
-        .height(Length::Fill)
+    container(scrollable(content).height(Length::Fill)).height(Length::Fill)
 }
 
 /// Longest name the AirPods accept in a rename packet, in bytes.
@@ -646,11 +652,11 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
                 .spacing(12),
             ]
             .spacing(6)
-        }
+        },
         MicTest::Starting => column![title, dim_text("Pausing media…".to_string())].spacing(6),
         MicTest::Stopping => {
             column![title, dim_text("Finishing the recording…".to_string())].spacing(6)
-        }
+        },
         MicTest::Recording(recorder) => column![
             title,
             row![
@@ -687,7 +693,8 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
                 .align_y(Center)
                 .spacing(12),
                 row![
-                    button(text(format!("-{skip}s")).size(14)).on_press(Message::MicTestSkip(false)),
+                    button(text(format!("-{skip}s")).size(14))
+                        .on_press(Message::MicTestSkip(false)),
                     play_pause,
                     button(text(format!("+{skip}s")).size(14)).on_press(Message::MicTestSkip(true)),
                     Space::new().width(Length::Fill),
@@ -702,7 +709,7 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
                 col = col.push(dim_text(e));
             }
             col
-        }
+        },
     }
 }
 

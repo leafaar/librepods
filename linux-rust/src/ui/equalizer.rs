@@ -1,17 +1,32 @@
-use crate::bluetooth::aacp::AACPManager;
-use crate::bluetooth::eq::{BAND_MAX, CustomEq, model_supports_custom_eq};
-use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
-use crate::ui::window::Message;
-use iced::border::Radius;
-use iced::widget::rule::FillMode;
-use iced::widget::{Space, button, column, container, row, rule, slider, text, toggler};
-use iced::{Background, Border, Center, Element, Length, Padding, Theme};
-use tracing::error;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::Mutex;
+use {
+    crate::{
+        bluetooth::{
+            aacp::AACPManager,
+            eq::{BAND_MAX, CustomEq, model_supports_custom_eq},
+        },
+        devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState},
+        ui::window::Message,
+    },
+    iced::{
+        Background, Border, Center, Element, Length, Padding, Theme,
+        border::Radius,
+        widget::{
+            Space, button, column, container, row,
+            rule::{self, FillMode},
+            slider, text, toggler,
+        },
+    },
+    std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    },
+    tokio::sync::Mutex,
+    tracing::error,
+};
 
 /// How long the bands must stay still before they are sent. A slider drag
 /// reports every step it passes; the AirPods only need where it settles.

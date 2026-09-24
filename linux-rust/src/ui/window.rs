@@ -1,41 +1,51 @@
-use crate::bluetooth::aacp::{
-    AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
-    ControlCommandIdentifiers,
+use {
+    crate::{
+        audio::{mic_test, output},
+        bluetooth::{
+            aacp::{
+                AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
+                ControlCommandIdentifiers,
+            },
+            att::ATTHandles,
+            managers::DeviceManagers,
+        },
+        devices::enums::{
+            AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType,
+            NothingAncMode, NothingState,
+        },
+        ui::{
+            airpods::{airpods_view, validate_device_name},
+            equalizer::EqualizerState,
+            messages::BluetoothUIMessage,
+            nothing::nothing_view,
+        },
+        utils::{AppSettings, MyTheme, PreferredCodec, get_devices_path, update_devices_file},
+    },
+    bluer::Address,
+    iced::{
+        Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
+        Subscription, Task, Theme,
+        border::Radius,
+        daemon,
+        overlay::menu,
+        widget::{
+            Space, button, column, combo_box, container, pane_grid, pick_list, row,
+            rule::{self, FillMode},
+            scrollable, text, text_input, toggler,
+        },
+        window,
+    },
+    std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    },
+    tokio::sync::{Mutex, RwLock, mpsc::UnboundedReceiver},
+    tracing::{debug, error, warn},
 };
-use crate::bluetooth::att::ATTHandles;
-use crate::bluetooth::managers::DeviceManagers;
-use crate::devices::enums::{
-    AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
-    NothingState,
-};
-use crate::audio::{mic_test, output};
-use crate::ui::airpods::{airpods_view, validate_device_name};
-use crate::ui::equalizer::EqualizerState;
-use crate::ui::messages::BluetoothUIMessage;
-use crate::ui::nothing::nothing_view;
-use crate::utils::{
-    AppSettings, MyTheme, PreferredCodec, get_devices_path, update_devices_file,
-};
-use bluer::Address;
-use iced::border::Radius;
-use iced::overlay::menu;
-use iced::widget::button::Style;
-use iced::widget::rule::FillMode;
-use iced::widget::{
-    Space, button, column, combo_box, container, pane_grid, pick_list, row, rule, scrollable,
-    text, text_input, toggler,
-};
-use iced::{
-    Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
-    Subscription, Task, Theme, daemon, window,
-};
-use tracing::{debug, error, warn};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{Mutex, RwLock};
 
 pub fn start_ui(
     ui_rx: UnboundedReceiver<BluetoothUIMessage>,
@@ -158,7 +168,10 @@ enum ConnectStatus {
 
 impl ConnectStatus {
     fn in_progress(&self) -> bool {
-        matches!(self, ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_))
+        matches!(
+            self,
+            ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)
+        )
     }
 }
 
@@ -376,37 +389,37 @@ impl App {
                 self.window = Some(id);
                 self.devices = load_devices();
                 Task::none()
-            }
+            },
             Message::WindowClosed(id) => {
                 if self.window == Some(id) {
                     self.window = None;
                 }
                 Task::none()
-            }
+            },
             Message::Resized(event) => {
                 self.panes.resize(event.split, event.ratio);
                 Task::none()
-            }
+            },
             Message::SelectTab(tab) => {
                 self.selected_tab = tab;
                 self.name_draft = None;
                 Task::none()
-            }
+            },
             Message::RenameInput(mac, name) => {
                 self.name_draft = Some((mac, name));
                 Task::none()
-            }
+            },
             Message::RenameSubmit(mac) => self.rename(mac),
             Message::NothingAncModeSelected(mac, mode) => self.set_nothing_anc_mode(mac, mode),
             Message::DevicesChanged => {
                 self.devices = load_devices();
                 Task::none()
-            }
+            },
             Message::ThemeSelected(theme) => {
                 self.selected_theme = theme;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
             Message::ConnectDevice(mac) => self.start_connect(mac),
             Message::MicTestRecord => {
@@ -420,14 +433,13 @@ impl App {
                 // for the whole test. Players already paused by an earlier take stay listed.
                 if self.mic_test_paused.is_empty() {
                     self.mic_test = MicTest::Starting;
-                    return Task::perform(
-                        off_ui_thread(output::pause_media_players),
-                        |players| Message::MicTestMediaPaused(players.unwrap_or_default()),
-                    );
+                    return Task::perform(off_ui_thread(output::pause_media_players), |players| {
+                        Message::MicTestMediaPaused(players.unwrap_or_default())
+                    });
                 }
                 self.mic_test = MicTest::Recording(mic_test::Recorder::start());
                 Task::none()
-            }
+            },
             Message::MicTestMediaPaused(players) => {
                 if matches!(self.mic_test, MicTest::Starting) {
                     self.mic_test_paused = players;
@@ -441,7 +453,7 @@ impl App {
                     // The test ended while the players were being paused.
                     resume_players(players)
                 }
-            }
+            },
             Message::MicTestStop => self.stop_recording(),
             Message::MicTestRecorded(take, result) => {
                 if take != self.mic_test_take || !matches!(self.mic_test, MicTest::Stopping) {
@@ -451,26 +463,26 @@ impl App {
                     Ok(pcm) => {
                         self.mic_test = MicTest::Ready(mic_test::Player::new(pcm));
                         Task::none()
-                    }
+                    },
                     Err(e) => {
                         // No Done button on a failed test, so give the music back now.
                         self.mic_test = MicTest::Failed(e);
                         resume_players(std::mem::take(&mut self.mic_test_paused))
-                    }
+                    },
                 }
-            }
+            },
             Message::MicTestPlay => {
                 if let MicTest::Ready(player) = &self.mic_test {
                     player.play();
                 }
                 Task::none()
-            }
+            },
             Message::MicTestPause => {
                 if let MicTest::Ready(player) = &self.mic_test {
                     player.pause();
                 }
                 Task::none()
-            }
+            },
             Message::MicTestSkip(forward) => {
                 if let MicTest::Ready(player) = &self.mic_test {
                     let at = player.position();
@@ -482,13 +494,13 @@ impl App {
                     player.seek(to.min(player.duration()));
                 }
                 Task::none()
-            }
+            },
             Message::MicTestSeek(secs) => {
                 if let MicTest::Ready(player) = &self.mic_test {
                     player.seek(Duration::from_secs_f32(secs.max(0.0)));
                 }
                 Task::none()
-            }
+            },
             Message::MicTestDone => self.end_mic_test(),
             Message::ConnectFinished(mac, attempt, result) => {
                 if !matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting(a)) if *a == attempt)
@@ -504,13 +516,13 @@ impl App {
                         Task::perform(tokio::time::sleep(CONNECT_SETUP_TIMEOUT), move |_| {
                             Message::ConnectSetupTimedOut(mac, attempt)
                         })
-                    }
+                    },
                     Err(e) => {
                         self.connect_status.insert(mac, ConnectStatus::Failed(e));
                         Task::none()
-                    }
+                    },
                 }
-            }
+            },
             Message::ConnectSetupTimedOut(mac, attempt) => {
                 if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(a)) if *a == attempt)
                 {
@@ -522,14 +534,14 @@ impl App {
                     );
                 }
                 Task::none()
-            }
+            },
             Message::UiChannelClosed => Task::none(),
             Message::MicLevelTick => {
                 if matches!(&self.mic_test, MicTest::Recording(r) if r.finished()) {
                     return self.stop_recording();
                 }
                 Task::none()
-            }
+            },
             Message::BluetoothMessage(ui_message) => {
                 match ui_message {
                     BluetoothUIMessage::ConnectAirPods => {
@@ -544,7 +556,7 @@ impl App {
                             tasks.push(self.start_connect(mac));
                         }
                         Task::batch(tasks)
-                    }
+                    },
                     BluetoothUIMessage::OpenWindow => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
@@ -557,7 +569,7 @@ impl App {
                             self.window = Some(new_window_task);
                             Task::batch(vec![open_task.map(Message::WindowOpened), wait_task])
                         }
-                    }
+                    },
                     BluetoothUIMessage::DeviceConnected(mac) => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
@@ -644,7 +656,7 @@ impl App {
                                         .collect(),
                                     custom_eq: EqualizerState::new(state.custom_eq.unwrap_or_default()),
                                 }));
-                            }
+                            },
                             Some(DeviceType::Nothing) => {
                                 self.device_states.insert(
                                     mac.clone(),
@@ -660,12 +672,12 @@ impl App {
                                         ]),
                                     }),
                                 );
-                            }
-                            _ => {}
+                            },
+                            _ => {},
                         }
 
                         Task::batch(vec![wait_task])
-                    }
+                    },
                     BluetoothUIMessage::DeviceDisconnected(mac) => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
@@ -675,7 +687,10 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(_))) {
+                        if matches!(
+                            self.connect_status.get(&mac),
+                            Some(ConnectStatus::SettingUp(_))
+                        ) {
                             self.connect_status.remove(&mac);
                         }
                         if self.name_draft.as_ref().is_some_and(|(m, _)| *m == mac) {
@@ -700,7 +715,7 @@ impl App {
                         }
 
                         Task::batch(vec![wait_task, end_test])
-                    }
+                    },
                     BluetoothUIMessage::AACPUIEvent(mac, event) => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
@@ -722,7 +737,7 @@ impl App {
                                     {
                                         state.noise_control_mode = mode;
                                     }
-                                }
+                                },
                                 ControlCommandIdentifiers::ConversationDetectConfig => {
                                     let is_enabled = match status.value.as_slice() {
                                         [0x01] => true,
@@ -733,14 +748,14 @@ impl App {
                                                 status.value
                                             );
                                             false
-                                        }
+                                        },
                                     };
                                     if let Some(DeviceState::AirPods(state)) =
                                         self.device_states.get_mut(&mac)
                                     {
                                         state.conversation_awareness_enabled = is_enabled;
                                     }
-                                }
+                                },
                                 ControlCommandIdentifiers::AdaptiveVolumeConfig => {
                                     let is_enabled = match status.value.as_slice() {
                                         [0x01] => true,
@@ -751,14 +766,14 @@ impl App {
                                                 status.value
                                             );
                                             false
-                                        }
+                                        },
                                     };
                                     if let Some(DeviceState::AirPods(state)) =
                                         self.device_states.get_mut(&mac)
                                     {
                                         state.personalized_volume_enabled = is_enabled;
                                     }
-                                }
+                                },
                                 ControlCommandIdentifiers::AllowOffOption => {
                                     let is_enabled = match status.value.as_slice() {
                                         [0x01] => true,
@@ -769,7 +784,7 @@ impl App {
                                                 status.value
                                             );
                                             false
-                                        }
+                                        },
                                     };
                                     if let Some(DeviceState::AirPods(state)) =
                                         self.device_states.get_mut(&mac)
@@ -787,7 +802,7 @@ impl App {
                                             modes
                                         });
                                     }
-                                }
+                                },
                                 _ => {
                                     if let Some(DeviceState::AirPods(state)) =
                                         self.device_states.get_mut(&mac)
@@ -796,7 +811,7 @@ impl App {
                                             .control_values
                                             .insert(status.identifier as u8, status.value);
                                     }
-                                }
+                                },
                             },
                             AACPEvent::BatteryInfo(battery_info) => {
                                 self.remember_case_level(&mac, &battery_info);
@@ -806,18 +821,18 @@ impl App {
                                     state.battery = battery_info;
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
                                 }
-                            }
+                            },
                             AACPEvent::CustomEq(custom_eq) => {
                                 if let Some(DeviceState::AirPods(state)) =
                                     self.device_states.get_mut(&mac)
                                 {
                                     state.custom_eq.eq = custom_eq;
                                 }
-                            }
-                            _ => {}
+                            },
+                            _ => {},
                         }
                         Task::batch(vec![wait_task])
-                    }
+                    },
                     BluetoothUIMessage::ATTNotification(mac, handle, value) => {
                         debug!(
                             "ATT Notification for {}: handle=0x{:04X}, value={:?}",
@@ -829,9 +844,9 @@ impl App {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         Task::batch(vec![wait_task])
-                    }
+                    },
                 }
-            }
+            },
             // Message::ShowNewDialogTab => {
             //     debug!("switching to Add Device tab");
             //     self.selected_tab = Tab::AddDevice;
@@ -840,16 +855,16 @@ impl App {
             Message::GotPairedDevices(map) => {
                 self.paired_devices = map;
                 Task::none()
-            }
+            },
             Message::StartAddDevice(name, addr) => {
                 self.pending_add_device = Some((name, addr));
                 self.selected_device_type = None;
                 Task::none()
-            }
+            },
             Message::SelectDeviceType(device_type) => {
                 self.selected_device_type = Some(device_type);
                 Task::none()
-            }
+            },
             Message::ConfirmAddDevice => {
                 if let Some((name, addr)) = self.pending_add_device.take()
                     && let Some(type_) = self.selected_device_type.take()
@@ -872,12 +887,12 @@ impl App {
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
                 Task::none()
-            }
+            },
             Message::CancelAddDevice => {
                 self.pending_add_device = None;
                 self.selected_device_type = None;
                 Task::none()
-            }
+            },
             Message::StateChanged(mac, state) => {
                 let mut end_test = Task::none();
                 if let DeviceState::AirPods(a) = &state
@@ -914,42 +929,42 @@ impl App {
                     });
                 }
                 end_test
-            }
+            },
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::A2dpResetChanged(is_enabled) => {
                 self.a2dp_reset = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::AutoSwitchChanged(is_enabled) => {
                 self.auto_switch_on_playback = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::PreferredCodecChanged(codec) => {
                 self.preferred_codec = codec;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::HiResMicAgcChanged(is_enabled) => {
                 self.hires_mic_agc = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
             Message::HiResMicPauseConvoChanged(is_enabled) => {
                 self.hires_mic_pause_convo = is_enabled;
                 self.save_settings();
                 Task::none()
-            }
+            },
         }
     }
 
@@ -967,7 +982,7 @@ impl App {
             other => {
                 self.mic_test = other;
                 return Task::none();
-            }
+            },
         };
         self.mic_test_take += 1;
         let take = self.mic_test_take;
@@ -990,7 +1005,10 @@ impl App {
             .discard(),
             _ => Task::none(),
         };
-        Task::batch([stop, resume_players(std::mem::take(&mut self.mic_test_paused))])
+        Task::batch([
+            stop,
+            resume_players(std::mem::take(&mut self.mic_test_paused)),
+        ])
     }
 
     fn aacp_manager(&self, mac: &str) -> Option<Arc<AACPManager>> {
@@ -1080,7 +1098,11 @@ impl App {
     }
 
     fn start_connect(&mut self, mac: String) -> Task<Message> {
-        if self.connect_status.get(&mac).is_some_and(ConnectStatus::in_progress) {
+        if self
+            .connect_status
+            .get(&mac)
+            .is_some_and(ConnectStatus::in_progress)
+        {
             return Task::none();
         }
         let Ok(addr) = mac.parse::<Address>() else {
@@ -1108,7 +1130,11 @@ impl App {
                 false,
             ),
         };
-        let label = if connecting { "Connecting…" } else { "Connect to this PC" };
+        let label = if connecting {
+            "Connecting…"
+        } else {
+            "Connect to this PC"
+        };
         let mut connect = button(text(label).size(16)).padding(Padding {
             top: 10.0,
             bottom: 10.0,
@@ -1119,10 +1145,14 @@ impl App {
             connect = connect.on_press(Message::ConnectDevice(mac.to_string()));
         }
         container(
-            column![text("AirPods not connected").size(20), text(status).size(14), connect]
-                .spacing(16)
-                .align_x(Center)
-                .max_width(440),
+            column![
+                text("AirPods not connected").size(20),
+                text(status).size(14),
+                connect
+            ]
+            .spacing(16)
+            .align_x(Center)
+            .max_width(440),
         )
         .center_x(Length::Fill)
         .center_y(Length::Fill)
@@ -1150,7 +1180,7 @@ impl App {
                                             part_text = part_text.style(move |theme: &Theme| {
                                                 let mut style = text::Style::default();
                                                 let color = if is_selected {
-                                                    Style::default().text_color
+                                                    button::Style::default().text_color
                                                 } else {
                                                     theme.palette().text
                                                 };
@@ -1180,14 +1210,14 @@ impl App {
                             .padding(8);
                         let style = move |theme: &Theme, _status| {
                             if is_selected {
-                                let mut style = Style::default()
+                                let mut style = button::Style::default()
                                     .with_background(theme.palette().primary);
                                 let mut border = Border::default();
                                 border.color = theme.palette().text;
                                 style.border = border.rounded(12);
                                 style
                             } else {
-                                let mut style = Style::default()
+                                let mut style = button::Style::default()
                                     .with_background(theme.palette().primary.scale_alpha(0.1));
                                 let mut border = Border::default();
                                 border.color = theme.palette().primary.scale_alpha(0.1);
@@ -1212,14 +1242,14 @@ impl App {
                             .padding(8);
                         let style = move |theme: &Theme, _status| {
                             if is_selected {
-                                let mut style = Style::default()
+                                let mut style = button::Style::default()
                                     .with_background(theme.palette().primary);
                                 let mut border = Border::default();
                                 border.color = theme.palette().text;
                                 style.border = border.rounded(12);
                                 style
                             } else {
-                                let mut style = Style::default()
+                                let mut style = button::Style::default()
                                     .with_background(theme.palette().primary.scale_alpha(0.1));
                                 let mut border = Border::default();
                                 border.color = theme.palette().primary.scale_alpha(0.1);
@@ -1261,7 +1291,7 @@ impl App {
                             // )
                             //     .style(
                             //         |theme: &Theme, _status| {
-                            //             let mut style = Style::default();
+                            //             let mut style = button::Style::default();
                             //             style.text_color = theme.palette().text;
                             //             style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
                             //             style.border = Border {
@@ -1828,7 +1858,7 @@ impl App {
                                                         )
                                                             .style(
                                                                 |theme: &Theme, _status| {
-                                                                    let mut style = Style::default();
+                                                                    let mut style = button::Style::default();
                                                                     style.text_color = theme.palette().text;
                                                                     style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.5)));
                                                                     style.border = Border {
@@ -1899,7 +1929,7 @@ impl App {
                                                                 button(text("Cancel").size(16).width(Length::Fill).center())
                                                                     .on_press(Message::CancelAddDevice)
                                                                     .style(|theme: &Theme, _status| {
-                                                                        let mut style = Style::default();
+                                                                        let mut style = button::Style::default();
                                                                         style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
                                                                         style.text_color = theme.palette().text;
                                                                         style.border = Border::default().rounded(8.0);
@@ -1911,7 +1941,7 @@ impl App {
                                                                 button(text("Add Device").size(16).width(Length::Fill).center())
                                                                     .on_press(Message::ConfirmAddDevice)
                                                                     .style(|theme: &Theme, _status| {
-                                                                        let mut style = Style::default();
+                                                                        let mut style = button::Style::default();
                                                                         style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.3)));
                                                                         style.text_color = theme.palette().text;
                                                                         style.border = Border::default().rounded(8.0);
@@ -1982,7 +2012,7 @@ impl App {
             Some(interval) => {
                 let tick = iced::time::every(interval).map(|_| Message::MicLevelTick);
                 Subscription::batch([close, tick])
-            }
+            },
             None => close,
         }
     }
@@ -2033,7 +2063,10 @@ fn resume_players(players: Vec<String>) -> Task<Message> {
     if players.is_empty() {
         return Task::none();
     }
-    Task::future(off_ui_thread(move || output::resume_media_players(&players))).discard()
+    Task::future(off_ui_thread(move || {
+        output::resume_media_players(&players)
+    }))
+    .discard()
 }
 
 /// Read devices.json. A missing or unreadable file gives an empty list.
@@ -2045,7 +2078,7 @@ fn load_devices() -> HashMap<String, DeviceData> {
                 error!("Failed to read devices file: {}", e);
             }
             return HashMap::new();
-        }
+        },
     };
     serde_json::from_str(&devices_json).unwrap_or_else(|e| {
         error!("Deserialization failed: {}", e);
@@ -2065,9 +2098,13 @@ fn known_level(info: &BatteryInfo) -> Option<u8> {
 fn battery_text(info: Option<&BatteryInfo>) -> String {
     match info.and_then(|b| known_level(b).map(|level| (level, b.status))) {
         Some((level, status)) => {
-            let mark = if status.is_charging() { CHARGING_MARK } else { "" };
+            let mark = if status.is_charging() {
+                CHARGING_MARK
+            } else {
+                ""
+            };
             format!("{}%{}", level, mark)
-        }
+        },
         None => "-".to_string(),
     }
 }
@@ -2096,8 +2133,14 @@ fn battery_parts(battery: &[BatteryInfo], last_case: Option<u8>) -> Vec<(String,
         (None, None) => ("-".to_string(), false),
     };
     vec![
-        (format!("\u{1018E5} {}", battery_text(find(BatteryComponent::Left))), false),
-        (format!("\u{1018E8} {}", battery_text(find(BatteryComponent::Right))), false),
+        (
+            format!("\u{1018E5} {}", battery_text(find(BatteryComponent::Left))),
+            false,
+        ),
+        (
+            format!("\u{1018E8} {}", battery_text(find(BatteryComponent::Right))),
+            false,
+        ),
         (format!("\u{100E6C} {}", case), stale),
     ]
 }
@@ -2109,7 +2152,7 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
         None => {
             error!("UI message channel closed, no more device updates");
             Message::UiChannelClosed
-        }
+        },
     }
 }
 
@@ -2160,7 +2203,10 @@ mod tests {
         let gone = entry(BatteryComponent::Left, 0, BatteryStatus::Disconnected);
         let bogus = entry(BatteryComponent::Left, 255, BatteryStatus::NotCharging);
         assert_eq!(battery_text(Some(&charging)), format!("40%{CHARGING_MARK}"));
-        assert_eq!(battery_text(Some(&optimized)), format!("80%{CHARGING_MARK}"));
+        assert_eq!(
+            battery_text(Some(&optimized)),
+            format!("80%{CHARGING_MARK}")
+        );
         assert_eq!(battery_text(Some(&idle)), "100%");
         assert_eq!(battery_text(Some(&gone)), "-");
         assert_eq!(battery_text(Some(&bogus)), "-");
@@ -2169,9 +2215,21 @@ mod tests {
 
     #[test]
     fn case_level_is_remembered_only_when_reported() {
-        let in_case = [entry(BatteryComponent::Case, 60, BatteryStatus::NotCharging)];
-        let buds_out = [entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected)];
-        let buds_out_255 = [entry(BatteryComponent::Case, 255, BatteryStatus::Disconnected)];
+        let in_case = [entry(
+            BatteryComponent::Case,
+            60,
+            BatteryStatus::NotCharging,
+        )];
+        let buds_out = [entry(
+            BatteryComponent::Case,
+            0,
+            BatteryStatus::Disconnected,
+        )];
+        let buds_out_255 = [entry(
+            BatteryComponent::Case,
+            255,
+            BatteryStatus::Disconnected,
+        )];
         let bad_level = [entry(BatteryComponent::Case, 101, BatteryStatus::Charging)];
         assert_eq!(live_case_level(&in_case), Some(60));
         assert_eq!(live_case_level(&buds_out), None);
@@ -2218,7 +2276,11 @@ mod tests {
 
     #[test]
     fn headphones_show_one_level() {
-        let battery = [entry(BatteryComponent::Headphone, 30, BatteryStatus::NotCharging)];
+        let battery = [entry(
+            BatteryComponent::Headphone,
+            30,
+            BatteryStatus::NotCharging,
+        )];
         assert_eq!(texts(&battery_parts(&battery, Some(70))), ["􀺹 30%"]);
     }
 }

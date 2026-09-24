@@ -1,14 +1,16 @@
-use crate::bluetooth::att::{ATTHandles, ATTManager};
-use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::ui::messages::BluetoothUIMessage;
-use crate::utils::{get_devices_path, update_devices_file};
-use bluer::Address;
-use tracing::{debug, error, info};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use {
+    crate::{
+        bluetooth::att::{ATTHandles, ATTManager},
+        devices::enums::{DeviceData, DeviceInformation, DeviceType},
+        ui::messages::BluetoothUIMessage,
+        utils::{get_devices_path, update_devices_file},
+    },
+    bluer::Address,
+    serde::{Deserialize, Serialize},
+    std::{collections::HashMap, time::Duration},
+    tokio::{sync::mpsc, time::sleep},
+    tracing::{debug, error, info},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NothingInformation {

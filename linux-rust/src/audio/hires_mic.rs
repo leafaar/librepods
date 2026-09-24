@@ -1,21 +1,28 @@
 //! Hi-res microphone lifecycle: a persistent virtual input device plus a monitor
 //! that runs the AACP 0x58 capture only while an app is recording from it.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use tracing::{error, info, warn};
-use tokio::sync::Notify;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle as TokioHandle;
-
-use crate::audio::eld::{ELD_CHANNELS, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, EldDecoder};
-use crate::audio::output::{self, Output, VirtualMic};
-use crate::bluetooth::aacp::AACPManager;
-use crate::bluetooth::aacp_audio;
+use {
+    crate::{
+        audio::{
+            eld::{ELD_CHANNELS, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, EldDecoder},
+            output::{self, Output, VirtualMic},
+        },
+        bluetooth::{aacp::AACPManager, aacp_audio},
+    },
+    std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        },
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    },
+    tokio::{
+        sync::{Notify, mpsc},
+        task::JoinHandle as TokioHandle,
+    },
+    tracing::{error, info, warn},
+};
 
 /// Delay after sending 0x58 START before resetting the A2DP transport
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
@@ -241,14 +248,14 @@ async fn monitor_loop(
                             aacp.set_conversation_detection(false).await;
                         }
                         Some(c)
-                    }
+                    },
                     None => {
                         status.reset();
                         capture_failed(&mut retry, "capture start failed");
                         None
-                    }
+                    },
                 }
-            }
+            },
             (true, true, Some(c)) => {
                 status.set_capture(app);
                 let stalled = status.since_last_sdu().is_some_and(|d| d > STALL_TIMEOUT);
@@ -267,7 +274,7 @@ async fn monitor_loop(
                 } else {
                     Some(c)
                 }
-            }
+            },
             // Disabled while capturing: end the 0x58 stream now.
             // The virtual source stays up feeding silence, so an active
             // recorder isn't dropped onto the AirPods' HFP mic (handsfree).
@@ -282,7 +289,7 @@ async fn monitor_loop(
                 }
                 status.reset();
                 None
-            }
+            },
             (_, _, None) => None,
         };
 
@@ -386,7 +393,7 @@ fn spawn_decode_thread(
         Err(e) => {
             error!("could not spawn the hi-res decode thread: {}", e);
             None
-        }
+        },
     }
 }
 
@@ -413,7 +420,7 @@ fn decode_loop(
                 Some(_) => {
                     frames += 1;
                     consecutive_errors = 0;
-                }
+                },
                 None => {
                     // insert a silent frame
                     errors += 1;
@@ -430,14 +437,14 @@ fn decode_loop(
                                     DECODER_RESET_ERRORS
                                 );
                                 decoder = fresh;
-                            }
+                            },
                             None => warn!(
                                 "[audio] {} decode errors in a row and the AAC-ELD decoder could not be recreated",
                                 DECODER_RESET_ERRORS
                             ),
                         }
                     }
-                }
+                },
             }
         });
 
@@ -449,7 +456,7 @@ fn decode_loop(
                 Err(()) => {
                     warn!("hi-res output broke; stopping decode loop");
                     break;
-                }
+                },
             }
         };
 

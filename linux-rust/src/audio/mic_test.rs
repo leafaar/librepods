@@ -4,22 +4,28 @@
 //! Recorder and Player each run a pulse stream on their own thread and share
 //! only atomics and the PCM buffer with the UI, which polls them on its tick.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle, sleep};
-use std::time::{Duration, Instant};
-
-use libpulse_binding::def::{BufferAttr, Retval};
-use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::{
-    FlagSet as StreamFlagSet, PeekResult, SeekMode, State as StreamState, Stream,
+use {
+    crate::audio::{
+        eld::{ELD_CHANNELS, ELD_SAMPLE_RATE},
+        output::{SOURCE_NAME, connect, connect_cancellable, wait_for},
+    },
+    libpulse_binding::{
+        def::{BufferAttr, Retval},
+        mainloop::standard::{IterateResult, Mainloop},
+        sample::{Format, Spec},
+        stream::{FlagSet as StreamFlagSet, PeekResult, SeekMode, State as StreamState, Stream},
+    },
+    std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        },
+        thread::{self, JoinHandle, sleep},
+        time::{Duration, Instant},
+    },
 };
-
-use crate::audio::eld::{ELD_CHANNELS, ELD_SAMPLE_RATE};
-use crate::audio::output::{SOURCE_NAME, connect, connect_cancellable, wait_for};
 
 /// Longest recording kept; about 38 MB of 64 kHz mono s16.
 pub const MAX_RECORDING: Duration = Duration::from_secs(300);
@@ -61,7 +67,7 @@ fn iterate(mainloop: &mut Mainloop, block: bool) -> Result<(), String> {
     match mainloop.iterate(block) {
         IterateResult::Quit(_) | IterateResult::Err(_) => {
             Err("Lost the connection to the sound server".to_string())
-        }
+        },
         IterateResult::Success(_) => Ok(()),
     }
 }
@@ -88,7 +94,7 @@ fn wait_ready(
             StreamState::Ready => return Ok(()),
             StreamState::Failed | StreamState::Terminated => {
                 return Err("The sound server refused the stream".to_string());
-            }
+            },
             _ => sleep(IDLE_SLEEP),
         }
     }
@@ -174,7 +180,7 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
             Ok(PeekResult::Empty) => sleep(IDLE_SLEEP),
             Ok(PeekResult::Hole(_)) => {
                 let _ = stream.discard();
-            }
+            },
             Ok(PeekResult::Data(data)) => {
                 let full = {
                     let mut pcm = pcm.lock().map_err(|_| "Recording lost".to_string())?;
@@ -186,7 +192,7 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), String> {
                 if full {
                     break Ok(());
                 }
-            }
+            },
             Err(_) => break Err("Recording failed".to_string()),
         }
     };
@@ -304,7 +310,7 @@ fn wait_for_playback_slot(
         } else {
             match commands.recv_timeout(left) {
                 Ok(cmd) => pending.push_back(cmd),
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {},
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
@@ -357,15 +363,15 @@ fn play_loop(
                 // resume from the heard position rather than the write offset.
                 let heard = position.load(Ordering::Relaxed).min(pcm.len());
                 offset = heard - heard % BYTES_PER_FRAME;
-            }
+            },
             Ok(Command::Seek(to)) => {
                 offset = to - to % BYTES_PER_FRAME;
                 position.store(offset, Ordering::Relaxed);
                 let mut op = stream.flush(None);
                 wait_for(&mut mainloop, &mut op);
-            }
+            },
             Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => {},
         }
         iterate(&mut mainloop, false)?;
 

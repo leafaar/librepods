@@ -1,21 +1,33 @@
-use crate::bluetooth::eq::{self, CustomEq};
-use crate::devices::airpods::AirPodsInformation;
-use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
-use crate::utils::get_devices_path;
-use bluer::{
-    Address, AddressType, Error, Result,
-    l2cap::{SeqPacket, Socket, SocketAddr},
+use {
+    crate::{
+        bluetooth::eq::{self, CustomEq},
+        devices::{
+            airpods::AirPodsInformation,
+            enums::{DeviceData, DeviceInformation, DeviceType},
+        },
+        utils::get_devices_path,
+    },
+    bluer::{
+        Address, AddressType, Error, Result,
+        l2cap::{SeqPacket, Socket, SocketAddr},
+    },
+    serde::{Deserialize, Serialize},
+    serde_json,
+    std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    },
+    tokio::{
+        sync::{Mutex, Notify, mpsc},
+        task::{AbortHandle, JoinSet},
+        time::{Instant, sleep},
+    },
+    tracing::{debug, error, info, warn},
 };
-use tracing::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
-use serde_json;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::{Mutex, Notify, mpsc};
-use tokio::task::{AbortHandle, JoinSet};
-use tokio::time::{Instant, sleep};
 
 const PSM: u16 = 0x1001;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -588,7 +600,7 @@ impl AACPManager {
             Err(e) => {
                 error!("Failed to create L2CAP socket: {}", e);
                 return Err(Error::from(e));
-            }
+            },
         };
 
         let seq_packet =
@@ -597,11 +609,14 @@ impl AACPManager {
                 Ok(Err(e)) => {
                     error!("L2CAP connect failed: {}", e);
                     return Err(Error::from(e));
-                }
+                },
                 Err(_) => {
                     error!("L2CAP connect timed out");
-                    return Err(connect_error(std::io::ErrorKind::TimedOut, "L2CAP connect timed out"));
-                }
+                    return Err(connect_error(
+                        std::io::ErrorKind::TimedOut,
+                        "L2CAP connect timed out",
+                    ));
+                },
             };
 
         // Wait for connection to be fully established
@@ -609,7 +624,7 @@ impl AACPManager {
         loop {
             match seq_packet.peer_addr() {
                 Ok(peer) if peer.cid != 0 => break,
-                Ok(_) => { /* still waiting */ }
+                Ok(_) => { /* still waiting */ },
                 Err(e) => {
                     if e.raw_os_error() == Some(107) {
                         // ENOTCONN
@@ -617,7 +632,7 @@ impl AACPManager {
                         return Err(Error::from(e));
                     }
                     error!("Error getting peer address: {}", e);
-                }
+                },
             }
             if start.elapsed() >= CONNECT_TIMEOUT {
                 error!("Timed out waiting for L2CAP connection to be fully established.");
@@ -664,7 +679,7 @@ impl AACPManager {
                     std::io::ErrorKind::TimedOut,
                     "state mutex busy",
                 )));
-            }
+            },
         };
         if let Some(sender) = sender {
             sender.send(data.to_vec()).await.map_err(|e| {
@@ -756,7 +771,7 @@ impl AACPManager {
                             _ => {
                                 error!("Unknown battery component: {:#04x}", payload[base_index]);
                                 continue;
-                            }
+                            },
                         },
                         level: payload[base_index + 2],
                         status: match payload[base_index + 3] {
@@ -767,7 +782,7 @@ impl AACPManager {
                             _ => {
                                 error!("Unknown battery status: {:#04x}", payload[base_index + 3]);
                                 continue;
-                            }
+                            },
                         },
                     });
                 }
@@ -777,7 +792,7 @@ impl AACPManager {
                     let _ = tx.send(AACPEvent::BatteryInfo(batteries));
                 }
                 info!("Received Battery Info: {:?}", state.battery_info);
-            }
+            },
             opcodes::CONTROL_COMMAND => {
                 if payload.len() < 7 {
                     error!("Control Command packet too short: {}", hex::encode(payload));
@@ -829,7 +844,7 @@ impl AACPManager {
                         identifier_byte
                     );
                 }
-            }
+            },
             opcodes::EAR_DETECTION => {
                 if payload.len() < 4 {
                     error!("Ear Detection packet too short: {}", hex::encode(payload));
@@ -846,7 +861,7 @@ impl AACPManager {
                     _ => {
                         error!("Unknown ear detection status: {:#04x}", primary_status);
                         EarDetectionStatus::OutOfEar
-                    }
+                    },
                 });
                 statuses.push(match secondary_status {
                     0x00 => EarDetectionStatus::InEar,
@@ -856,7 +871,7 @@ impl AACPManager {
                     _ => {
                         error!("Unknown ear detection status: {:#04x}", secondary_status);
                         EarDetectionStatus::OutOfEar
-                    }
+                    },
                 });
                 let mut state = self.state.lock().await;
                 state.old_ear_detection_status = state.ear_detection_status.clone();
@@ -876,7 +891,7 @@ impl AACPManager {
                     "Received Ear Detection Status: {:?}",
                     state.ear_detection_status
                 );
-            }
+            },
             opcodes::CONVERSATION_AWARENESS => {
                 if packet.len() == 10 {
                     let status = packet[9];
@@ -892,7 +907,7 @@ impl AACPManager {
                         packet.len()
                     );
                 }
-            }
+            },
             opcodes::INFORMATION => {
                 if payload.len() < 6 {
                     error!("Information packet too short: {}", hex::encode(payload));
@@ -920,7 +935,10 @@ impl AACPManager {
                     strings.push(String::from_utf8_lossy(&data[start..index]).into_owned());
                 }
                 if strings.is_empty() {
-                    error!("Information packet has no strings: {}", hex::encode(payload));
+                    error!(
+                        "Information packet has no strings: {}",
+                        hex::encode(payload)
+                    );
                     return;
                 }
                 strings.remove(0);
@@ -961,7 +979,7 @@ impl AACPManager {
                 if let Some((mac, data)) = updated {
                     save_device(mac, data).await;
                 }
-            }
+            },
 
             opcodes::PROXIMITY_KEYS_RSP => {
                 if payload.len() < 4 {
@@ -1025,15 +1043,15 @@ impl AACPManager {
                             Some(ProximityKeyType::Irk) => info.le_keys.irk = hex::encode(key_data),
                             Some(ProximityKeyType::EncKey) => {
                                 info.le_keys.enc_key = hex::encode(key_data)
-                            }
-                            None => {}
+                            },
+                            None => {},
                         }
                     }
                 }
                 let data = device_data.clone();
                 drop(state);
                 save_device(mac_str, data).await;
-            }
+            },
             opcodes::STEM_PRESS => {
                 if payload.len() < 4 {
                     error!("Stem Press packet too short: {}", hex::encode(payload));
@@ -1053,7 +1071,7 @@ impl AACPManager {
                         press_type, bud_type
                     );
                 }
-            }
+            },
             opcodes::AUDIO_SOURCE => {
                 if payload.len() < 9 {
                     error!("Audio Source packet too short: {}", hex::encode(payload));
@@ -1071,7 +1089,7 @@ impl AACPManager {
                     let _ = tx.send(AACPEvent::AudioSource(audio_source));
                 }
                 info!("Received Audio Source: {:?}", state.audio_source);
-            }
+            },
             opcodes::CONNECTED_DEVICES => {
                 if payload.len() < 3 {
                     error!(
@@ -1120,7 +1138,7 @@ impl AACPManager {
                     ));
                 }
                 info!("Received Connected Devices: {:?}", state.connected_devices);
-            }
+            },
             opcodes::SMART_ROUTING_RESP => {
                 let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or_default());
                 info!("Received Smart Routing Response: {}", packet_string);
@@ -1130,13 +1148,16 @@ impl AACPManager {
                         let _ = tx.send(AACPEvent::OwnershipToFalseRequest);
                     }
                 }
-            }
+            },
             opcodes::EQ_DATA => {
                 debug!("Received EQ Data");
-            }
+            },
             opcodes::CUSTOM_EQ => {
                 let Some(custom_eq) = eq::parse(payload) else {
-                    warn!("Ignoring malformed custom EQ packet: {}", hex::encode(packet));
+                    warn!(
+                        "Ignoring malformed custom EQ packet: {}",
+                        hex::encode(packet)
+                    );
                     return;
                 };
                 info!("Received custom EQ: {:?}", custom_eq);
@@ -1145,7 +1166,7 @@ impl AACPManager {
                 if let Some(ref tx) = state.event_tx {
                     let _ = tx.send(AACPEvent::CustomEq(custom_eq));
                 }
-            }
+            },
             _ => debug!("Received unknown packet with opcode {:#04x}", opcode),
         }
     }
@@ -1411,7 +1432,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             Ok(0) => {
                 info!("Remote closed the connection.");
                 break;
-            }
+            },
             Ok(n) => {
                 let data = &buf[..n];
 
@@ -1431,11 +1452,11 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
 
                 debug!("Received {} bytes: {}", n, hex::encode(data));
                 manager.receive_packet(data).await;
-            }
+            },
             Err(e) => {
                 info!("Read error, the AirPods probably disconnected: {}", e);
                 break;
-            }
+            },
         }
     }
     // Both exits end the connection: nothing read from it is current any more.
@@ -1461,15 +1482,15 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
                 Ok(_) => {
                     debug!("Sent {} bytes: {}", data.len(), hex::encode(&data));
                     break;
-                }
+                },
                 Err(e) if e.raw_os_error() == Some(107) && attempts < 10 => {
                     attempts += 1;
                     sleep(Duration::from_millis(100)).await;
-                }
+                },
                 Err(e) => {
                     error!("Failed to send data: {}", e);
                     return;
-                }
+                },
             }
         }
     }
@@ -1485,7 +1506,7 @@ async fn save_device(mac: String, data: DeviceData) {
     })
     .await;
     match result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {},
         Ok(Err(e)) => error!("Failed to save devices: {}", e),
         Err(e) => error!("Failed to save devices: {}", e),
     }
@@ -1600,11 +1621,11 @@ mod tests {
 
     #[test]
     fn media_information_tags_the_streaming_state_by_length() {
-        let yes = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", true)
-            .unwrap();
+        let yes =
+            media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", true).unwrap();
         assert!(yes.windows(4).any(|w| w == b"\x43YES"));
-        let no = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", false)
-            .unwrap();
+        let no =
+            media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", false).unwrap();
         assert!(no.windows(3).any(|w| w == b"\x42NO"));
     }
 
@@ -1634,7 +1655,17 @@ mod tests {
     fn rename_payload_carries_the_name_length() {
         assert_eq!(
             rename_payload("Pods").unwrap(),
-            [opcodes::RENAME, 0x00, 0x01, 0x04, 0x00, b'P', b'o', b'd', b's']
+            [
+                opcodes::RENAME,
+                0x00,
+                0x01,
+                0x04,
+                0x00,
+                b'P',
+                b'o',
+                b'd',
+                b's'
+            ]
         );
         let longest = "a".repeat(255);
         assert_eq!(rename_payload(&longest).unwrap()[3], 255);

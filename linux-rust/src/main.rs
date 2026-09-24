@@ -6,28 +6,37 @@ mod media_controller;
 mod ui;
 mod utils;
 
-use crate::bluetooth::discovery::{find_connected_airpods, find_other_managed_devices};
-use crate::bluetooth::le::start_le_monitor;
-use crate::bluetooth::managers::DeviceManagers;
-use crate::devices::enums::DeviceData;
-use crate::ui::messages::BluetoothUIMessage;
-use crate::ui::tray::MyTray;
-use crate::utils::{ensure_device_registered, get_app_settings_path, get_devices_path};
-use bluer::{Address, InternalErrorKind};
-use clap::Parser;
-use dbus::arg::{RefArg, Variant};
-use dbus::blocking::Connection;
-use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-use dbus::message::MatchRule;
-use devices::airpods::AirPodsDevice;
-use ksni::TrayMethods;
-use tracing::{debug, error, info, warn};
-use std::collections::HashMap;
-use std::env;
-use std::sync::atomic::{AtomicBool};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use {
+    crate::{
+        bluetooth::{
+            discovery::{find_connected_airpods, find_other_managed_devices},
+            le::start_le_monitor,
+            managers::DeviceManagers,
+        },
+        devices::enums::DeviceData,
+        ui::{messages::BluetoothUIMessage, tray::MyTray},
+        utils::{ensure_device_registered, get_app_settings_path, get_devices_path},
+    },
+    bluer::{Address, InternalErrorKind},
+    clap::Parser,
+    dbus::{
+        arg::{RefArg, Variant},
+        blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
+        message::MatchRule,
+    },
+    devices::airpods::AirPodsDevice,
+    ksni::TrayMethods,
+    std::{
+        collections::HashMap,
+        env,
+        sync::{Arc, atomic::AtomicBool},
+    },
+    tokio::sync::{
+        RwLock,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
+    tracing::{debug, error, info, warn},
+};
 
 const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
@@ -48,7 +57,7 @@ struct Args {
     )]
     le_debug: bool,
     #[arg(long, short = 'v', help = "Show application version and exit")]
-    version: bool
+    version: bool,
 }
 
 fn main() -> iced::Result {
@@ -152,7 +161,7 @@ async fn async_main(
                      Your environment may lack a StatusNotifier/AppIndicator watcher."
                 );
                 None
-            }
+            },
         }
     };
 
@@ -214,13 +223,13 @@ async fn async_main(
                         &ui_tx,
                     )
                     .await;
-                }
+                },
                 Err(e) => error!("Could not set up AirPods {}: {}", device.address(), e),
             }
-        }
+        },
         Err(_) => {
             info!("No connected AirPods found.");
-        }
+        },
     }
 
     match find_other_managed_devices(&adapter, managed_devices_mac.clone()).await {
@@ -251,7 +260,7 @@ async fn async_main(
                             Err(e) => {
                                 error!("Could not set up device {}: {}", addr_str, e);
                                 return;
-                            }
+                            },
                         };
                         let mut managers = device_managers.write().await;
                         let dev_managers = DeviceManagers::with_att(dev.att_manager.clone());
@@ -260,13 +269,15 @@ async fn async_main(
                             .or_insert(dev_managers)
                             .set_att(dev.att_manager);
                         drop(managers);
-                        if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str)) {
+                        if let Err(e) =
+                            ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str))
+                        {
                             warn!("Failed to send DeviceConnected UI message: {:?}", e);
                         }
                     }
                 });
             }
-        }
+        },
         Err(e) => {
             tracing::debug!("type of error: {:?}", e.kind);
             if e.kind
@@ -276,7 +287,7 @@ async fn async_main(
             } else {
                 info!("No other managed devices found.");
             }
-        }
+        },
     }
 
     let conn = Connection::new_system()?;
@@ -316,7 +327,7 @@ async fn async_main(
         let Ok(addr) = addr_str.parse::<Address>() else {
             return true;
         };
-        if is_connected==0 {
+        if is_connected == 0 {
             if let Err(e) = ui_tx.send(BluetoothUIMessage::DeviceDisconnected(addr_str.clone())) {
                 warn!("Failed to send DeviceConnected UI message: {:?}", e);
             }
@@ -342,7 +353,7 @@ async fn async_main(
                         .await;
                 });
             }
-            return true
+            return true;
         }
         if managed_devices_mac.contains(&addr_str) {
             info!("Managed device connected: {}, initializing", addr_str);
@@ -355,12 +366,14 @@ async fn async_main(
                 let device_managers = device_managers.clone();
                 tokio::spawn(async move {
                     // Connect before taking the lock, see the startup path.
-                    let dev = match devices::nothing::NothingDevice::new(addr, ui_tx_clone.clone()).await {
+                    let dev = match devices::nothing::NothingDevice::new(addr, ui_tx_clone.clone())
+                        .await
+                    {
                         Ok(dev) => dev,
                         Err(e) => {
                             error!("Could not set up device {}: {}", addr_str, e);
                             return;
-                        }
+                        },
                     };
                     let mut managers = device_managers.write().await;
                     let dev_managers = DeviceManagers::with_att(dev.att_manager.clone());
@@ -369,7 +382,9 @@ async fn async_main(
                         .or_insert(dev_managers)
                         .set_att(dev.att_manager);
                     drop(managers);
-                    if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str.clone())) {
+                    if let Err(e) =
+                        ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str.clone()))
+                    {
                         warn!("Failed to send DeviceConnected UI message: {:?}", e);
                     }
                 });
@@ -389,13 +404,14 @@ async fn async_main(
         let ui_tx_clone = ui_tx.clone();
         let device_managers = device_managers.clone();
         tokio::spawn(async move {
-            let airpods_device = match AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await {
-                Ok(device) => device,
-                Err(e) => {
-                    error!("Could not set up AirPods {}: {}", addr_str, e);
-                    return;
-                }
-            };
+            let airpods_device =
+                match AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await {
+                    Ok(device) => device,
+                    Err(e) => {
+                        error!("Could not set up AirPods {}: {}", addr_str, e);
+                        return;
+                    },
+                };
             register_airpods(airpods_device, addr_str, &device_managers, &ui_tx_clone).await;
         });
         true

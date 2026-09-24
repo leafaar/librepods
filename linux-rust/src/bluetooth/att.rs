@@ -1,12 +1,17 @@
-use bluer::l2cap::{SeqPacket, Socket, SocketAddr};
-use bluer::{Address, AddressType, Error, Result};
-use hex;
-use tracing::{debug, error, info};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinSet;
-use tokio::time::{Duration, Instant, sleep};
+use {
+    bluer::{
+        Address, AddressType, Error, Result,
+        l2cap::{SeqPacket, Socket, SocketAddr},
+    },
+    hex,
+    std::{collections::HashMap, sync::Arc},
+    tokio::{
+        sync::{Mutex, mpsc},
+        task::JoinSet,
+        time::{Duration, Instant, sleep},
+    },
+    tracing::{debug, error, info},
+};
 
 const PSM_ATT: u16 = 0x001F;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,7 +94,7 @@ fn match_response(request_opcode: u8, pdu: &[u8]) -> ResponseMatch<'_> {
         // Error Response: opcode, request opcode in error, handle (2), error code.
         [OPCODE_ERROR_RESPONSE, failed, _, _, code, ..] if *failed == request_opcode => {
             ResponseMatch::Error(*code)
-        }
+        },
         _ => ResponseMatch::Unrelated,
     }
 }
@@ -131,14 +136,14 @@ impl ATTManager {
             Ok(Err(e)) => {
                 error!("L2CAP connect failed: {}", e);
                 return Err(e.into());
-            }
+            },
             Err(_) => {
                 error!("L2CAP connect timed out");
                 return Err(Error::from(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "Connection timeout",
                 )));
-            }
+            },
         };
 
         // Wait for connection to be fully established
@@ -146,7 +151,7 @@ impl ATTManager {
         loop {
             match seq_packet.peer_addr() {
                 Ok(peer) if peer.cid != 0 => break,
-                Ok(_) => {}
+                Ok(_) => {},
                 Err(e) => {
                     if e.raw_os_error() == Some(107) {
                         // ENOTCONN
@@ -154,7 +159,7 @@ impl ATTManager {
                         return Err(e.into());
                     }
                     error!("Error getting peer address: {}", e);
-                }
+                },
             }
             if start.elapsed() >= CONNECT_TIMEOUT {
                 error!("Timed out waiting for L2CAP connection to be fully established.");
@@ -262,13 +267,13 @@ impl ATTManager {
                         std::io::ErrorKind::UnexpectedEof,
                         "Response channel closed",
                     )));
-                }
+                },
                 Err(_) => {
                     return Err(Error::from(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "Response timeout",
                     )));
-                }
+                },
             };
             match match_response(request_opcode, &resp) {
                 ResponseMatch::Response(value) => return Ok(value.to_vec()),
@@ -277,10 +282,10 @@ impl ATTManager {
                         "ATT error {:#04x} for request {:#04x}",
                         code, request_opcode
                     ))));
-                }
+                },
                 ResponseMatch::Unrelated => {
                     debug!("Ignoring unrelated PDU: {}", hex::encode(&resp));
-                }
+                },
             }
         }
     }
@@ -293,7 +298,7 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
             Ok(0) => {
                 info!("Remote closed the connection.");
                 break;
-            }
+            },
             Ok(n) => {
                 let data = &buf[..n];
                 debug!("Received {} bytes: {}", n, hex::encode(data));
@@ -324,11 +329,11 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
                     // A response; request() matches it to what it sent.
                     let _ = manager.response_tx.send(data.to_vec());
                 }
-            }
+            },
             Err(e) => {
                 error!("read error: {}", e);
                 break;
-            }
+            },
         }
     }
     let mut state = manager.state.lock().await;
@@ -368,7 +373,13 @@ mod tests {
 
     #[test]
     fn error_response_for_the_request_is_an_error() {
-        let pdu = [OPCODE_ERROR_RESPONSE, OPCODE_WRITE_REQUEST, 0x02, 0x80, 0x03];
+        let pdu = [
+            OPCODE_ERROR_RESPONSE,
+            OPCODE_WRITE_REQUEST,
+            0x02,
+            0x80,
+            0x03,
+        ];
         assert_eq!(
             match_response(OPCODE_WRITE_REQUEST, &pdu),
             ResponseMatch::Error(0x03)

@@ -1,9 +1,12 @@
-use aes::Aes128;
-use aes::cipher::Array;
-use aes::cipher::{BlockCipherEncrypt, KeyInit};
-use iced::Theme;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use {
+    aes::{
+        Aes128,
+        cipher::{Array, BlockCipherEncrypt, KeyInit},
+    },
+    iced::Theme,
+    serde::{Deserialize, Serialize},
+    std::path::PathBuf,
+};
 
 pub fn get_devices_path() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
@@ -244,7 +247,7 @@ impl AppSettings {
                 if let Err(e) = write_atomic(&path, &json) {
                     tracing::error!("Failed to write app settings: {}", e);
                 }
-            }
+            },
             Err(e) => tracing::error!("Failed to serialize app settings: {}", e),
         }
     }

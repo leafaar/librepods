@@ -1,6 +1,8 @@
-use bluer::Adapter;
-use tracing::{debug, warn};
-use std::io::Error;
+use {
+    bluer::Adapter,
+    std::io::Error,
+    tracing::{debug, warn},
+};
 
 pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<bluer::Device> {
     let target_uuid = uuid::Uuid::parse_str("74ec2172-0bad-4d01-8f77-997b2be0722a").unwrap();
@@ -12,7 +14,7 @@ pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<b
             Err(e) => {
                 warn!("Skipping device {}: {}", addr, e);
                 continue;
-            }
+            },
         };
         if device.is_connected().await.unwrap_or(false)
             && let Ok(uuids) = device.uuids().await
@@ -41,7 +43,7 @@ pub async fn find_other_managed_devices(
             Err(e) => {
                 warn!("Skipping device {}: {}", addr, e);
                 continue;
-            }
+            },
         };
         let device_mac = device.address().to_string();
         let connected = device.is_connected().await.unwrap_or(false);

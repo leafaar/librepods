@@ -2,11 +2,11 @@
 //!   AOT 39, mono, 64000 Hz, 480-sample frame (7.5 ms), ~80 kbps VBR.
 //! See https://ffmpeg-d.dpldocs.info/v3.1.1/ffmpeg.libavcodec.avcodec.AVCodecContext.html
 
-use ffmpeg_sys_next as ff;
-use tracing::{info, warn};
-use std::os::raw::c_int;
-use std::ptr;
-use std::sync::Once;
+use {
+    ffmpeg_sys_next as ff,
+    std::{os::raw::c_int, ptr, sync::Once},
+    tracing::{info, warn},
+};
 
 pub const ELD_SAMPLE_RATE: u32 = 64000;
 pub const ELD_FRAME_SAMPLES: usize = 480;
@@ -175,13 +175,13 @@ impl EldDecoder {
                             out.push(f_to_s16(*plane.add(i)));
                         }
                     }
-                }
+                },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_FLT as c_int => {
                     let p = data[0] as *const f32;
                     for i in 0..total {
                         out.push(f_to_s16(*p.add(i)));
                     }
-                }
+                },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_S16P as c_int => {
                     for i in 0..ns {
                         for c in 0..nch {
@@ -189,13 +189,13 @@ impl EldDecoder {
                             out.push(*plane.add(i));
                         }
                     }
-                }
+                },
                 f if f == ff::AVSampleFormat::AV_SAMPLE_FMT_S16 as c_int => {
                     let p = data[0] as *const i16;
                     for i in 0..total {
                         out.push(*p.add(i));
                     }
-                }
+                },
                 _ => return None,
             }
             Some(total)
