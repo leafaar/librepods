@@ -18,6 +18,7 @@ use tokio::runtime::Runtime;
 // use crate::bluetooth::att::ATTManager;
 use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
 use crate::audio::mic_test;
+use crate::ui::equalizer::equalizer_section;
 use crate::ui::window::{Message, MicTest};
 
 pub fn airpods_view<'a>(
@@ -587,6 +588,7 @@ pub fn airpods_view<'a>(
         Space::new().height(Length::from(20)),
         audio_settings_col,
         Space::new().height(Length::from(20)),
+        equalizer_section(&mac, devices_list, state, &aacp_manager),
         off_listening_mode_toggle,
         Space::new().height(Length::from(20)),
         hires_mic_toggle,

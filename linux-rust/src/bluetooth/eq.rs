@@ -47,7 +47,7 @@ impl CustomEq {
     /// Opcode and body, to be sent with `AACPManager::send_custom_eq`, which
     /// adds the AACP header. Bands above `BAND_MAX` are clamped so the
     /// AirPods never see an out-of-range value.
-    pub fn to_packet(&self) -> [u8; PACKET_LEN] {
+    pub fn to_packet(self) -> [u8; PACKET_LEN] {
         [
             opcodes::CUSTOM_EQ,
             0x00,

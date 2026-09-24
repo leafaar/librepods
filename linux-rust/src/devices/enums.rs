@@ -1,6 +1,7 @@
 use crate::bluetooth::aacp::BatteryInfo;
 use crate::devices::airpods::AirPodsInformation;
 use crate::devices::nothing::NothingInformation;
+use crate::ui::equalizer::EqualizerState;
 use iced::widget::combo_box;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -60,6 +61,7 @@ pub struct AirPodsState {
     /// Local capture state of the proprietary hi-res microphone (UI-driven).
     pub hires_mic_enabled: bool,
     pub battery: Vec<BatteryInfo>,
+    pub custom_eq: EqualizerState,
 }
 
 #[derive(Clone, Debug)]

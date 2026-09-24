@@ -8,6 +8,7 @@ use crate::devices::enums::{
 };
 use crate::audio::{mic_test, output};
 use crate::ui::airpods::airpods_view;
+use crate::ui::equalizer::EqualizerState;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
 use crate::utils::{
@@ -527,6 +528,7 @@ impl App {
                                         matches!(status.value.as_slice(), [0x01])
                                     }),
                                     hires_mic_enabled: self.hires_mic_enabled,
+                                    custom_eq: EqualizerState::new(state.custom_eq.unwrap_or_default()),
                                 }));
                             }
                             Some(DeviceType::Nothing) => {
@@ -665,6 +667,13 @@ impl App {
                                 {
                                     state.battery = battery_info;
                                     debug!("Updated battery info for {}: {:?}", mac, state.battery);
+                                }
+                            }
+                            AACPEvent::CustomEq(custom_eq) => {
+                                if let Some(DeviceState::AirPods(state)) =
+                                    self.device_states.get_mut(&mac)
+                                {
+                                    state.custom_eq.eq = custom_eq;
                                 }
                             }
                             _ => {}
