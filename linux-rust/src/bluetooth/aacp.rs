@@ -1594,7 +1594,6 @@ pub(crate) mod testing {
         crate::devices::enums::DeviceData,
         std::{
             collections::HashMap,
-            io,
             sync::{Arc, Mutex},
         },
         tokio::sync::mpsc,

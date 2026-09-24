@@ -40,8 +40,8 @@ mod mic;
 pub(crate) use {
     equalizer::{EQ_SEND_DELAY, EqBand, EqEffect, EqInput},
     mic::{
-        MicCapture, MicEffect, MicInput, MicSample, MicTest, PlaybackView, PlayerCommand,
-        PlayerSample, RecorderSample, Recording,
+        MicCapture, MicEffect, MicInput, MicSample, PlaybackView, PlayerCommand, PlayerSample,
+        RecorderSample, Recording,
     },
 };
 

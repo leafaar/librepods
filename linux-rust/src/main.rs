@@ -550,14 +550,11 @@ fn spawn_shutdown_handler(device_managers: Managers, mut shutdown_rx: UnboundedR
 }
 
 /// Log to stderr through tracing. RUST_LOG overrides the defaults; libraries that
-/// use the `log` crate (bluer, iced, wgpu) are bridged into the same subscriber.
+/// use the `log` crate (bluer) are bridged into the same subscriber.
 fn init_tracing(debug: bool, le_debug: bool) {
     let level = if debug { "debug" } else { "info" };
     let le_level = if le_debug { "debug" } else { "info" };
-    let default_filter = format!(
-        "{level},zbus=warn,winit=warn,iced_wgpu=warn,wgpu_hal=warn,wgpu_core=warn,\
-         cosmic_text=warn,naga=warn,iced_winit=warn,librepods::bluetooth::le={le_level}"
-    );
+    let default_filter = format!("{level},zbus=warn,librepods::bluetooth::le={le_level}");
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     tracing_subscriber::fmt().with_env_filter(filter).init();

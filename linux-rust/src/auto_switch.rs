@@ -221,11 +221,6 @@ pub async fn run(adapter: Adapter, deps: AutoSwitchDeps) {
     }
 }
 
-/// AirPods recorded in the devices file.
-pub(crate) fn known_airpods() -> Vec<Address> {
-    known_airpods_in(&DevicesStore::default_location())
-}
-
 /// AirPods recorded in `devices`. An unreadable file gives none.
 fn known_airpods_in(devices: &DevicesStore) -> Vec<Address> {
     let devices = devices.load().unwrap_or_else(|e| {

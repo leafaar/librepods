@@ -1,12 +1,7 @@
 use {
-    crate::{
-        bluetooth::aacp::BatteryInfo,
-        devices::{airpods::AirPodsInformation, nothing::NothingInformation},
-        ui::equalizer::EqualizerState,
-    },
-    iced::widget::combo_box,
+    crate::devices::{airpods::AirPodsInformation, nothing::NothingInformation},
     serde::{Deserialize, Serialize},
-    std::{collections::HashMap, fmt::Display},
+    std::fmt::Display,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,42 +36,6 @@ pub struct DeviceData {
     pub name: String,
     pub type_: DeviceType,
     pub information: Option<DeviceInformation>,
-}
-
-#[derive(Clone, Debug)]
-pub enum DeviceState {
-    AirPods(AirPodsState),
-    Nothing(NothingState),
-}
-
-impl Display for DeviceState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviceState::AirPods(_) => write!(f, "AirPods State"),
-            DeviceState::Nothing(_) => write!(f, "Nothing State"),
-        }
-    }
-}
-
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent AirPods settings shown in the UI, not the states of one machine"
-)]
-#[derive(Clone, Debug)]
-pub struct AirPodsState {
-    pub device_name: String,
-    pub noise_control_mode: AirPodsNoiseControlMode,
-    pub noise_control_state: combo_box::State<AirPodsNoiseControlMode>,
-    pub conversation_awareness_enabled: bool,
-    pub personalized_volume_enabled: bool,
-    pub allow_off_mode: bool,
-    /// Local capture state of the proprietary hi-res microphone (UI-driven).
-    pub hires_mic_enabled: bool,
-    pub battery: Vec<BatteryInfo>,
-    /// Last known raw value per control command id, as reported by the AirPods or
-    /// last set from the settings page.
-    pub control_values: HashMap<u8, Vec<u8>>,
-    pub custom_eq: EqualizerState,
 }
 
 #[derive(Clone, Debug)]
@@ -120,12 +79,6 @@ impl AirPodsNoiseControlMode {
             AirPodsNoiseControlMode::Adaptive => 0x04,
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct NothingState {
-    pub anc_mode: NothingAncMode,
-    pub anc_mode_state: combo_box::State<NothingAncMode>,
 }
 
 #[derive(Clone, Debug)]
