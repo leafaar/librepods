@@ -34,6 +34,17 @@ use {
     tracing::{debug, error, warn},
 };
 
+mod equalizer;
+mod mic;
+
+pub(crate) use {
+    equalizer::{EQ_SEND_DELAY, EqBand, EqEffect, EqInput},
+    mic::{
+        MicCapture, MicEffect, MicInput, MicSample, MicTest, PlaybackView, PlayerCommand,
+        PlayerSample, RecorderSample, Recording,
+    },
+};
+
 /// Everything that can change the model, in the order it happened.
 #[derive(Debug)]
 pub(crate) enum Input {
@@ -65,6 +76,12 @@ pub(crate) enum Input {
     Setting(SettingChange),
     /// A message for the user, such as a command that failed.
     Toast(String),
+
+    // Hi-res microphone and equalizer sections.
+    Microphone(MicInput),
+    Equalizer(EqInput),
+    /// The main window was shown or hidden.
+    WindowVisible(bool),
 }
 
 /// Work for the app to do after an update.
@@ -108,6 +125,10 @@ pub(crate) enum Effect {
     ApplyTheme(ThemePreference),
     PresentWindow,
     Toast(String),
+
+    // Hi-res microphone and equalizer sections.
+    Microphone(MicEffect),
+    Equalizer(EqEffect),
 }
 
 /// What a connected device reported when the UI first saw it.
@@ -321,6 +342,10 @@ pub(crate) struct Model {
     theme: ThemePreference,
     /// Hint for the name field of the device being renamed.
     name_hint: Option<(String, NameHint)>,
+
+    // Hi-res microphone and equalizer sections.
+    mic: mic::MicState,
+    eq_sends: equalizer::EqSends,
 }
 
 impl Model {
@@ -337,6 +362,9 @@ impl Model {
             settings,
             theme,
             name_hint: None,
+
+            mic: mic::MicState::default(),
+            eq_sends: equalizer::EqSends::default(),
         };
         model.set_devices(devices);
         model
@@ -375,6 +403,9 @@ impl Model {
                 })
             },
             Input::SetConversationAwareness(mac, enabled) => {
+                if self.conversation_awareness_locked(&mac) {
+                    return Vec::new();
+                }
                 let Some(airpods) = self.airpods.get_mut(&mac) else {
                     return Vec::new();
                 };
@@ -408,6 +439,13 @@ impl Model {
             },
             Input::Setting(change) => self.change_setting(change),
             Input::Toast(message) => vec![Effect::Toast(message)],
+
+            Input::Microphone(input) => self.microphone(input),
+            Input::Equalizer(input) => self.equalizer(input),
+            Input::WindowVisible(visible) => {
+                self.set_window_visible(visible);
+                Vec::new()
+            },
         }
     }
 
@@ -434,12 +472,13 @@ impl Model {
                 debug!("Device disconnected: {}", mac);
                 self.connected.remove(&mac);
                 self.connects.disconnected(&mac);
-                self.airpods.remove(&mac);
+                let was_airpods = self.airpods.remove(&mac).is_some();
                 self.nothing.remove(&mac);
                 if self.name_hint.as_ref().is_some_and(|(m, _)| *m == mac) {
                     self.name_hint = None;
                 }
-                Vec::new()
+                self.eq_disconnected(&mac);
+                self.mic_disconnected(&mac, was_airpods)
             },
             BluetoothUIMessage::AACPUIEvent(mac, event) => {
                 self.aacp_event(&mac, event);
@@ -758,7 +797,7 @@ fn on_off(enabled: bool) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use {
         super::*,
         crate::{
@@ -767,7 +806,7 @@ mod tests {
         },
     };
 
-    const PODS: &str = "AA:BB:CC:DD:EE:01";
+    pub(super) const PODS: &str = "AA:BB:CC:DD:EE:01";
     const OTHER: &str = "AA:BB:CC:DD:EE:02";
     const EAR: &str = "AA:BB:CC:DD:EE:03";
 
@@ -779,7 +818,7 @@ mod tests {
         }
     }
 
-    fn model() -> Model {
+    pub(super) fn model() -> Model {
         let devices = HashMap::from([
             (PODS.to_string(), device("Pods", DeviceType::AirPods)),
             (OTHER.to_string(), device("Alpha Pods", DeviceType::AirPods)),
@@ -804,7 +843,7 @@ mod tests {
     }
 
     /// Connect PODS and deliver its snapshot.
-    fn connected(model: &mut Model, snapshot: AirPodsSnapshot) {
+    pub(super) fn connected(model: &mut Model, snapshot: AirPodsSnapshot) {
         let effects = model.update(Input::Backend(BluetoothUIMessage::DeviceConnected(
             PODS.to_string(),
         )));

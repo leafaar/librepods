@@ -35,6 +35,9 @@ use {
     tracing::{debug, error, warn},
 };
 
+mod equalizer;
+mod mic;
+
 /// How long to wait for DeviceConnected after the Bluetooth connect succeeded.
 const CONNECT_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -110,6 +113,10 @@ struct Controller {
     /// A devices.json read is running; a second request waits for it.
     devices_loading: Cell<bool>,
     devices_reload: Cell<bool>,
+
+    // Hi-res microphone and equalizer sections.
+    mic: RefCell<mic::MicDevices>,
+    eq_sender: equalizer::EqSender,
 }
 
 impl Controller {
@@ -122,6 +129,11 @@ impl Controller {
         window.root().set_hide_on_close(options.tray);
         let model = Model::new(startup.settings, startup.devices);
         apply_theme(model.theme());
+        let eq_sender = equalizer::spawn_eq_sender(
+            &startup.backend,
+            Arc::clone(&startup.device_managers),
+            dispatch.clone(),
+        );
         let controller = Rc::new(Controller {
             model: RefCell::new(model),
             window,
@@ -131,8 +143,19 @@ impl Controller {
             settings_writer: spawn_settings_writer(),
             devices_loading: Cell::new(false),
             devices_reload: Cell::new(false),
+            mic: RefCell::new(mic::MicDevices::default()),
+            eq_sender,
         });
         controller.window.render(&controller.model.borrow());
+        {
+            let dispatch = dispatch.clone();
+            controller
+                .window
+                .root()
+                .connect_visible_notify(move |window| {
+                    dispatch.send(Input::WindowVisible(window.is_visible()));
+                });
+        }
 
         let context = glib::MainContext::default();
         let mut ui_rx = startup.ui_rx;
@@ -154,6 +177,7 @@ impl Controller {
                 for effect in effects {
                     this.run(effect);
                 }
+                this.sync_mic_tick();
             }
         });
         controller
@@ -236,6 +260,9 @@ impl Controller {
             Effect::ApplyTheme(theme) => apply_theme(theme),
             Effect::PresentWindow => self.window.present(),
             Effect::Toast(text) => self.window.toast(&text),
+
+            Effect::Microphone(effect) => self.run_mic(effect),
+            Effect::Equalizer(effect) => self.run_equalizer(effect),
         }
     }
 
