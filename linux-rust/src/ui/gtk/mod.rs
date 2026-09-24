@@ -5,7 +5,9 @@
 //!
 //! - `model`: all state and decisions, no GTK. `Model::update(Input)` returns
 //!   `Effect`s. Unit tested.
-//! - `battery`, `theme`: toolkit-free display decisions the model uses.
+//! - `battery`: toolkit-free display decisions the model uses.
+//! - `controls`: the AirPods settings driven by control commands: what
+//!   shows, what a change sends, and holding slider values until they rest.
 //! - `app`: startup, the input loop and the effects (backend commands, file
 //!   I/O, timers).
 //! - `window`, `sidebar`, `pages/*`: widgets. Built once, then `render(&Model)`
@@ -32,13 +34,13 @@
 
 mod app;
 mod battery;
+mod controls;
 mod instance;
 mod model;
 mod pages;
 mod sidebar;
 #[cfg(test)]
 mod smoke;
-mod theme;
 mod widgets;
 mod window;
 

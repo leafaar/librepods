@@ -4,10 +4,9 @@ use {
     crate::{
         ui::gtk::{
             model::{Input, Model, SettingChange},
-            theme::ThemePreference,
             widgets::{Dispatch, Guarded, combo_row, switch_row},
         },
-        utils::PreferredCodec,
+        utils::{PreferredCodec, ThemePreference},
     },
     adw::prelude::*,
 };
@@ -38,7 +37,7 @@ impl SettingsPage {
             "Style",
             None,
             &ThemePreference::ALL,
-            |t| t.label().to_string(),
+            ToString::to_string,
             SettingChange::Theme,
         );
         let (tray_row, tray_text_mode) = switch(

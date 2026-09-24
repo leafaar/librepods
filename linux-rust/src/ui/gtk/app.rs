@@ -7,14 +7,14 @@ use {
         devices::enums::DeviceData,
         ui::{
             gtk::{
+                controls::SETTLE_DELAY,
                 model::{AirPodsSnapshot, DeviceSnapshot, Effect, Input, Model},
-                theme::ThemePreference,
                 widgets::Dispatch,
                 window::{APP_ID, Window},
             },
             messages::BluetoothUIMessage,
         },
-        utils::{AppSettings, get_devices_path, update_devices_file},
+        utils::{AppSettings, ThemePreference, get_devices_path, update_devices_file},
     },
     adw::prelude::*,
     gtk::{gio, glib},
@@ -236,6 +236,22 @@ impl Controller {
             Effect::ApplyTheme(theme) => apply_theme(theme),
             Effect::PresentWindow => self.window.present(),
             Effect::Toast(text) => self.window.toast(&text),
+            // AirPods settings sections (controls.rs).
+            Effect::SettleControl {
+                mac,
+                identifier,
+                generation,
+            } => {
+                let dispatch = self.dispatch.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    glib::timeout_future(SETTLE_DELAY).await;
+                    dispatch.send(Input::ControlSettled {
+                        mac,
+                        identifier,
+                        generation,
+                    });
+                });
+            },
         }
     }
 

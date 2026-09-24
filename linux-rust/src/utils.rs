@@ -4,7 +4,6 @@ use {
         Aes128,
         cipher::{Array, BlockCipherEncrypt, KeyInit},
     },
-    iced::Theme,
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
@@ -167,57 +166,69 @@ pub fn ah(k: &[u8; 16], r: [u8; 3]) -> [u8; 3] {
     hash
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum MyTheme {
+/// Light or dark appearance. System follows the desktop preference, so a
+/// fresh install matches GNOME's light or dark setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum ThemePreference {
+    #[default]
+    System,
     Light,
     Dark,
-    Dracula,
-    Nord,
-    SolarizedLight,
-    SolarizedDark,
-    GruvboxLight,
-    GruvboxDark,
-    CatppuccinLatte,
-    CatppuccinFrappe,
-    CatppuccinMacchiato,
-    CatppuccinMocha,
-    TokyoNight,
-    TokyoNightStorm,
-    TokyoNightLight,
-    KanagawaWave,
-    KanagawaDragon,
-    KanagawaLotus,
-    Moonfly,
-    Nightfly,
-    Oxocarbon,
-    Ferra,
 }
 
-impl std::fmt::Display for MyTheme {
+/// Names from the old theme list that read as Light, besides those
+/// containing "Light".
+const LIGHT_THEME_NAMES: [&str; 2] = ["CatppuccinLatte", "KanagawaLotus"];
+
+/// Names from the old theme list that read as Dark, besides those containing
+/// "Dark".
+const DARK_THEME_NAMES: [&str; 13] = [
+    "Dracula",
+    "Nord",
+    "CatppuccinFrappe",
+    "CatppuccinMacchiato",
+    "CatppuccinMocha",
+    "TokyoNight",
+    "TokyoNightStorm",
+    "KanagawaWave",
+    "KanagawaDragon",
+    "Moonfly",
+    "Nightfly",
+    "Oxocarbon",
+    "Ferra",
+];
+
+impl ThemePreference {
+    /// Options in the order the settings pages list them.
+    pub const ALL: [ThemePreference; 3] = [Self::System, Self::Light, Self::Dark];
+
+    /// Reads a stored name leniently. Settings files written before this type
+    /// hold a name from the old theme list: light variants read as Light, dark
+    /// ones as Dark. Any other name, including one from a newer version, reads
+    /// as System instead of failing the whole settings file.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "System" => Self::System,
+            _ if name.contains("Light") || LIGHT_THEME_NAMES.contains(&name) => Self::Light,
+            _ if name.contains("Dark") || DARK_THEME_NAMES.contains(&name) => Self::Dark,
+            _ => Self::System,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThemePreference {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(Self::from_name(&name))
+    }
+}
+
+impl std::fmt::Display for ThemePreference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
-            Self::Dracula => "Dracula",
-            Self::Nord => "Nord",
-            Self::SolarizedLight => "Solarized Light",
-            Self::SolarizedDark => "Solarized Dark",
-            Self::GruvboxLight => "Gruvbox Light",
-            Self::GruvboxDark => "Gruvbox Dark",
-            Self::CatppuccinLatte => "Catppuccin Latte",
-            Self::CatppuccinFrappe => "Catppuccin Frappé",
-            Self::CatppuccinMacchiato => "Catppuccin Macchiato",
-            Self::CatppuccinMocha => "Catppuccin Mocha",
-            Self::TokyoNight => "Tokyo Night",
-            Self::TokyoNightStorm => "Tokyo Night Storm",
-            Self::TokyoNightLight => "Tokyo Night Light",
-            Self::KanagawaWave => "Kanagawa Wave",
-            Self::KanagawaDragon => "Kanagawa Dragon",
-            Self::KanagawaLotus => "Kanagawa Lotus",
-            Self::Moonfly => "Moonfly",
-            Self::Nightfly => "Nightfly",
-            Self::Oxocarbon => "Oxocarbon",
-            Self::Ferra => "Ferra",
         })
     }
 }
@@ -228,7 +239,7 @@ impl std::fmt::Display for MyTheme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    pub theme: MyTheme,
+    pub theme: ThemePreference,
     pub tray_text_mode: bool,
     pub stem_control: bool,
     pub hires_mic_enabled: bool,
@@ -245,7 +256,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            theme: MyTheme::Dark,
+            theme: ThemePreference::System,
             tray_text_mode: false,
             stem_control: false,
             hires_mic_enabled: true,
@@ -304,35 +315,6 @@ impl SettingsStore {
             err,
         })?;
         write_atomic(&self.path, &json)
-    }
-}
-
-impl From<MyTheme> for Theme {
-    fn from(my_theme: MyTheme) -> Self {
-        match my_theme {
-            MyTheme::Light => Theme::Light,
-            MyTheme::Dark => Theme::Dark,
-            MyTheme::Dracula => Theme::Dracula,
-            MyTheme::Nord => Theme::Nord,
-            MyTheme::SolarizedLight => Theme::SolarizedLight,
-            MyTheme::SolarizedDark => Theme::SolarizedDark,
-            MyTheme::GruvboxLight => Theme::GruvboxLight,
-            MyTheme::GruvboxDark => Theme::GruvboxDark,
-            MyTheme::CatppuccinLatte => Theme::CatppuccinLatte,
-            MyTheme::CatppuccinFrappe => Theme::CatppuccinFrappe,
-            MyTheme::CatppuccinMacchiato => Theme::CatppuccinMacchiato,
-            MyTheme::CatppuccinMocha => Theme::CatppuccinMocha,
-            MyTheme::TokyoNight => Theme::TokyoNight,
-            MyTheme::TokyoNightStorm => Theme::TokyoNightStorm,
-            MyTheme::TokyoNightLight => Theme::TokyoNightLight,
-            MyTheme::KanagawaWave => Theme::KanagawaWave,
-            MyTheme::KanagawaDragon => Theme::KanagawaDragon,
-            MyTheme::KanagawaLotus => Theme::KanagawaLotus,
-            MyTheme::Moonfly => Theme::Moonfly,
-            MyTheme::Nightfly => Theme::Nightfly,
-            MyTheme::Oxocarbon => Theme::Oxocarbon,
-            MyTheme::Ferra => Theme::Ferra,
-        }
     }
 }
 
@@ -545,7 +527,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = SettingsStore::new(dir.path().join("cfg").join("app_settings.json"));
         let settings = AppSettings {
-            theme: MyTheme::Nord,
+            theme: ThemePreference::Light,
             hires_mic_agc: false,
             preferred_codec: PreferredCodec::SbcXq,
             ..AppSettings::default()
@@ -554,7 +536,7 @@ mod tests {
         store.save(&settings).unwrap();
         let loaded = store.load().unwrap();
 
-        assert_eq!(loaded.theme, MyTheme::Nord);
+        assert_eq!(loaded.theme, ThemePreference::Light);
         assert!(!loaded.hires_mic_agc);
         assert_eq!(loaded.preferred_codec, PreferredCodec::SbcXq);
     }
@@ -567,10 +549,77 @@ mod tests {
 
         let settings = SettingsStore::new(path).load().unwrap();
 
-        assert_eq!(settings.theme, MyTheme::Nord);
+        assert_eq!(settings.theme, ThemePreference::Dark);
         assert!(!settings.a2dp_reset);
         assert!(settings.hires_mic_enabled);
         assert_eq!(settings.preferred_codec, PreferredCodec::Aac);
+    }
+
+    #[test]
+    fn fresh_settings_follow_the_system_theme() {
+        assert_eq!(AppSettings::default().theme, ThemePreference::System);
+    }
+
+    #[track_caller]
+    fn stored_theme(name: &str) -> ThemePreference {
+        let json = format!(r#"{{"theme":"{name}","tray_text_mode":true}}"#);
+        let settings: AppSettings = serde_json::from_str(&json).unwrap();
+        // The rest of the file still loads.
+        assert!(settings.tray_text_mode, "{name}");
+        settings.theme
+    }
+
+    #[test]
+    fn old_theme_names_map_to_light_or_dark() {
+        for name in [
+            "Light",
+            "SolarizedLight",
+            "GruvboxLight",
+            "TokyoNightLight",
+            "CatppuccinLatte",
+            "KanagawaLotus",
+        ] {
+            assert_eq!(stored_theme(name), ThemePreference::Light, "{name}");
+        }
+        for name in [
+            "Dark",
+            "SolarizedDark",
+            "GruvboxDark",
+            "Dracula",
+            "Nord",
+            "CatppuccinFrappe",
+            "CatppuccinMacchiato",
+            "CatppuccinMocha",
+            "TokyoNight",
+            "TokyoNightStorm",
+            "KanagawaWave",
+            "KanagawaDragon",
+            "Moonfly",
+            "Nightfly",
+            "Oxocarbon",
+            "Ferra",
+        ] {
+            assert_eq!(stored_theme(name), ThemePreference::Dark, "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_theme_names_follow_the_system() {
+        for name in ["System", "HighContrast", "light", ""] {
+            assert_eq!(stored_theme(name), ThemePreference::System, "{name}");
+        }
+    }
+
+    #[test]
+    fn theme_preference_round_trips() {
+        for theme in ThemePreference::ALL {
+            let json = serde_json::to_string(&theme).unwrap();
+            assert_eq!(json, format!("\"{theme}\""));
+            assert_eq!(
+                serde_json::from_str::<ThemePreference>(&json).unwrap(),
+                theme
+            );
+        }
     }
 
     #[test]

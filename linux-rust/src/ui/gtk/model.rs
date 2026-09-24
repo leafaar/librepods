@@ -23,11 +23,11 @@ use {
             format::{live_case_level, validate_device_name},
             gtk::{
                 battery::{Batteries, batteries},
-                theme::ThemePreference,
+                controls::{self, ControlChange, Settling},
             },
             messages::BluetoothUIMessage,
         },
-        utils::{AppSettings, PreferredCodec},
+        utils::{AppSettings, PreferredCodec, ThemePreference},
     },
     bluer::Address,
     std::collections::{HashMap, HashSet},
@@ -65,6 +65,16 @@ pub(crate) enum Input {
     Setting(SettingChange),
     /// A message for the user, such as a command that failed.
     Toast(String),
+    // AirPods settings sections (controls.rs).
+    /// A change in the press and hold, calls, microphone, accessibility,
+    /// Adaptive Audio or sleep settings.
+    AirPodsControl(String, ControlChange),
+    /// The settle delay of a slider change ran out.
+    ControlSettled {
+        mac: String,
+        identifier: ControlCommandIdentifiers,
+        generation: u64,
+    },
 }
 
 /// Work for the app to do after an update.
@@ -108,6 +118,13 @@ pub(crate) enum Effect {
     ApplyTheme(ThemePreference),
     PresentWindow,
     Toast(String),
+    // AirPods settings sections (controls.rs).
+    /// Come back with `Input::ControlSettled` after controls::SETTLE_DELAY.
+    SettleControl {
+        mac: String,
+        identifier: ControlCommandIdentifiers,
+        generation: u64,
+    },
 }
 
 /// What a connected device reported when the UI first saw it.
@@ -318,14 +335,14 @@ pub(crate) struct Model {
     connects: ConnectRequests,
     selection: Selection,
     settings: AppSettings,
-    theme: ThemePreference,
     /// Hint for the name field of the device being renamed.
     name_hint: Option<(String, NameHint)>,
+    /// Slider values of the AirPods settings waiting to be sent.
+    settling: Settling,
 }
 
 impl Model {
     pub(crate) fn new(settings: AppSettings, devices: HashMap<String, DeviceData>) -> Self {
-        let theme = ThemePreference::from_stored(settings.theme);
         let mut model = Model {
             devices: HashMap::new(),
             connected: HashSet::new(),
@@ -335,8 +352,8 @@ impl Model {
             connects: ConnectRequests::default(),
             selection: Selection::None,
             settings,
-            theme,
             name_hint: None,
+            settling: Settling::default(),
         };
         model.set_devices(devices);
         model
@@ -408,6 +425,19 @@ impl Model {
             },
             Input::Setting(change) => self.change_setting(change),
             Input::Toast(message) => vec![Effect::Toast(message)],
+            // AirPods settings sections (controls.rs).
+            Input::AirPodsControl(mac, change) => match self.airpods.get_mut(&mac) {
+                Some(airpods) => controls::apply(mac, airpods, &mut self.settling, change),
+                None => Vec::new(),
+            },
+            Input::ControlSettled {
+                mac,
+                identifier,
+                generation,
+            } => {
+                let connected = self.airpods.contains_key(&mac);
+                controls::settled(mac, connected, &mut self.settling, identifier, generation)
+            },
         }
     }
 
@@ -609,8 +639,7 @@ impl Model {
         let mut effects = Vec::with_capacity(2);
         match change {
             SettingChange::Theme(theme) => {
-                self.theme = theme;
-                settings.theme = theme.to_stored();
+                settings.theme = theme;
                 effects.push(Effect::ApplyTheme(theme));
             },
             SettingChange::TrayTextMode(on) => settings.tray_text_mode = on,
@@ -656,7 +685,7 @@ impl Model {
     }
 
     pub(crate) fn theme(&self) -> ThemePreference {
-        self.theme
+        self.settings.theme
     }
 
     pub(crate) fn airpods(&self, mac: &str) -> Option<&AirPods> {
@@ -1276,21 +1305,16 @@ mod tests {
         assert_eq!(effects, [Effect::SaveSettings]);
         assert!(model.settings().tray_text_mode);
 
-        let effects = model.update(Input::Setting(SettingChange::Theme(
-            ThemePreference::System,
-        )));
+        let effects = model.update(Input::Setting(SettingChange::Theme(ThemePreference::Dark)));
         assert_eq!(
             effects,
             [
-                Effect::ApplyTheme(ThemePreference::System),
+                Effect::ApplyTheme(ThemePreference::Dark),
                 Effect::SaveSettings
             ]
         );
-        assert_eq!(
-            ThemePreference::from_stored(model.settings().theme),
-            ThemePreference::System
-        );
-        assert_eq!(model.theme(), ThemePreference::System);
+        assert_eq!(model.settings().theme, ThemePreference::Dark);
+        assert_eq!(model.theme(), ThemePreference::Dark);
     }
 
     #[test]
