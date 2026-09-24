@@ -17,7 +17,11 @@ use {
         ui::{
             gtk::{
                 controls::{Bud, ControlChange},
-                model::{AirPodsSnapshot, DeviceSnapshot, Input, Model, Selection, SettingChange},
+                model::{
+                    AirPodsSnapshot, DeviceSnapshot, EqBand, EqInput, Input, MicCapture, MicInput,
+                    MicSample, Model, PlayerSample, RecorderSample, Recording, Selection,
+                    SettingChange,
+                },
                 widgets::Dispatch,
                 window::Window,
             },
@@ -27,7 +31,7 @@ use {
     },
     adw::prelude::*,
     gtk::gio,
-    std::collections::HashMap,
+    std::{collections::HashMap, time::Duration},
 };
 
 #[test]
@@ -83,6 +87,12 @@ fn render_builds_widgets_and_sends_nothing() {
     step(&mut model, battery(&mac, 0, BatteryStatus::Disconnected));
     step(&mut model, Input::SetAllowOff(mac.clone(), true));
     render_settings_sections(&mut model, &mac, &step);
+    for input in equalizer_steps(&mac) {
+        step(&mut model, input);
+    }
+    for input in microphone_steps(&mac) {
+        step(&mut model, input);
+    }
     step(&mut model, Input::NameEdited(mac.clone(), String::new()));
     step(
         &mut model,
@@ -148,6 +158,90 @@ fn render_settings_sections(model: &mut Model, mac: &str, step: &impl Fn(&mut Mo
     ] {
         step(model, Input::AirPodsControl(mac.to_string(), change));
     }
+}
+
+/// Custom EQ on, bands moved, reset and off.
+fn equalizer_steps(mac: &str) -> Vec<Input> {
+    let eq = |input| Input::Equalizer(input);
+    vec![
+        eq(EqInput::SetEnabled(mac.to_string(), true)),
+        eq(EqInput::SetBand(mac.to_string(), EqBand::Low, 80)),
+        eq(EqInput::SetBand(mac.to_string(), EqBand::High, 0)),
+        eq(EqInput::SendDue {
+            mac: mac.to_string(),
+            generation: 3,
+        }),
+        eq(EqInput::Reset(mac.to_string())),
+        eq(EqInput::SetEnabled(mac.to_string(), false)),
+    ]
+}
+
+/// An app capturing, then a microphone test through every phase, a failed
+/// take, and the hi-res microphone turned off and on.
+fn microphone_steps(mac: &str) -> Vec<Input> {
+    let mic = |input| Input::Microphone(input);
+    let tick = |sample| mic(MicInput::Tick(sample));
+    let capture = |active, level, app: Option<&str>| MicSample {
+        capture: Some(vec![(
+            mac.to_string(),
+            MicCapture {
+                active,
+                level,
+                app: app.map(str::to_string),
+            },
+        )]),
+        ..MicSample::default()
+    };
+    let recorder = |secs| MicSample {
+        recorder: Some(RecorderSample {
+            elapsed: Duration::from_secs(secs),
+            finished: false,
+        }),
+        ..MicSample::default()
+    };
+    let player = |position, playing, error: Option<&str>| MicSample {
+        player: Some(PlayerSample {
+            position: Duration::from_millis(position),
+            duration: Duration::from_secs(12),
+            playing,
+            error: error.map(str::to_string),
+        }),
+        ..MicSample::default()
+    };
+    vec![
+        Input::WindowVisible(true),
+        tick(capture(true, 0.4, Some("Zoom"))),
+        tick(capture(true, 0.95, None)),
+        Input::SetConversationAwareness(mac.to_string(), true),
+        tick(capture(false, 0.0, None)),
+        mic(MicInput::Record),
+        mic(MicInput::MediaPaused(vec![
+            "org.mpris.MediaPlayer2.test".into(),
+        ])),
+        tick(recorder(3)),
+        tick(recorder(64)),
+        mic(MicInput::Stop),
+        mic(MicInput::Recorded {
+            take: 1,
+            result: Ok(Recording(vec![0; 4])),
+        }),
+        tick(player(0, false, None)),
+        mic(MicInput::Play),
+        tick(player(2500, true, None)),
+        mic(MicInput::Skip { forward: true }),
+        mic(MicInput::Seek(Duration::from_secs(11))),
+        mic(MicInput::Pause),
+        tick(player(11_000, false, Some("Could not play the recording"))),
+        mic(MicInput::Record),
+        mic(MicInput::Stop),
+        mic(MicInput::Recorded {
+            take: 2,
+            result: Err("No sound was recorded".into()),
+        }),
+        mic(MicInput::Done),
+        mic(MicInput::SetHiRes(mac.to_string(), false)),
+        mic(MicInput::SetHiRes(mac.to_string(), true)),
+    ]
 }
 
 /// A battery report with a charging left bud and the given case entry.
