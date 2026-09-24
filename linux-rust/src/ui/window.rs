@@ -23,7 +23,7 @@ use iced::{
     Background, Border, Center, Element, Font, Length, Padding, Program, Settings, Size,
     Subscription, Task, Theme, daemon, window,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +87,20 @@ pub struct App {
     hires_mic_agc: bool,
     hires_mic_pause_convo: bool,
     a2dp_reset: bool,
+}
+
+// The icon is embedded: a path is resolved against the working directory, which
+// is wherever the app was launched from. The application id becomes the X11
+// WM_CLASS / Wayland app_id, which GNOME matches against the .desktop file name
+// to show the right icon in the dock and the alt-tab switcher.
+fn main_window_settings() -> window::Settings {
+    let mut settings = window::Settings::default();
+    settings.min_size = Some(Size::new(400.0, 300.0));
+    settings.icon = window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None)
+        .map_err(|e| warn!("Failed to load window icon: {}", e))
+        .ok();
+    settings.platform_specific.application_id = "me.kavishdevar.librepods".to_string();
+    settings
 }
 
 pub struct BluetoothState {
@@ -154,10 +168,7 @@ impl App {
         let (window, open_task) = if start_minimized {
             (None, Task::none())
         } else {
-            let mut settings = window::Settings::default();
-            settings.min_size = Some(Size::new(400.0, 300.0));
-            settings.icon = window::icon::from_file("../../assets/icon.png").ok();
-            let (id, open) = window::open(settings);
+            let (id, open) = window::open(main_window_settings());
             (Some(id), open.map(Message::WindowOpened))
         };
 
@@ -287,10 +298,7 @@ impl App {
                         if let Some(window_id) = self.window {
                             Task::batch(vec![window::gain_focus(window_id), wait_task])
                         } else {
-                            let mut settings = window::Settings::default();
-                            settings.min_size = Some(Size::new(400.0, 300.0));
-                            settings.icon = window::icon::from_file("../../assets/icon.png").ok();
-                            let (new_window_task, open_task) = window::open(settings);
+                            let (new_window_task, open_task) = window::open(main_window_settings());
                             self.window = Some(new_window_task);
                             Task::batch(vec![open_task.map(Message::WindowOpened), wait_task])
                         }
