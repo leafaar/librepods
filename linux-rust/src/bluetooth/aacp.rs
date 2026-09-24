@@ -443,7 +443,7 @@ impl AACPManager {
             )
             .await
         {
-            warn!("[hires] failed to set conversation detection: {}", e);
+            warn!("[aacp] failed to set conversation detection: {}", e);
             return;
         }
         // AirPods don't echo this back, so record it in our own status list
@@ -679,25 +679,19 @@ impl AACPManager {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     ) {
         let mut state = self.state.lock().await;
-        state
-            .control_command_subscribers
-            .entry(identifier)
-            .or_default()
-            .push(tx);
         // send initial value if available
         if let Some(status) = state
             .control_command_status_list
             .iter()
             .find(|s| s.identifier == identifier)
         {
-            let _ = state
-                .control_command_subscribers
-                .get(&identifier)
-                .unwrap()
-                .last()
-                .unwrap()
-                .send(status.value.clone());
+            let _ = tx.send(status.value.clone());
         }
+        state
+            .control_command_subscribers
+            .entry(identifier)
+            .or_default()
+            .push(tx);
     }
 
     pub async fn receive_packet(&self, packet: &[u8]) {
@@ -1186,15 +1180,7 @@ impl AACPManager {
     }
 
     pub async fn send_rename_packet(&self, name: &str) -> Result<()> {
-        let name_bytes = name.as_bytes();
-        let size = name_bytes.len();
-        let mut packet = Vec::with_capacity(6 + size);
-        packet.push(opcodes::RENAME);
-        packet.push(0x00);
-        packet.push(0x01);
-        packet.push(size as u8);
-        packet.push(0x00);
-        packet.extend_from_slice(name_bytes);
+        let packet = rename_payload(name)?;
         self.send_data_packet(&packet).await
     }
 
@@ -1219,11 +1205,7 @@ impl AACPManager {
     ) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(112);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
 
         buffer.extend_from_slice(&[0x68, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
@@ -1254,11 +1236,7 @@ impl AACPManager {
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(106);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x62, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5]);
         buffer.push(0x4A);
@@ -1293,11 +1271,7 @@ impl AACPManager {
     ) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(138);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x82, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
         buffer.extend_from_slice(b"PlayingApp");
@@ -1329,11 +1303,7 @@ impl AACPManager {
     pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(134);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x7E, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
         buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
@@ -1365,11 +1335,7 @@ impl AACPManager {
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(97);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x59, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE3]);
         buffer.push(0x5F);
@@ -1398,11 +1364,7 @@ impl AACPManager {
     ) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(86);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x4E, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5]);
         buffer.extend_from_slice(&[0x48, 0x69]);
@@ -1521,4 +1483,78 @@ async fn save_device(mac: String, data: DeviceData) {
 
 fn connect_error(kind: std::io::ErrorKind, msg: &str) -> Error {
     Error::from(std::io::Error::new(kind, msg))
+}
+
+fn invalid_input(msg: String) -> Error {
+    Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+}
+
+/// A colon-separated MAC address as the 6 bytes AACP sends, least significant
+/// byte first.
+fn mac_to_wire(mac: &str) -> Result<[u8; 6]> {
+    let addr: Address = mac
+        .parse()
+        .map_err(|_| invalid_input(format!("invalid MAC address: {mac:?}")))?;
+    let mut bytes = addr.0;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+/// Rename payload: opcode, 0x00, 0x01, name length (one byte), 0x00, name.
+fn rename_payload(name: &str) -> Result<Vec<u8>> {
+    let name_bytes = name.as_bytes();
+    let size = u8::try_from(name_bytes.len()).map_err(|_| {
+        invalid_input(format!(
+            "name is {} bytes long, at most 255 fit in the rename packet",
+            name_bytes.len()
+        ))
+    })?;
+    let mut packet = Vec::with_capacity(5 + name_bytes.len());
+    packet.extend_from_slice(&[opcodes::RENAME, 0x00, 0x01, size, 0x00]);
+    packet.extend_from_slice(name_bytes);
+    Ok(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_to_wire_reverses_the_bytes() {
+        assert_eq!(
+            mac_to_wire("AA:BB:CC:DD:EE:0f").unwrap(),
+            [0x0F, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]
+        );
+    }
+
+    #[test]
+    fn mac_to_wire_rejects_malformed_addresses() {
+        for mac in [
+            "",
+            "AA:BB:CC:DD:EE",
+            "AA:BB:CC:DD:EE:FF:00",
+            "AA:BB:CC:DD:EE:GG",
+            "AABBCCDDEEFF",
+            "AA:BB:CC:DD:EE:FFF",
+        ] {
+            assert!(mac_to_wire(mac).is_err(), "accepted {mac:?}");
+        }
+    }
+
+    #[test]
+    fn rename_payload_carries_the_name_length() {
+        assert_eq!(
+            rename_payload("Pods").unwrap(),
+            [opcodes::RENAME, 0x00, 0x01, 0x04, 0x00, b'P', b'o', b'd', b's']
+        );
+        let longest = "a".repeat(255);
+        assert_eq!(rename_payload(&longest).unwrap()[3], 255);
+    }
+
+    #[test]
+    fn rename_payload_rejects_names_over_255_bytes() {
+        assert!(rename_payload(&"a".repeat(256)).is_err());
+        // 128 two-byte characters: 128 chars but 256 bytes.
+        assert!(rename_payload(&"é".repeat(128)).is_err());
+    }
 }
