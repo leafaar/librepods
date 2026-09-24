@@ -12,9 +12,7 @@ use iced::{Background, Border, Center, Color, Length, Padding, Theme};
 use log::error;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 // use crate::bluetooth::att::ATTManager;
 use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
 use crate::audio::mic_test;
@@ -117,7 +115,7 @@ pub fn airpods_view<'a>(
                         move |selected_mode| {
                             let aacp_manager = aacp_manager.clone();
                             let selected_mode_c = selected_mode.clone();
-                            run_async_in_thread(async move {
+                            aacp_manager.runtime().clone().spawn(async move {
                                 aacp_manager
                                     .send_control_command(
                                         ControlCommandIdentifiers::ListeningMode,
@@ -227,7 +225,7 @@ pub fn airpods_view<'a>(
                                 move |is_enabled| {
                                     let aacp_manager = aacp_manager_pv.clone();
                                     let mac = mac.clone();
-                                    run_async_in_thread(
+                                    aacp_manager.runtime().clone().spawn(
                                         async move {
                                             aacp_manager.send_control_command(
                                                 ControlCommandIdentifiers::AdaptiveVolumeConfig,
@@ -281,7 +279,7 @@ pub fn airpods_view<'a>(
                             } else {
                                 convo_toggler.on_toggle(move |is_enabled| {
                                     let aacp_manager = aacp_manager_conv_detect.clone();
-                                    run_async_in_thread(
+                                    aacp_manager.runtime().clone().spawn(
                                         async move {
                                             aacp_manager.set_conversation_detection(is_enabled).await;
                                         }
@@ -335,7 +333,7 @@ pub fn airpods_view<'a>(
             toggler(state.allow_off_mode)
                 .on_toggle(move |is_enabled| {
                     let aacp_manager = aacp_manager_olm.clone();
-                    run_async_in_thread(
+                    aacp_manager.runtime().clone().spawn(
                         async move {
                             aacp_manager.send_control_command(
                                 ControlCommandIdentifiers::AllowOffOption,
@@ -395,7 +393,7 @@ pub fn airpods_view<'a>(
             toggler(state.hires_mic_enabled)
                 .on_toggle(move |is_enabled| {
                     let aacp_manager = aacp_manager_mic.clone();
-                    run_async_in_thread(async move {
+                    aacp_manager.runtime().clone().spawn(async move {
                         aacp_manager.set_hires_mic_enabled(is_enabled).await;
                     });
                     let mut state = state.clone();
@@ -759,16 +757,6 @@ fn level_meter<'a>(level: f32, app: Option<String>) -> iced::widget::Container<'
         bottom: 6.0,
         ..Padding::ZERO
     })
-}
-
-fn run_async_in_thread<F>(fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(fut);
-    });
 }
 
 #[cfg(test)]

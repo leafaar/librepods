@@ -2,6 +2,7 @@ use crate::bluetooth::aacp::{
     AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
     ControlCommandIdentifiers,
 };
+use crate::bluetooth::att::ATTHandles;
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
     AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
@@ -228,6 +229,7 @@ pub enum Message {
     /// The backend dropped its UI sender. Not re-armed: waiting again would
     /// return at once and spin.
     UiChannelClosed,
+    NothingAncModeSelected(String, NothingAncMode),
     RenameInput(String, String),
     RenameSubmit(String),
     DevicesChanged,
@@ -392,6 +394,7 @@ impl App {
                 Task::none()
             }
             Message::RenameSubmit(mac) => self.rename(mac),
+            Message::NothingAncModeSelected(mac, mode) => self.set_nothing_anc_mode(mac, mode),
             Message::DevicesChanged => {
                 self.devices = load_devices();
                 Task::none()
@@ -975,6 +978,46 @@ impl App {
             .and_then(|m| m.get_aacp())
     }
 
+    fn set_nothing_anc_mode(&mut self, mac: String, mode: NothingAncMode) -> Task<Message> {
+        let Some(DeviceState::Nothing(state)) = self.device_states.get_mut(&mac) else {
+            return Task::none();
+        };
+        state.anc_mode = mode.clone();
+        let att = self
+            .device_managers
+            .blocking_read()
+            .get(&mac)
+            .and_then(|m| m.get_att());
+        let Some(att) = att else {
+            error!("Cannot set noise control mode on {}, no ATT manager", mac);
+            return Task::none();
+        };
+        let packet = [
+            0x55,
+            0x60,
+            0x01,
+            0x0F,
+            0xF0,
+            0x03,
+            0x00,
+            0x00,
+            0x01,
+            mode.to_byte(),
+            0x00,
+            0x00,
+            0x00,
+        ];
+        Task::future(async move {
+            if let Err(e) = att.write(ATTHandles::NothingEverything, &packet).await {
+                error!(
+                    "Failed to set noise cancellation mode for device {}: {}",
+                    mac, e
+                );
+            }
+        })
+        .discard()
+    }
+
     /// Send the drafted name to the AirPods and save it to devices.json. An
     /// invalid draft stays in the field with its hint shown.
     fn rename(&mut self, mac: String) -> Task<Message> {
@@ -1289,8 +1332,8 @@ impl App {
                                     Some(DeviceType::Nothing) => {
                                         if let Some(DeviceState::Nothing(state)) = device_state {
                                             if let Some(device_managers) = device_managers.get(id) {
-                                                if let Some(att_manager) = device_managers.get_att() {
-                                                    nothing_view(id, devices_list, state, att_manager.clone())
+                                                if device_managers.get_att().is_some() {
+                                                    nothing_view(id, devices_list, state)
                                                 } else {
                                                     error!("No ATT manager found for Nothing device {}", id);
                                                     container(

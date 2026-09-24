@@ -1,5 +1,4 @@
-use crate::bluetooth::att::{ATTHandles, ATTManager};
-use crate::devices::enums::{DeviceData, DeviceInformation, DeviceState, NothingState};
+use crate::devices::enums::{DeviceData, DeviceInformation, NothingState};
 use crate::ui::window::Message;
 use iced::border::Radius;
 use iced::overlay::menu;
@@ -8,15 +7,11 @@ use iced::widget::text_input;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Background, Border, Length, Theme};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::thread;
-use tokio::runtime::Runtime;
 
 pub fn nothing_view<'a>(
     mac: &'a str,
     devices_list: &HashMap<String, DeviceData>,
     state: &'a NothingState,
-    att_manager: Arc<ATTManager>,
 ) -> iced::widget::Container<'a, Message> {
     let mut information_col = iced::widget::column![];
     let mac = mac.to_string();
@@ -59,52 +54,12 @@ pub fn nothing_view<'a>(
             }),
             Space::new().width(Length::Fill),
             {
-                let state_clone = state.clone();
                 let mac = mac.clone();
-                let att_manager_clone = att_manager.clone();
                 combo_box(
                     &state.anc_mode_state,
                     "Select Noise Control Mode",
                     Some(&state.anc_mode.clone()),
-                    {
-                        move |selected_mode| {
-                            let att_manager = att_manager_clone.clone();
-                            let selected_mode_c = selected_mode.clone();
-                            let mac_s = mac.clone();
-                            run_async_in_thread(async move {
-                                if let Err(e) = att_manager
-                                    .write(
-                                        ATTHandles::NothingEverything,
-                                        &[
-                                            0x55,
-                                            0x60,
-                                            0x01,
-                                            0x0F,
-                                            0xF0,
-                                            0x03,
-                                            0x00,
-                                            0x00,
-                                            0x01,
-                                            selected_mode_c.to_byte(),
-                                            0x00,
-                                            0x00,
-                                            0x00,
-                                        ],
-                                    )
-                                    .await
-                                {
-                                    log::error!(
-                                        "Failed to set noise cancellation mode for device {}: {}",
-                                        mac_s,
-                                        e
-                                    );
-                                }
-                            });
-                            let mut state = state_clone.clone();
-                            state.anc_mode = selected_mode.clone();
-                            Message::StateChanged(mac.to_string(), DeviceState::Nothing(state))
-                        }
-                    },
+                    move |selected_mode| Message::NothingAncModeSelected(mac.clone(), selected_mode),
                 )
                 .width(Length::from(200))
                 .input_style(|theme: &Theme, _status| text_input::Style {
@@ -178,14 +133,4 @@ pub fn nothing_view<'a>(
 
     container(scrollable(content).height(Length::Fill))
         .height(Length::Fill)
-}
-
-fn run_async_in_thread<F>(fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(fut);
-    });
 }
