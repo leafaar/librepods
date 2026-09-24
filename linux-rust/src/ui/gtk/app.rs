@@ -8,13 +8,12 @@ use {
         ui::{
             gtk::{
                 model::{AirPodsSnapshot, DeviceSnapshot, Effect, Input, Model},
-                theme::ThemePreference,
                 widgets::Dispatch,
                 window::{APP_ID, Window},
             },
             messages::BluetoothUIMessage,
         },
-        utils::{AppSettings, get_devices_path, update_devices_file},
+        utils::{AppSettings, ThemePreference, get_devices_path, update_devices_file},
     },
     adw::prelude::*,
     gtk::{gio, glib},

@@ -5,7 +5,7 @@
 //!
 //! - `model`: all state and decisions, no GTK. `Model::update(Input)` returns
 //!   `Effect`s. Unit tested.
-//! - `battery`, `theme`: toolkit-free display decisions the model uses.
+//! - `battery`: toolkit-free display decisions the model uses.
 //! - `app`: startup, the input loop and the effects (backend commands, file
 //!   I/O, timers).
 //! - `window`, `sidebar`, `pages/*`: widgets. Built once, then `render(&Model)`
@@ -37,7 +37,6 @@ mod pages;
 mod sidebar;
 #[cfg(test)]
 mod smoke;
-mod theme;
 mod widgets;
 mod window;
 

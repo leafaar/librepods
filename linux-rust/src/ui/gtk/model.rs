@@ -21,13 +21,10 @@ use {
         ui::{
             connect::{ConnectRequests, ConnectStatus, sidebar_status},
             format::{live_case_level, validate_device_name},
-            gtk::{
-                battery::{Batteries, batteries},
-                theme::ThemePreference,
-            },
+            gtk::battery::{Batteries, batteries},
             messages::BluetoothUIMessage,
         },
-        utils::{AppSettings, PreferredCodec},
+        utils::{AppSettings, PreferredCodec, ThemePreference},
     },
     bluer::Address,
     std::collections::{HashMap, HashSet},
@@ -318,14 +315,12 @@ pub(crate) struct Model {
     connects: ConnectRequests,
     selection: Selection,
     settings: AppSettings,
-    theme: ThemePreference,
     /// Hint for the name field of the device being renamed.
     name_hint: Option<(String, NameHint)>,
 }
 
 impl Model {
     pub(crate) fn new(settings: AppSettings, devices: HashMap<String, DeviceData>) -> Self {
-        let theme = ThemePreference::from_stored(settings.theme);
         let mut model = Model {
             devices: HashMap::new(),
             connected: HashSet::new(),
@@ -335,7 +330,6 @@ impl Model {
             connects: ConnectRequests::default(),
             selection: Selection::None,
             settings,
-            theme,
             name_hint: None,
         };
         model.set_devices(devices);
@@ -609,8 +603,7 @@ impl Model {
         let mut effects = Vec::with_capacity(2);
         match change {
             SettingChange::Theme(theme) => {
-                self.theme = theme;
-                settings.theme = theme.to_stored();
+                settings.theme = theme;
                 effects.push(Effect::ApplyTheme(theme));
             },
             SettingChange::TrayTextMode(on) => settings.tray_text_mode = on,
@@ -656,7 +649,7 @@ impl Model {
     }
 
     pub(crate) fn theme(&self) -> ThemePreference {
-        self.theme
+        self.settings.theme
     }
 
     pub(crate) fn airpods(&self, mac: &str) -> Option<&AirPods> {
@@ -1276,21 +1269,16 @@ mod tests {
         assert_eq!(effects, [Effect::SaveSettings]);
         assert!(model.settings().tray_text_mode);
 
-        let effects = model.update(Input::Setting(SettingChange::Theme(
-            ThemePreference::System,
-        )));
+        let effects = model.update(Input::Setting(SettingChange::Theme(ThemePreference::Dark)));
         assert_eq!(
             effects,
             [
-                Effect::ApplyTheme(ThemePreference::System),
+                Effect::ApplyTheme(ThemePreference::Dark),
                 Effect::SaveSettings
             ]
         );
-        assert_eq!(
-            ThemePreference::from_stored(model.settings().theme),
-            ThemePreference::System
-        );
-        assert_eq!(model.theme(), ThemePreference::System);
+        assert_eq!(model.settings().theme, ThemePreference::Dark);
+        assert_eq!(model.theme(), ThemePreference::Dark);
     }
 
     #[test]

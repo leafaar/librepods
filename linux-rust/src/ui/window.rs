@@ -18,7 +18,9 @@ use {
             messages::BluetoothUIMessage,
             nothing::nothing_view,
         },
-        utils::{AppSettings, MyTheme, PreferredCodec, get_devices_path, update_devices_file},
+        utils::{
+            AppSettings, PreferredCodec, ThemePreference, get_devices_path, update_devices_file,
+        },
     },
     bluer::Address,
     iced::{
@@ -85,8 +87,8 @@ pub struct App {
     window: Option<window::Id>,
     panes: pane_grid::State<Pane>,
     selected_tab: Tab,
-    theme_state: combo_box::State<MyTheme>,
-    selected_theme: MyTheme,
+    theme_state: combo_box::State<ThemePreference>,
+    selected_theme: ThemePreference,
     ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>>>,
     bluetooth_state: BluetoothState,
     paired_devices: HashMap<String, Address>,
@@ -178,7 +180,7 @@ pub enum Message {
     WindowClosed(window::Id),
     Resized(pane_grid::ResizeEvent),
     SelectTab(Tab),
-    ThemeSelected(MyTheme),
+    ThemeSelected(ThemePreference),
     CopyToClipboard(String),
     BluetoothMessage(BluetoothUIMessage),
     ConnectDevice(String),
@@ -278,30 +280,7 @@ impl App {
                 window,
                 panes,
                 selected_tab: Tab::Device("none".to_string()),
-                theme_state: combo_box::State::new(vec![
-                    MyTheme::Light,
-                    MyTheme::Dark,
-                    MyTheme::Dracula,
-                    MyTheme::Nord,
-                    MyTheme::SolarizedLight,
-                    MyTheme::SolarizedDark,
-                    MyTheme::GruvboxLight,
-                    MyTheme::GruvboxDark,
-                    MyTheme::CatppuccinLatte,
-                    MyTheme::CatppuccinFrappe,
-                    MyTheme::CatppuccinMacchiato,
-                    MyTheme::CatppuccinMocha,
-                    MyTheme::TokyoNight,
-                    MyTheme::TokyoNightStorm,
-                    MyTheme::TokyoNightLight,
-                    MyTheme::KanagawaWave,
-                    MyTheme::KanagawaDragon,
-                    MyTheme::KanagawaLotus,
-                    MyTheme::Moonfly,
-                    MyTheme::Nightfly,
-                    MyTheme::Oxocarbon,
-                    MyTheme::Ferra,
-                ]),
+                theme_state: combo_box::State::new(ThemePreference::ALL.to_vec()),
                 selected_theme,
                 ui_rx,
                 bluetooth_state,
@@ -1922,7 +1901,12 @@ impl App {
     }
 
     fn theme(&self, _id: window::Id) -> Theme {
-        self.selected_theme.into()
+        // This window does not read the desktop preference; System keeps the
+        // dark theme it always started with.
+        match self.selected_theme {
+            ThemePreference::Light => Theme::Light,
+            ThemePreference::System | ThemePreference::Dark => Theme::Dark,
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
