@@ -280,14 +280,14 @@ fn play_loop(
             Ok(Command::Play) => playing.store(true, Ordering::Relaxed),
             Ok(Command::Pause) => {
                 playing.store(false, Ordering::Relaxed);
-                let op = stream.flush(None);
-                wait_for(&mut mainloop, &op);
+                let mut op = stream.flush(None);
+                wait_for(&mut mainloop, &mut op);
             }
             Ok(Command::Seek(to)) => {
                 offset = to - to % BYTES_PER_FRAME;
                 position.store(offset, Ordering::Relaxed);
-                let op = stream.flush(None);
-                wait_for(&mut mainloop, &op);
+                let mut op = stream.flush(None);
+                wait_for(&mut mainloop, &mut op);
             }
             Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
@@ -299,8 +299,8 @@ fn play_loop(
             continue;
         }
         if offset >= pcm.len() {
-            let op = stream.drain(None);
-            wait_for(&mut mainloop, &op);
+            let mut op = stream.drain(None);
+            wait_for(&mut mainloop, &mut op);
             playing.store(false, Ordering::Relaxed);
             position.store(pcm.len(), Ordering::Relaxed);
             continue;

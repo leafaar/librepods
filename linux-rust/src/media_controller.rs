@@ -1,25 +1,25 @@
 use crate::bluetooth::aacp::AACPManager;
 use crate::bluetooth::aacp::EarDetectionStatus;
-use dbus::arg::RefArg;
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::introspect::SinkInfo;
-use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
-use libpulse_binding::mainloop::standard::Mainloop;
-use libpulse_binding::operation::State as OperationState;
 use libpulse_binding::proplist::Proplist;
 use libpulse_binding::volume::{ChannelVolumes, Volume};
 use log::{debug, error, info, warn};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
+
+/// How long after our own pause a player resuming is still attributed to us.
+const OWN_PAUSE_WINDOW: Duration = Duration::from_secs(10);
+/// How long after the buds came out putting them back resumes local media.
+const RESUME_WINDOW: Duration = Duration::from_secs(120);
 
 // Reconnecting AirPods creates a fresh MediaController. Keep the listener task
 // outside the controller so the replacement can stop its predecessor by MAC.
@@ -51,16 +51,21 @@ struct MediaControllerState {
     local_mac: String,
     is_playing: bool,
     paused_by_app_services: Vec<String>,
+    paused_by_app_at: Option<Instant>,
     device_index: Option<u32>,
     cached_a2dp_profile: String,
     old_in_ear_data: Vec<bool>,
     user_played_the_media: bool,
-    i_paused_the_media: bool,
+    /// When this controller last paused local players itself. Players tend to
+    /// resume once the audio profile comes back; within OWN_PAUSE_WINDOW that
+    /// resume is ours, not the user asking for the audio.
+    i_paused_the_media_at: Option<Instant>,
     ear_detection_enabled: bool,
     disconnect_when_not_wearing: bool,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
+    wireplumber_restarted: bool,
 }
 
 impl MediaControllerState {
@@ -70,16 +75,18 @@ impl MediaControllerState {
             local_mac: String::new(),
             is_playing: false,
             paused_by_app_services: Vec::new(),
+            paused_by_app_at: None,
             device_index: None,
             cached_a2dp_profile: String::new(),
             old_in_ear_data: vec![false, false],
             user_played_the_media: false,
-            i_paused_the_media: false,
+            i_paused_the_media_at: None,
             ear_detection_enabled: true,
             disconnect_when_not_wearing: true,
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
+            wireplumber_restarted: false,
         }
     }
 }
@@ -163,8 +170,7 @@ impl MediaController {
                 // Exception: this PC connected the AirPods itself to play here
                 // (auto-switch or the connect button), so media already playing
                 // is exactly what should take the audio.
-                let requested = crate::auto_switch::take_takeover_request(&device_mac);
-                if !(requested && is_playing) {
+                if !(is_playing && crate::auto_switch::has_takeover_request(&device_mac)) {
                     debug!("Recorded initial playback state ({is_playing}); not a transition");
                     continue;
                 }
@@ -178,14 +184,20 @@ impl MediaController {
             // just took over, ending with neither side playing.
             if is_playing && !was_playing {
                 let mut state = self.state.lock().await;
-                if state.i_paused_the_media {
-                    state.i_paused_the_media = false;
+                if state
+                    .i_paused_the_media_at
+                    .take()
+                    .is_some_and(|at| at.elapsed() < OWN_PAUSE_WINDOW)
+                {
                     debug!("Playback resumed after our own pause; not taking ownership");
                     continue;
                 }
             }
 
-            if !was_playing && is_playing {
+            // A requested takeover is retried on every poll until it runs or
+            // expires: the first readings can come before the ear status does.
+            let requested = is_playing && crate::auto_switch::has_takeover_request(&device_mac);
+            if (!was_playing && is_playing) || requested {
                 let (bud_in_ear, connected_devices) = {
                     let aacp_state = aacp_manager.state.lock().await;
                     (
@@ -199,6 +211,7 @@ impl MediaController {
                     info!("Media playback started but buds not in ear, skipping takeover");
                     continue;
                 }
+                crate::auto_switch::clear_takeover_request(&device_mac);
                 info!("Media playback started, taking ownership and activating a2dp");
                 let _ = control_tx.send((
                     crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
@@ -347,15 +360,14 @@ impl MediaController {
             if in_ear {
                 debug!("Resuming media as buds are in ear");
                 self.resume().await;
-                self.state.lock().await.i_paused_the_media = false;
+                self.state.lock().await.i_paused_the_media_at = None;
             } else if !old_all_out {
                 debug!("Pausing media as buds are not fully in ear");
                 self.pause().await;
-                self.state.lock().await.i_paused_the_media = true;
             } else {
                 debug!("Playing media");
                 self.resume().await;
-                self.state.lock().await.i_paused_the_media = false;
+                self.state.lock().await.i_paused_the_media_at = None;
             }
         }
 
@@ -415,9 +427,20 @@ impl MediaController {
 
     async fn restart_wire_plumber(&self) -> bool {
         info!("Restarting WirePlumber to rediscover A2DP profiles");
-        let result = Command::new("systemctl")
+        // Restarting WirePlumber interrupts every audio device on the system,
+        // so do it at most once per connection.
+        {
+            let mut state = self.state.lock().await;
+            if state.wireplumber_restarted {
+                warn!("WirePlumber was already restarted for this connection; not again");
+                return false;
+            }
+            state.wireplumber_restarted = true;
+        }
+        let result = tokio::process::Command::new("systemctl")
             .args(["--user", "restart", "wireplumber"])
-            .output();
+            .output()
+            .await;
 
         match result {
             Ok(output) if output.status.success() => {
@@ -548,6 +571,8 @@ impl MediaController {
             info!("Paused {} media player(s) via DBus", paused_services.len());
             let mut state = self.state.lock().await;
             state.paused_by_app_services = paused_services;
+            state.paused_by_app_at = Some(Instant::now());
+            state.i_paused_the_media_at = Some(Instant::now());
             state.is_playing = false;
         } else {
             info!("No playing media players found to pause");
@@ -556,10 +581,6 @@ impl MediaController {
 
     pub async fn pause_all_media(&self) {
         debug!("Pausing all media (without tracking for resume)");
-
-        // Remember that the pause came from us, so the playback listener does
-        // not mistake the players coming back for the user starting something.
-        self.state.lock().await.i_paused_the_media = true;
 
         let paused_count = tokio::task::spawn_blocking(|| {
             let conn = match Connection::new_session() {
@@ -596,6 +617,9 @@ impl MediaController {
             .unwrap_or_default();
 
         if paused_count > 0 {
+            // Remember that the pause came from us, so the playback listener
+            // does not mistake the players coming back for the user.
+            self.state.lock().await.i_paused_the_media_at = Some(Instant::now());
             info!("Paused {} media player(s) due to ownership loss", paused_count);
             self.state.lock().await.is_playing = false;
         } else {
@@ -605,10 +629,23 @@ impl MediaController {
 
     async fn resume(&self) {
         debug!("Resuming playback");
-        let services = self.state.lock().await.paused_by_app_services.clone();
+        // Take the list whatever happens next: a resume is attempted once.
+        let (services, paused_at) = {
+            let mut state = self.state.lock().await;
+            (
+                std::mem::take(&mut state.paused_by_app_services),
+                state.paused_by_app_at.take(),
+            )
+        };
 
         if services.is_empty() {
             debug!("No services to resume");
+            return;
+        }
+        // Putting the buds back in much later is not "continue what I was
+        // doing here": the user may be on another device by now.
+        if !paused_at.is_some_and(|at| at.elapsed() < RESUME_WINDOW) {
+            debug!("Media was paused too long ago; not resuming");
             return;
         }
 
@@ -638,7 +675,6 @@ impl MediaController {
 
         if resumed_count > 0 {
             info!("Resumed {} media player(s) via DBus", resumed_count);
-            self.state.lock().await.paused_by_app_services.clear();
         } else {
             error!("Failed to resume any media players via DBus");
         }
@@ -763,35 +799,20 @@ impl MediaController {
 
     pub async fn deactivate_a2dp_profile(&self) {
         debug!("Entering deactivate_a2dp_profile");
-        let mut state = self.state.lock().await;
-
-        if state.device_index.is_none() {
-            state.device_index = self
-                .get_audio_device_index(&state.connected_device_mac)
-                .await;
-        }
-
-        if state.connected_device_mac.is_empty() || state.device_index.is_none() {
-            warn!("Connected device MAC or index is empty, cannot deactivate A2DP profile");
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        // Resolve by MAC every time: card indices are reused, so a cached one
+        // can belong to another sound card by now.
+        let Some(device_index) = find_audio_device_index(&mac).await else {
+            warn!("No sound card for {}, cannot deactivate A2DP profile", mac);
             return;
-        }
-        let device_index = state.device_index.unwrap();
-        drop(state);
+        };
+        self.state.lock().await.device_index = Some(device_index);
 
         info!("Deactivating A2DP profile for AirPods by setting to off");
-
-        let success = tokio::task::spawn_blocking(move || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                set_card_profile_sync(device_index, "off")
-            }))
-                .unwrap_or_else(|e| {
-                    warn!("Panic in set_card_profile_sync: {:?}", e);
-                    false
-                })
-        })
-            .await
-            .unwrap_or(false);
-
+        let success =
+            tokio::task::spawn_blocking(move || set_card_profile_sync(device_index, "off"))
+                .await
+                .unwrap_or(false);
         if success {
             info!("Successfully deactivated A2DP profile");
         } else {
@@ -1011,21 +1032,6 @@ impl MediaController {
 
 // --- PulseAudio helpers ---
 
-fn pulse_connect() -> Option<(Mainloop, Context)> {
-    let mut mainloop = Mainloop::new()?;
-    let mut context = Context::new(&mainloop, "LibrePods")?;
-    context.connect(None, ContextFlagSet::NOAUTOSPAWN, None).ok()?;
-    loop {
-        mainloop.iterate(false);
-        match context.get_state() {
-            libpulse_binding::context::State::Ready => break,
-            libpulse_binding::context::State::Failed
-            | libpulse_binding::context::State::Terminated => return None,
-            _ => {}
-        }
-    }
-    Some((mainloop, context))
-}
 
 /// One lookup of the sound server card that belongs to a Bluetooth MAC.
 async fn find_audio_device_index(mac: &str) -> Option<u32> {
@@ -1044,14 +1050,14 @@ async fn find_audio_device_index(mac: &str) -> Option<u32> {
 }
 
 fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
-    let (mut mainloop, context) = match pulse_connect() {
+    let (mut mainloop, context) = match crate::audio::output::connect() {
         Some(c) => c,
         None => return vec![],
     };
 
     let introspector = context.introspect();
     let cards: Rc<RefCell<Vec<OwnedCardInfo>>> = Rc::new(RefCell::new(Vec::new()));
-    let op = introspector.get_card_info_list({
+    let mut op = introspector.get_card_info_list({
         let cards = cards.clone();
         move |result| {
             if let ListResult::Item(item) = result {
@@ -1076,9 +1082,7 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
         }
     });
 
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    crate::audio::output::wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
     // A cancelled operation leaks its callback and with it a clone of `cards`,
     // so take the contents instead of unwrapping the Rc.
@@ -1086,10 +1090,10 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
 }
 
 fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
-    let (mut mainloop, context) = pulse_connect()?;
+    let (mut mainloop, context) = crate::audio::output::connect()?;
     let introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
+    let mut op = introspector.get_sink_info_by_name(sink_name, {
         let sink_info = sink_info.clone();
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
@@ -1101,9 +1105,7 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    crate::audio::output::wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
 
     let borrowed = sink_info.borrow();
@@ -1118,27 +1120,33 @@ fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
 }
 
 fn set_card_profile_sync(card_index: u32, profile_name: &str) -> bool {
-    let (mut mainloop, context) = match pulse_connect() {
+    let (mut mainloop, context) = match crate::audio::output::connect() {
         Some(c) => c,
         None => return false,
     };
     let mut introspector = context.introspect();
-    let op = introspector.set_card_profile_by_index(card_index, profile_name, None);
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    let ok = Rc::new(std::cell::Cell::new(false));
+    let mut op = introspector.set_card_profile_by_index(
+        card_index,
+        profile_name,
+        Some(Box::new({
+            let ok = ok.clone();
+            move |success| ok.set(success)
+        })),
+    );
+    let finished = crate::audio::output::wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
-    true
+    finished && ok.get()
 }
 
 pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
-    let (mut mainloop, context) = match pulse_connect() {
+    let (mut mainloop, context) = match crate::audio::output::connect() {
         Some(c) => c,
         None => return false,
     };
     let mut introspector = context.introspect();
     let sink_info: Rc<RefCell<Option<OwnedSinkInfo>>> = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
+    let mut op = introspector.get_sink_info_by_name(sink_name, {
         let sink_info = sink_info.clone();
         move |result: ListResult<&SinkInfo>| {
             if let ListResult::Item(item) = result {
@@ -1150,9 +1158,7 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
             }
         }
     });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
+    crate::audio::output::wait_for(&mut mainloop, &mut op);
 
     if let Some(info) = sink_info.borrow().as_ref() {
         let channels = info.volume.len();
@@ -1161,10 +1167,8 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
             (((target_volume as f64) / 100.0) * f64::from(Volume::NORMAL.0)).round() as u32;
         new_volumes.set(channels, Volume(raw));
 
-        let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
+        let mut op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
+        crate::audio::output::wait_for(&mut mainloop, &mut op);
         mainloop.quit(Retval(0));
         true
     } else {
@@ -1180,10 +1184,10 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
     let mac_clone = mac.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let (mut mainloop, context) = pulse_connect()?;
+        let (mut mainloop, context) = crate::audio::output::connect()?;
         let introspector = context.introspect();
         let sink_list: Rc<RefCell<Vec<OwnedSinkInfo>>> = Rc::new(RefCell::new(Vec::new()));
-        let op = introspector.get_sink_info_list({
+        let mut op = introspector.get_sink_info_list({
             let sink_list = sink_list.clone();
             move |result: ListResult<&SinkInfo>| {
                 if let ListResult::Item(item) = result {
@@ -1195,9 +1199,7 @@ async fn get_sink_name_by_mac(mac: &str) -> Option<String> {
                 }
             }
         });
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
+        crate::audio::output::wait_for(&mut mainloop, &mut op);
         mainloop.quit(Retval(0));
 
         for sink in sink_list.borrow().iter() {

@@ -42,13 +42,21 @@ fn request_takeover(addr: Address) {
     }
 }
 
-/// Consume the takeover request for `mac`; true when one was made recently.
-pub(crate) fn take_takeover_request(mac: &str) -> bool {
-    TAKEOVER_REQUESTS
-        .lock()
-        .ok()
-        .and_then(|mut requests| requests.remove(mac))
-        .is_some_and(|at| at.elapsed() < TAKEOVER_REQUEST_TTL)
+/// Whether a takeover of `mac` was requested within TAKEOVER_REQUEST_TTL.
+/// Expired requests are dropped here.
+pub(crate) fn has_takeover_request(mac: &str) -> bool {
+    let Ok(mut requests) = TAKEOVER_REQUESTS.lock() else {
+        return false;
+    };
+    requests.retain(|_, at| at.elapsed() < TAKEOVER_REQUEST_TTL);
+    requests.contains_key(mac)
+}
+
+/// Mark the takeover of `mac` as done.
+pub(crate) fn clear_takeover_request(mac: &str) {
+    if let Ok(mut requests) = TAKEOVER_REQUESTS.lock() {
+        requests.remove(mac);
+    }
 }
 
 fn players_playing() -> HashSet<String> {
@@ -136,7 +144,12 @@ async fn connect_device(adapter: &Adapter, addr: Address) -> Result<(), String> 
     };
     match &result {
         Ok(()) => info!("[switch] connected {}", addr),
-        Err(e) => warn!("[switch] could not connect {}: {}", addr, e),
+        Err(e) => {
+            warn!("[switch] could not connect {}: {}", addr, e);
+            // Otherwise a later reconnect the user did not ask for would still
+            // take the audio.
+            clear_takeover_request(&addr.to_string());
+        }
     }
     result
 }

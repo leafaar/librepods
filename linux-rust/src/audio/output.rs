@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dbus::blocking::Connection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
@@ -161,7 +161,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
     let introspect = context.introspect();
 
     let index = Rc::new(Cell::new(u32::MAX));
-    let op = introspect.get_source_info_by_name(name, {
+    let mut op = introspect.get_source_info_by_name(name, {
         let index = index.clone();
         move |result| {
             if let ListResult::Item(item) = result {
@@ -169,12 +169,12 @@ pub fn source_consumer(name: &str) -> Option<String> {
             }
         }
     });
-    wait_for(&mut mainloop, &op);
+    wait_for(&mut mainloop, &mut op);
 
     let app = Rc::new(RefCell::new(None::<String>));
     let idx = index.get();
     if idx != u32::MAX {
-        let op = introspect.get_source_output_info_list({
+        let mut op = introspect.get_source_output_info_list({
             let app = app.clone();
             move |result| {
                 if let ListResult::Item(item) = result {
@@ -188,7 +188,7 @@ pub fn source_consumer(name: &str) -> Option<String> {
                 }
             }
         });
-        wait_for(&mut mainloop, &op);
+        wait_for(&mut mainloop, &mut op);
     }
     mainloop.quit(Retval(0));
 
@@ -210,7 +210,7 @@ pub fn reset_a2dp(bdaddr: &str) {
     let mut introspect = context.introspect();
 
     let current_profile = Rc::new(RefCell::new(None::<String>));
-    let op = introspect.get_card_info_by_name(&card, {
+    let mut op = introspect.get_card_info_by_name(&card, {
         let current_profile = current_profile.clone();
         move |result| {
             if let ListResult::Item(item) = result {
@@ -222,7 +222,7 @@ pub fn reset_a2dp(bdaddr: &str) {
             }
         }
     });
-    wait_for(&mut mainloop, &op);
+    wait_for(&mut mainloop, &mut op);
 
     let Some(current_profile) = current_profile.borrow().clone() else {
         warn!("[pw] no active profile on {}; skipping A2DP reset", card);
@@ -238,11 +238,11 @@ pub fn reset_a2dp(bdaddr: &str) {
         "[pw] reset A2DP transport: {} off -> {}",
         card, current_profile
     );
-    let op = introspect.set_card_profile_by_name(&card, "off", None);
-    wait_for(&mut mainloop, &op);
+    let mut op = introspect.set_card_profile_by_name(&card, "off", None);
+    wait_for(&mut mainloop, &mut op);
 
-    let op = introspect.set_card_profile_by_name(&card, &current_profile, None);
-    wait_for(&mut mainloop, &op);
+    let mut op = introspect.set_card_profile_by_name(&card, &current_profile, None);
+    wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
 
     // resume all media players after the reset
@@ -313,25 +313,51 @@ pub(crate) fn resume_media_players(services: &[String]) {
     }
 }
 
-// Block on the mainloop until `op` finishes. A blocking iterate sleeps until the
-// server replies instead of spinning a core; a dead connection ends the wait.
-pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &Operation<T>) {
-    while op.get_state() == OperationState::Running {
-        if let IterateResult::Quit(_) | IterateResult::Err(_) = mainloop.iterate(true) {
-            break;
+/// Longest a single sound server request may take before we give up on it.
+const PULSE_TIMEOUT: Duration = Duration::from_secs(3);
+const PULSE_POLL: Duration = Duration::from_millis(2);
+
+/// Run the mainloop until `op` finishes. Returns false if it was cancelled, the
+/// connection died, or the server did not answer within PULSE_TIMEOUT. Polls
+/// instead of blocking in iterate(true), which would wait forever on a server
+/// that stopped answering.
+pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>) -> bool {
+    let deadline = Instant::now() + PULSE_TIMEOUT;
+    loop {
+        match op.get_state() {
+            OperationState::Done => return true,
+            OperationState::Cancelled => return false,
+            OperationState::Running => {}
+        }
+        if Instant::now() >= deadline {
+            warn!("[pw] sound server did not answer in time");
+            op.cancel();
+            return false;
+        }
+        match mainloop.iterate(false) {
+            IterateResult::Quit(_) | IterateResult::Err(_) => return false,
+            IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
+            IterateResult::Success(_) => {}
         }
     }
 }
 
+/// Connect to the sound server, giving up after PULSE_TIMEOUT.
 pub(crate) fn connect() -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
-    let mut context = Context::new(&mainloop, "LibrePods-HiResMic")?;
+    let mut context = Context::new(&mainloop, "LibrePods")?;
     context
         .connect(None, ContextFlagSet::NOAUTOSPAWN, None)
         .ok()?;
+    let deadline = Instant::now() + PULSE_TIMEOUT;
     loop {
-        match mainloop.iterate(true) {
+        if Instant::now() >= deadline {
+            warn!("[pw] could not connect to the sound server in time");
+            return None;
+        }
+        match mainloop.iterate(false) {
             IterateResult::Quit(_) | IterateResult::Err(_) => return None,
+            IterateResult::Success(0) => std::thread::sleep(PULSE_POLL),
             IterateResult::Success(_) => {}
         }
         match context.get_state() {
@@ -350,7 +376,7 @@ fn unload_stale_modules() {
     };
     let stale: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
     let introspect = context.introspect();
-    let op = introspect.get_module_info_list({
+    let mut op = introspect.get_module_info_list({
         let stale = stale.clone();
         move |result| {
             if let ListResult::Item(item) = result {
@@ -362,7 +388,7 @@ fn unload_stale_modules() {
             }
         }
     });
-    wait_for(&mut mainloop, &op);
+    wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
 
     for index in stale.borrow().iter() {
@@ -375,11 +401,11 @@ fn load_module(name: &str, args: &str) -> Option<u32> {
     let (mut mainloop, context) = connect()?;
     let idx: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
     let mut introspect = context.introspect();
-    let op = introspect.load_module(name, args, {
+    let mut op = introspect.load_module(name, args, {
         let idx = idx.clone();
         move |index| idx.set(index)
     });
-    wait_for(&mut mainloop, &op);
+    wait_for(&mut mainloop, &mut op);
     mainloop.quit(Retval(0));
 
     match idx.get() {
@@ -394,8 +420,8 @@ fn unload_module(index: u32) {
     }
     if let Some((mut mainloop, context)) = connect() {
         let mut introspect = context.introspect();
-        let op = introspect.unload_module(index, |_| {});
-        wait_for(&mut mainloop, &op);
+        let mut op = introspect.unload_module(index, |_| {});
+        wait_for(&mut mainloop, &mut op);
         mainloop.quit(Retval(0));
     }
 }
