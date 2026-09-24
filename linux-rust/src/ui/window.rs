@@ -101,6 +101,9 @@ pub struct App {
     // Manual connect requests from the UI or tray, keyed by MAC; cleared once
     // the device connects.
     connect_status: HashMap<String, ConnectStatus>,
+    // Numbers each connect request, so a late result or timeout from an older
+    // request does not touch a newer one.
+    connect_attempt: u64,
     mic_test: MicTest,
     // Media players paused for the microphone test, resumed when it ends.
     mic_test_paused: Vec<String>,
@@ -139,9 +142,22 @@ impl MicTest {
 
 #[derive(Debug, Clone)]
 enum ConnectStatus {
-    Connecting,
+    /// The connect call for this attempt is running.
+    Connecting(u64),
+    /// The connect call returned; waiting for DeviceConnected, which comes once
+    /// the AACP session is set up.
+    SettingUp(u64),
     Failed(String),
 }
+
+impl ConnectStatus {
+    fn in_progress(&self) -> bool {
+        matches!(self, ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_))
+    }
+}
+
+/// How long to wait for DeviceConnected after the Bluetooth connect succeeded.
+const CONNECT_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The icon is embedded: a path is resolved against the working directory, which
 // is wherever the app was launched from. The application id becomes the X11
@@ -179,7 +195,8 @@ pub enum Message {
     CopyToClipboard(String),
     BluetoothMessage(BluetoothUIMessage),
     ConnectDevice(String),
-    ConnectFinished(String, Result<(), String>),
+    ConnectFinished(String, u64, Result<(), String>),
+    ConnectSetupTimedOut(String, u64),
     MicTestRecord,
     MicTestStop,
     MicTestPlay,
@@ -307,6 +324,7 @@ impl App {
                 auto_switch_on_playback,
                 preferred_codec,
                 connect_status: HashMap::new(),
+                connect_attempt: 0,
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
                 mic_test_take: 0,
@@ -445,15 +463,36 @@ impl App {
                 Task::none()
             }
             Message::MicTestDone => self.end_mic_test(),
-            Message::ConnectFinished(mac, result) => {
+            Message::ConnectFinished(mac, attempt, result) => {
+                if !matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting(a)) if *a == attempt)
+                {
+                    return Task::none();
+                }
                 match result {
-                    // DeviceConnected arrives separately once the device is set up.
+                    // Stay in "Connecting" until DeviceConnected arrives, or the
+                    // panel would offer the Connect button again in between.
                     Ok(()) => {
-                        self.connect_status.remove(&mac);
+                        self.connect_status
+                            .insert(mac.clone(), ConnectStatus::SettingUp(attempt));
+                        Task::perform(tokio::time::sleep(CONNECT_SETUP_TIMEOUT), move |_| {
+                            Message::ConnectSetupTimedOut(mac, attempt)
+                        })
                     }
                     Err(e) => {
                         self.connect_status.insert(mac, ConnectStatus::Failed(e));
+                        Task::none()
                     }
+                }
+            }
+            Message::ConnectSetupTimedOut(mac, attempt) => {
+                if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(a)) if *a == attempt)
+                {
+                    self.connect_status.insert(
+                        mac,
+                        ConnectStatus::Failed(
+                            "Connected, but the AirPods did not respond. Try again.".to_string(),
+                        ),
+                    );
                 }
                 Task::none()
             }
@@ -607,6 +646,9 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
+                        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(_))) {
+                            self.connect_status.remove(&mac);
+                        }
                         let removed = self.device_states.remove(&mac);
                         // The test records from the AirPods, and its Done button
                         // goes away with them.
@@ -902,22 +944,27 @@ impl App {
     }
 
     fn start_connect(&mut self, mac: String) -> Task<Message> {
-        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting)) {
+        if self.connect_status.get(&mac).is_some_and(ConnectStatus::in_progress) {
             return Task::none();
         }
         let Ok(addr) = mac.parse::<Address>() else {
             error!("Cannot connect, invalid address {}", mac);
             return Task::none();
         };
-        self.connect_status.insert(mac.clone(), ConnectStatus::Connecting);
+        self.connect_attempt += 1;
+        let attempt = self.connect_attempt;
+        self.connect_status
+            .insert(mac.clone(), ConnectStatus::Connecting(attempt));
         Task::perform(crate::auto_switch::connect_airpods(addr), move |result| {
-            Message::ConnectFinished(mac, result)
+            Message::ConnectFinished(mac, attempt, result)
         })
     }
 
     fn disconnected_view(&self, mac: &str) -> iced::widget::Container<'_, Message> {
         let (status, connecting) = match self.connect_status.get(mac) {
-            Some(ConnectStatus::Connecting) => ("Connecting…".to_string(), true),
+            Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
+                ("Connecting…".to_string(), true)
+            }
             Some(ConnectStatus::Failed(e)) => (e.clone(), false),
             None => (
                 "Not connected to this PC. If they are on your phone, connecting here takes them over."
@@ -983,7 +1030,9 @@ impl App {
                             }
                         } else {
                             text(match self.connect_status.get(mac_addr) {
-                                Some(ConnectStatus::Connecting) => "Connecting…",
+                                Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
+                                    "Connecting…"
+                                }
                                 Some(ConnectStatus::Failed(_)) => "Couldn't connect",
                                 None => "Not connected",
                             })
