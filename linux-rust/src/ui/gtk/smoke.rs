@@ -6,10 +6,17 @@
 
 use {
     crate::{
-        bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus},
+        bluetooth::{
+            aacp::{
+                AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus,
+                ControlCommandIdentifiers as Id, ControlCommandStatus,
+            },
+            settings::{CallControls, ClickHoldAction, CycleMode},
+        },
         devices::enums::{DeviceData, DeviceType},
         ui::{
             gtk::{
+                controls::{Bud, ControlChange},
                 model::{AirPodsSnapshot, DeviceSnapshot, Input, Model, Selection, SettingChange},
                 widgets::Dispatch,
                 window::Window,
@@ -75,6 +82,7 @@ fn render_builds_widgets_and_sends_nothing() {
     step(&mut model, battery(&mac, 70, BatteryStatus::NotCharging));
     step(&mut model, battery(&mac, 0, BatteryStatus::Disconnected));
     step(&mut model, Input::SetAllowOff(mac.clone(), true));
+    render_settings_sections(&mut model, &mac, &step);
     step(&mut model, Input::NameEdited(mac.clone(), String::new()));
     step(
         &mut model,
@@ -100,6 +108,46 @@ fn render_builds_widgets_and_sends_nothing() {
         queued.push(format!("{input:?}"));
     }
     assert!(queued.is_empty(), "render sent inputs: {queued:?}");
+}
+
+/// Report every setting of the AirPods settings sections, some with values
+/// that do not decode, then change a few of them.
+fn render_settings_sections(model: &mut Model, mac: &str, step: &impl Fn(&mut Model, Input)) {
+    for (identifier, value) in [
+        (Id::ClickHoldMode, &[0x05, 0x01][..]),
+        (Id::ListeningModeConfigs, &[0x06]),
+        (Id::CallManagementConfig, &[0x00, 0x03]),
+        (Id::MicMode, &[0x09]),
+        (Id::SleepDetectionConfig, &[0x01]),
+        (Id::DoubleClickInterval, &[0x01]),
+        (Id::ClickHoldInterval, &[0x00]),
+        (Id::OneBudAncMode, &[0x02]),
+        (Id::ChimeVolume, &[0x40, 0x50]),
+        (Id::VolumeSwipeMode, &[0x01]),
+        (Id::VolumeSwipeInterval, &[0x02]),
+        (Id::AutoAncStrength, &[0xFF]),
+    ] {
+        step(
+            model,
+            Input::Backend(BluetoothUIMessage::AACPUIEvent(
+                mac.to_string(),
+                AACPEvent::ControlCommand(ControlCommandStatus {
+                    identifier,
+                    value: value.to_vec(),
+                }),
+            )),
+        );
+    }
+    for change in [
+        ControlChange::LongPress(Bud::Left, ClickHoldAction::Siri),
+        ControlChange::CycleMode(CycleMode::Off, true),
+        ControlChange::MuteControl(CallControls::PressTwiceToMute),
+        ControlChange::ToneVolume(35),
+        ControlChange::AdaptiveNoise(80),
+        ControlChange::VolumeSwipe(false),
+    ] {
+        step(model, Input::AirPodsControl(mac.to_string(), change));
+    }
 }
 
 /// A battery report with a charging left bud and the given case entry.
