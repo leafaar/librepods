@@ -221,6 +221,9 @@ pub enum Message {
     HiResMicAgcChanged(bool),
     HiResMicPauseConvoChanged(bool),
     MicLevelTick,
+    /// The backend dropped its UI sender. Not re-armed: waiting again would
+    /// return at once and spin.
+    UiChannelClosed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -496,6 +499,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::UiChannelClosed => Task::none(),
             Message::MicLevelTick => {
                 if matches!(&self.mic_test, MicTest::Recording(r) if r.finished()) {
                     return self.stop_recording();
@@ -504,11 +508,6 @@ impl App {
             }
             Message::BluetoothMessage(ui_message) => {
                 match ui_message {
-                    BluetoothUIMessage::NoOp => {
-                        let ui_rx = Arc::clone(&self.ui_rx);
-
-                        Task::perform(wait_for_message(ui_rx), |msg| msg)
-                    }
                     BluetoothUIMessage::ConnectAirPods => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let mut tasks = vec![Task::perform(wait_for_message(ui_rx), |msg| msg)];
@@ -845,7 +844,12 @@ impl App {
                         end_test = self.end_mic_test();
                     }
                 }
-                self.device_states.insert(mac.clone(), state);
+                // The state was cloned when the view was built. If the device
+                // disconnected since, inserting it would bring the device back.
+                let Some(current) = self.device_states.get_mut(&mac) else {
+                    return end_test;
+                };
+                *current = state;
                 // if airpods, update the noise control state combo box based on allow off mode
                 let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                 if let Some(DeviceType::AirPods) = type_
@@ -1967,8 +1971,8 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
     match rx.recv().await {
         Some(msg) => Message::BluetoothMessage(msg),
         None => {
-            error!("UI message channel closed");
-            Message::BluetoothMessage(BluetoothUIMessage::NoOp)
+            error!("UI message channel closed, no more device updates");
+            Message::UiChannelClosed
         }
     }
 }
