@@ -3,6 +3,7 @@ use crate::devices::airpods::AirPodsInformation;
 use crate::devices::nothing::NothingInformation;
 use iced::widget::combo_box;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,6 +61,9 @@ pub struct AirPodsState {
     /// Local capture state of the proprietary hi-res microphone (UI-driven).
     pub hires_mic_enabled: bool,
     pub battery: Vec<BatteryInfo>,
+    /// Last known raw value per control command id, as reported by the AirPods or
+    /// last set from the settings page.
+    pub control_values: HashMap<u8, Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]

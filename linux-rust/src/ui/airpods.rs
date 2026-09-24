@@ -588,6 +588,7 @@ pub fn airpods_view<'a>(
         Space::new().height(Length::from(20)),
         hires_mic_toggle,
         Space::new().height(Length::from(20)),
+        crate::ui::airpods_settings::settings_sections(&mac, state, aacp_manager.clone()),
         information_col
     ])
     .padding(20)

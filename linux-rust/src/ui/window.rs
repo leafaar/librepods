@@ -636,6 +636,11 @@ impl App {
                                         matches!(status.value.as_slice(), [0x01])
                                     }),
                                     hires_mic_enabled: self.hires_mic_enabled,
+                                    control_values: state
+                                        .control_command_status_list
+                                        .iter()
+                                        .map(|status| (status.identifier as u8, status.value.clone()))
+                                        .collect(),
                                 }));
                             }
                             Some(DeviceType::Nothing) => {
@@ -782,7 +787,13 @@ impl App {
                                     }
                                 }
                                 _ => {
-                                    debug!("Unhandled Control Command Status: {:?}", status);
+                                    if let Some(DeviceState::AirPods(state)) =
+                                        self.device_states.get_mut(&mac)
+                                    {
+                                        state
+                                            .control_values
+                                            .insert(status.identifier as u8, status.value);
+                                    }
                                 }
                             },
                             AACPEvent::BatteryInfo(battery_info) => {
