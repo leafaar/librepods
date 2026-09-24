@@ -89,11 +89,17 @@ impl EldDecoder {
             (*ctx).extradata = extradata;
             (*ctx).extradata_size = ELD_ASC.len() as c_int;
             (*ctx).sample_rate = ELD_CODING_RATE;
-            // FFmpeg < 5.1 (Ubuntu 22.04 ships 4.4) has no AVChannelLayout, only the
-            // legacy count and mask. A negative mask cannot happen; 0 means "unspecified".
-            (*ctx).channels = ELD_CHANNELS;
-            (*ctx).channel_layout =
-                u64::try_from(ff::av_get_default_channel_layout(ELD_CHANNELS)).unwrap_or(0);
+            // build.rs selects the channel API: AVChannelLayout from FFmpeg 5.1,
+            // the legacy count and mask before it (they were removed in 7.0).
+            #[cfg(ffmpeg_ch_layout)]
+            ff::av_channel_layout_default(&raw mut (*ctx).ch_layout, ELD_CHANNELS);
+            #[cfg(not(ffmpeg_ch_layout))]
+            {
+                (*ctx).channels = ELD_CHANNELS;
+                // A negative mask cannot happen; 0 means "unspecified".
+                (*ctx).channel_layout =
+                    u64::try_from(ff::av_get_default_channel_layout(ELD_CHANNELS)).unwrap_or(0);
+            }
 
             if ff::avcodec_open2(ctx, codec, ptr::null_mut()) < 0 {
                 d.free();
@@ -153,6 +159,9 @@ impl EldDecoder {
                 return None;
             }
 
+            #[cfg(ffmpeg_ch_layout)]
+            let nch = (*self.frame).ch_layout.nb_channels;
+            #[cfg(not(ffmpeg_ch_layout))]
             let nch = (*self.frame).channels;
             let ns = (*self.frame).nb_samples;
             if nch != ELD_CHANNELS || ns <= 0 {
