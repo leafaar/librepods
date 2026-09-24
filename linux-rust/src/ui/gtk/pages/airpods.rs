@@ -13,6 +13,7 @@ use {
         ui::gtk::{
             battery::{Batteries, Level},
             model::{AirPods, Input, Model, NameHint},
+            pages::{equalizer::EqualizerSection, microphone::MicrophoneSection},
             widgets::{
                 CurrentDevice, Dispatch, Guarded, clear_box, combo_row, switch_row, value_row,
             },
@@ -55,13 +56,8 @@ impl AirPodsPage {
             Box::new(BatterySection::new()),
             Box::new(NameSection::new(&cx)),
             Box::new(NoiseControlSection::new(&cx)),
-            // Extension point: the equalizer section (ui/equalizer.rs,
-            // bluetooth/eq.rs) goes here. AirPods::custom_eq holds the last
-            // reported EQ.
-            // Extension point: the hi-res microphone switch, its level meter
-            // and the microphone test (ui/airpods.rs, audio/mic_test.rs) go
-            // here. The conversation awareness switch in NoiseControlSection
-            // must be locked while a capture manages it.
+            Box::new(EqualizerSection::new(&cx)),
+            Box::new(MicrophoneSection::new(&cx)),
             // Extension point: the settings sections backported from
             // ui/airpods_settings.rs and bluetooth/settings.rs go here. They
             // read AirPods::control_values and send Effect::SendControl.
@@ -252,6 +248,7 @@ struct NoiseControlSection {
     listening_mode: Guarded<adw::ComboRow>,
     /// Mode bytes in the order the combo row lists them.
     modes: Rc<RefCell<Vec<u8>>>,
+    conversation_row: adw::ActionRow,
     conversation_awareness: Guarded<gtk::Switch>,
     personalized_volume: Guarded<gtk::Switch>,
     allow_off: Guarded<gtk::Switch>,
@@ -307,6 +304,7 @@ impl NoiseControlSection {
             group,
             listening_mode,
             modes,
+            conversation_row,
             conversation_awareness,
             personalized_volume,
             allow_off,
@@ -319,7 +317,7 @@ impl Section for NoiseControlSection {
         &self.group
     }
 
-    fn render(&self, _mac: &str, airpods: &AirPods, _model: &Model) {
+    fn render(&self, mac: &str, airpods: &AirPods, model: &Model) {
         let available = airpods.listening_modes();
         let bytes: Vec<u8> = available
             .iter()
@@ -337,6 +335,9 @@ impl Section for NoiseControlSection {
         self.listening_mode.select(index);
         self.conversation_awareness
             .set_active(airpods.conversation_awareness);
+        // Locked while a hi-res capture turns conversation awareness off.
+        self.conversation_row
+            .set_sensitive(!model.conversation_awareness_locked(mac));
         self.personalized_volume
             .set_active(airpods.personalized_volume);
         self.allow_off.set_active(airpods.allow_off);

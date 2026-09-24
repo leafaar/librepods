@@ -3,5 +3,7 @@
 
 pub(crate) mod airpods;
 pub(crate) mod disconnected;
+pub(crate) mod equalizer;
+pub(crate) mod microphone;
 pub(crate) mod nothing;
 pub(crate) mod settings;
