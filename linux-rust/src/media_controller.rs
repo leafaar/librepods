@@ -542,7 +542,7 @@ impl MediaController {
             paused_services
         })
             .await
-            .unwrap();
+            .unwrap_or_default();
 
         if !paused_services.is_empty() {
             info!("Paused {} media player(s) via DBus", paused_services.len());
@@ -593,7 +593,7 @@ impl MediaController {
             paused_count
         })
             .await
-            .unwrap();
+            .unwrap_or_default();
 
         if paused_count > 0 {
             info!("Paused {} media player(s) due to ownership loss", paused_count);
@@ -634,7 +634,7 @@ impl MediaController {
             resumed_count
         })
             .await
-            .unwrap();
+            .unwrap_or_default();
 
         if resumed_count > 0 {
             info!("Resumed {} media player(s) via DBus", resumed_count);
@@ -963,7 +963,7 @@ impl MediaController {
             }
         })
             .await
-            .unwrap();
+            .unwrap_or_default();
     }
 
     async fn restore_volume_if_needed(&self, sink: &str) {
@@ -1080,7 +1080,9 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
         mainloop.iterate(false);
     }
     mainloop.quit(Retval(0));
-    Rc::try_unwrap(cards).unwrap().into_inner()
+    // A cancelled operation leaks its callback and with it a clone of `cards`,
+    // so take the contents instead of unwrapping the Rc.
+    std::mem::take(&mut *cards.borrow_mut())
 }
 
 fn get_sink_volume_percent_by_name_sync(sink_name: &str) -> Option<u32> {
@@ -1156,7 +1158,7 @@ pub fn transition_sink_volume(sink_name: &str, target_volume: u32) -> bool {
         let channels = info.volume.len();
         let mut new_volumes = ChannelVolumes::default();
         let raw =
-            (((target_volume as f64) / 100.0) * Volume::NORMAL.0.as_f64().unwrap()).round() as u32;
+            (((target_volume as f64) / 100.0) * f64::from(Volume::NORMAL.0)).round() as u32;
         new_volumes.set(channels, Volume(raw));
 
         let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);

@@ -10,7 +10,9 @@ use crate::audio::{mic_test, output};
 use crate::ui::airpods::airpods_view;
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
-use crate::utils::{AppSettings, MyTheme, PreferredCodec, get_devices_path};
+use crate::utils::{
+    AppSettings, MyTheme, PreferredCodec, get_devices_path, update_devices_file,
+};
 use bluer::Address;
 use iced::border::Radius;
 use iced::overlay::menu;
@@ -705,30 +707,19 @@ impl App {
                 if let Some((name, addr)) = self.pending_add_device.take()
                     && let Some(type_) = self.selected_device_type.take()
                 {
-                    let devices_path = get_devices_path();
-                    let devices_json = std::fs::read_to_string(&devices_path).unwrap_or_else(|e| {
-                        error!("Failed to read devices file: {}", e);
-                        "{}".to_string()
+                    let key = addr.to_string();
+                    let result = update_devices_file(|devices| {
+                        devices.insert(
+                            key,
+                            DeviceData {
+                                name,
+                                type_: type_.clone(),
+                                information: None,
+                            },
+                        );
                     });
-                    let mut devices_list: HashMap<String, DeviceData> =
-                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
-                            HashMap::new()
-                        });
-                    devices_list.insert(
-                        addr.to_string(),
-                        DeviceData {
-                            name,
-                            type_: type_.clone(),
-                            information: None,
-                        },
-                    );
-                    let updated_json = serde_json::to_string(&devices_list).unwrap_or_else(|e| {
-                        error!("Serialization failed: {}", e);
-                        "{}".to_string()
-                    });
-                    if let Err(e) = std::fs::write(&devices_path, updated_json) {
-                        error!("Failed to write devices file: {}", e);
+                    if let Err(e) = result {
+                        error!("Failed to save device: {}", e);
                     }
                     self.selected_tab = Tab::Device(addr.to_string());
                 }

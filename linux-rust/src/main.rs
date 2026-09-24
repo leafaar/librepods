@@ -21,7 +21,7 @@ use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use dbus::message::MatchRule;
 use devices::airpods::AirPodsDevice;
 use ksni::TrayMethods;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool};
@@ -206,9 +206,13 @@ async fn async_main(
     info!("Checking for connected devices...");
     match find_connected_airpods(&adapter).await {
         Ok(device) => {
+            // The device can vanish between the scan and this call; that is not
+            // a reason to exit.
             let name = device
                 .name()
-                .await?
+                .await
+                .ok()
+                .flatten()
                 .unwrap_or_else(|| "Unknown".to_string());
             info!("Found connected AirPods: {}, initializing.", name);
             ensure_device_registered(
@@ -216,9 +220,8 @@ async fn async_main(
                 &name,
                 devices::enums::DeviceType::AirPods,
             );
-            let airpods_device =
-                AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await;
-
+            match AirPodsDevice::new(device.address(), tray_handle.clone(), ui_tx.clone()).await {
+                Ok(airpods_device) => {
             let hires_aacp = airpods_device.aacp_manager.clone();
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
@@ -239,6 +242,9 @@ async fn async_main(
                     hires_aacp.set_hires_mic_enabled(true).await;
                 });
             }
+                }
+                Err(e) => error!("Could not set up AirPods {}: {}", device.address(), e),
+            }
         }
         Err(_) => {
             info!("No connected AirPods found.");
@@ -257,23 +263,32 @@ async fn async_main(
                 let ui_tx_clone = ui_tx.clone();
                 let device_managers = device_managers.clone();
                 tokio::spawn(async move {
-                    let mut managers = device_managers.write().await;
                     if type_ == devices::enums::DeviceType::Nothing {
-                        let dev = devices::nothing::NothingDevice::new(
+                        // Connect before taking the lock: view() reads it on
+                        // every frame and would freeze for the whole connect.
+                        let dev = match devices::nothing::NothingDevice::new(
                             device.address(),
                             ui_tx_clone.clone(),
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(dev) => dev,
+                            Err(e) => {
+                                error!("Could not set up device {}: {}", addr_str, e);
+                                return;
+                            }
+                        };
+                        let mut managers = device_managers.write().await;
                         let dev_managers = DeviceManagers::with_att(dev.att_manager.clone());
                         managers
                             .entry(addr_str.clone())
                             .or_insert(dev_managers)
                             .set_att(dev.att_manager);
+                        drop(managers);
                         if let Err(e) = ui_tx_clone.send(BluetoothUIMessage::DeviceConnected(addr_str)) {
                             warn!("Failed to send DeviceConnected UI message: {:?}", e);
                         }
                     }
-                    drop(managers)
                 });
             }
         }
@@ -347,8 +362,15 @@ async fn async_main(
                 let ui_tx_clone = ui_tx.clone();
                 let device_managers = device_managers.clone();
                 tokio::spawn(async move {
+                    // Connect before taking the lock, see the startup path.
+                    let dev = match devices::nothing::NothingDevice::new(addr, ui_tx_clone.clone()).await {
+                        Ok(dev) => dev,
+                        Err(e) => {
+                            error!("Could not set up device {}: {}", addr_str, e);
+                            return;
+                        }
+                    };
                     let mut managers = device_managers.write().await;
-                    let dev = devices::nothing::NothingDevice::new(addr, ui_tx_clone.clone()).await;
                     let dev_managers = DeviceManagers::with_att(dev.att_manager.clone());
                     managers
                         .entry(addr_str.clone())
@@ -375,7 +397,13 @@ async fn async_main(
         let ui_tx_clone = ui_tx.clone();
         let device_managers = device_managers.clone();
         tokio::spawn(async move {
-            let airpods_device = AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await;
+            let airpods_device = match AirPodsDevice::new(addr, handle_clone, ui_tx_clone.clone()).await {
+                Ok(device) => device,
+                Err(e) => {
+                    error!("Could not set up AirPods {}: {}", addr_str, e);
+                    return;
+                }
+            };
             let mut managers = device_managers.write().await;
             // let dev_managers = DeviceManagers::with_both(airpods_device.aacp_manager.clone(), airpods_device.att_manager.clone());
             let dev_managers = DeviceManagers::with_aacp(airpods_device.aacp_manager.clone());

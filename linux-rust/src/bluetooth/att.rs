@@ -187,8 +187,10 @@ impl ATTManager {
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
-        let state = self.state.lock().await;
-        if let Some(sender) = &state.sender {
+        // Clone the sender and release the lock before awaiting, so a full
+        // channel cannot block the receive loop behind this mutex.
+        let sender = self.state.lock().await.sender.clone();
+        if let Some(sender) = sender {
             sender.send(data.to_vec()).await.map_err(|e| {
                 error!("Failed to send packet to channel: {}", e);
                 Error::from(std::io::Error::new(
@@ -237,7 +239,10 @@ async fn recv_thread(manager: ATTManager, sp: Arc<SeqPacket>) {
                     continue;
                 }
                 if data[0] == OPCODE_HANDLE_VALUE_NTF {
-                    // Notification
+                    // Notification: opcode, 2-byte handle, value.
+                    if data.len() < 3 {
+                        continue;
+                    }
                     let handle = (data[1] as u16) | ((data[2] as u16) << 8);
                     let value = data[3..].to_vec();
                     let state = manager.state.lock().await;

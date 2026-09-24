@@ -272,6 +272,14 @@ pub enum BatteryStatus {
     Charging = 1,
     NotCharging = 2,
     Disconnected = 4,
+    /// Apple's optimized charging, reported by a bud sitting in the case.
+    OptimizedCharging = 5,
+}
+
+impl BatteryStatus {
+    pub fn is_charging(self) -> bool {
+        matches!(self, Self::Charging | Self::OptimizedCharging)
+    }
 }
 
 #[repr(u8)]
@@ -328,7 +336,7 @@ pub enum AACPEvent {
     StemPress(StemPressType, StemPressBudType),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AirPodsLEKeys {
     pub irk: String,
     pub enc_key: String,
@@ -520,7 +528,8 @@ impl AACPManager {
         }
     }
 
-    pub async fn connect(&mut self, addr: Address) {
+    /// Open the AACP channel and start the send/receive tasks.
+    pub async fn connect(&mut self, addr: Address) -> Result<()> {
         info!("AACPManager connecting to {} on PSM {:#06X}...", addr, PSM);
         let target_sa = SocketAddr::new(addr, AddressType::BrEdr, PSM);
 
@@ -533,7 +542,7 @@ impl AACPManager {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to create L2CAP socket: {}", e);
-                return;
+                return Err(Error::from(e));
             }
         };
 
@@ -542,11 +551,11 @@ impl AACPManager {
                 Ok(Ok(s)) => Arc::new(s),
                 Ok(Err(e)) => {
                     error!("L2CAP connect failed: {}", e);
-                    return;
+                    return Err(Error::from(e));
                 }
                 Err(_) => {
                     error!("L2CAP connect timed out");
-                    return;
+                    return Err(connect_error(std::io::ErrorKind::TimedOut, "L2CAP connect timed out"));
                 }
             };
 
@@ -560,14 +569,17 @@ impl AACPManager {
                     if e.raw_os_error() == Some(107) {
                         // ENOTCONN
                         error!("Peer has disconnected during connection setup.");
-                        return;
+                        return Err(Error::from(e));
                     }
                     error!("Error getting peer address: {}", e);
                 }
             }
             if start.elapsed() >= CONNECT_TIMEOUT {
                 error!("Timed out waiting for L2CAP connection to be fully established.");
-                return;
+                return Err(connect_error(
+                    std::io::ErrorKind::TimedOut,
+                    "L2CAP connection setup timed out",
+                ));
             }
             sleep(POLL_INTERVAL).await;
         }
@@ -585,6 +597,7 @@ impl AACPManager {
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(recv_thread(manager_clone, seq_packet.clone()));
         tasks.spawn(send_thread(rx, seq_packet));
+        Ok(())
     }
 
     async fn send_packet(&self, data: &[u8]) -> Result<()> {
@@ -711,6 +724,7 @@ impl AACPManager {
                             0x01 => BatteryStatus::Charging,
                             0x02 => BatteryStatus::NotCharging,
                             0x04 => BatteryStatus::Disconnected,
+                            0x05 => BatteryStatus::OptimizedCharging,
                             _ => {
                                 error!("Unknown battery status: {:#04x}", payload[base_index + 3]);
                                 continue;
@@ -778,8 +792,12 @@ impl AACPManager {
                 }
             }
             opcodes::EAR_DETECTION => {
-                let primary_status = packet[6];
-                let secondary_status = packet[7];
+                if payload.len() < 4 {
+                    error!("Ear Detection packet too short: {}", hex::encode(payload));
+                    return;
+                }
+                let primary_status = payload[2];
+                let secondary_status = payload[3];
                 let mut statuses = Vec::new();
                 statuses.push(match primary_status {
                     0x00 => EarDetectionStatus::InEar,
@@ -858,13 +876,16 @@ impl AACPManager {
                     while index < data.len() && data[index] != 0x00 {
                         index += 1;
                     }
-                    let str_bytes = &data[start..index];
-                    if let Ok(s) = std::str::from_utf8(str_bytes) {
-                        strings.push(s.to_string());
-                    }
+                    // Lossy, not skipped: the fields are positional, so dropping
+                    // one bad string would shift every field after it.
+                    strings.push(String::from_utf8_lossy(&data[start..index]).into_owned());
+                }
+                if strings.is_empty() {
+                    error!("Information packet has no strings: {}", hex::encode(payload));
+                    return;
                 }
                 strings.remove(0);
-                let info = AirPodsInformation {
+                let mut info = AirPodsInformation {
                     name: strings.first().cloned().unwrap_or_default(),
                     model_number: strings.get(1).cloned().unwrap_or_default(),
                     manufacturer: strings.get(2).cloned().unwrap_or_default(),
@@ -882,23 +903,25 @@ impl AACPManager {
                     },
                 };
                 let mut state = self.state.lock().await;
-                if let Some(mac) = state.airpods_mac
+                let updated = if let Some(mac) = state.airpods_mac
                     && let Some(device_data) = state.devices.get_mut(&mac.to_string())
                 {
+                    // The LE keys come from a separate response; this packet must
+                    // not wipe the ones already stored.
+                    if let Some(DeviceInformation::AirPods(old)) = &device_data.information {
+                        info.le_keys = old.le_keys.clone();
+                    }
                     device_data.name = info.name.clone();
                     device_data.information = Some(DeviceInformation::AirPods(info.clone()));
-                }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                    Some((mac.to_string(), device_data.clone()))
+                } else {
+                    None
+                };
+                drop(state);
                 info!("Received Information: {:?}", info);
+                if let Some((mac, data)) = updated {
+                    save_device(mac, data).await;
+                }
             }
 
             opcodes::PROXIMITY_KEYS_RSP => {
@@ -942,49 +965,35 @@ impl AACPManager {
                         .collect::<Vec<_>>()
                 );
                 let mut state = self.state.lock().await;
-                for (key_type, key_data) in &keys {
-                    if let Some(kt) = ProximityKeyType::from_u8(*key_type)
-                        && let Some(mac) = state.airpods_mac
-                    {
-                        let mac_str = mac.to_string();
-                        let device_data =
-                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                name: mac_str.clone(),
-                                type_: DeviceType::AirPods,
-                                information: None,
-                            });
-                        match kt {
-                            ProximityKeyType::Irk => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.irk = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!("Device information is not AirPods for adding LE IRK.");
-                                }
-                            },
-                            ProximityKeyType::EncKey => match device_data.information.as_mut() {
-                                Some(DeviceInformation::AirPods(info)) => {
-                                    info.le_keys.enc_key = hex::encode(key_data);
-                                }
-                                _ => {
-                                    error!(
-                                        "Device information is not AirPods for adding LE encryption key."
-                                    );
-                                }
-                            },
+                let Some(mac) = state.airpods_mac else {
+                    return;
+                };
+                let mac_str = mac.to_string();
+                let device_data = state.devices.entry(mac_str.clone()).or_insert(DeviceData {
+                    name: mac_str.clone(),
+                    type_: DeviceType::AirPods,
+                    information: None,
+                });
+                // The keys may arrive before the information packet; start an
+                // empty record for them instead of dropping them.
+                if !matches!(device_data.information, Some(DeviceInformation::AirPods(_))) {
+                    device_data.information =
+                        Some(DeviceInformation::AirPods(AirPodsInformation::default()));
+                }
+                if let Some(DeviceInformation::AirPods(info)) = device_data.information.as_mut() {
+                    for (key_type, key_data) in &keys {
+                        match ProximityKeyType::from_u8(*key_type) {
+                            Some(ProximityKeyType::Irk) => info.le_keys.irk = hex::encode(key_data),
+                            Some(ProximityKeyType::EncKey) => {
+                                info.le_keys.enc_key = hex::encode(key_data)
+                            }
+                            None => {}
                         }
                     }
                 }
-                let json = serde_json::to_string(&state.devices).unwrap();
-                if let Some(parent) = get_devices_path().parent()
-                    && let Err(e) = tokio::fs::create_dir_all(&parent).await
-                {
-                    error!("Failed to create directory for devices: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
-                    error!("Failed to save devices: {}", e);
-                }
+                let data = device_data.clone();
+                drop(state);
+                save_device(mac_str, data).await;
             }
             opcodes::STEM_PRESS => {
                 if payload.len() < 4 {
@@ -1033,7 +1042,8 @@ impl AACPManager {
                     return;
                 }
                 let count = payload[2] as usize;
-                if payload.len() < 3 + count * 8 {
+                // Entries start at offset 5 and are 8 bytes each.
+                if payload.len() < 5 + count * 8 {
                     error!(
                         "Connected Devices packet length mismatch: {}",
                         hex::encode(payload)
@@ -1073,7 +1083,7 @@ impl AACPManager {
                 info!("Received Connected Devices: {:?}", state.connected_devices);
             }
             opcodes::SMART_ROUTING_RESP => {
-                let packet_string = String::from_utf8_lossy(&payload[2..]);
+                let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or_default());
                 info!("Received Smart Routing Response: {}", packet_string);
                 if packet_string.contains("SetOwnershipToFalse") {
                     info!("Received OwnershipToFalse request");
@@ -1466,4 +1476,23 @@ async fn send_thread(mut rx: mpsc::Receiver<Vec<u8>>, sp: Arc<SeqPacket>) {
         }
     }
     info!("Send thread finished.");
+}
+
+/// Persist one device record without blocking the runtime.
+async fn save_device(mac: String, data: DeviceData) {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::utils::update_devices_file(|devices| {
+            devices.insert(mac, data);
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Failed to save devices: {}", e),
+        Err(e) => error!("Failed to save devices: {}", e),
+    }
+}
+
+fn connect_error(kind: std::io::ErrorKind, msg: &str) -> Error {
+    Error::from(std::io::Error::new(kind, msg))
 }

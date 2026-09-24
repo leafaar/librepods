@@ -15,33 +15,23 @@ pub fn get_devices_path() -> PathBuf {
 
 pub fn ensure_device_registered(mac: &str, name: &str, type_: crate::devices::enums::DeviceType) {
     use crate::devices::enums::DeviceData;
-    use std::collections::HashMap;
 
-    let path = get_devices_path();
-    let json = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
-    let mut devices: HashMap<String, DeviceData> = serde_json::from_str(&json).unwrap_or_default();
-    if devices.contains_key(mac) {
-        return;
-    }
-    log::info!("Registering device {} ({}) as {:?}", name, mac, type_);
-    devices.insert(
-        mac.to_string(),
-        DeviceData {
-            name: name.to_string(),
-            type_,
-            information: None,
-        },
-    );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match serde_json::to_string(&devices) {
-        Ok(updated) => {
-            if let Err(e) = std::fs::write(&path, updated) {
-                log::error!("Failed to write devices file: {}", e);
-            }
+    let result = update_devices_file(|devices| {
+        if devices.contains_key(mac) {
+            return;
         }
-        Err(e) => log::error!("Failed to serialize devices file: {}", e),
+        log::info!("Registering device {} ({}) as {:?}", name, mac, type_);
+        devices.insert(
+            mac.to_string(),
+            DeviceData {
+                name: name.to_string(),
+                type_,
+                information: None,
+            },
+        );
+    });
+    if let Err(e) = result {
+        log::error!("Failed to register device {}: {}", mac, e);
     }
 }
 
@@ -251,7 +241,7 @@ impl AppSettings {
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_atomic(&path, &json) {
                     log::error!("Failed to write app settings: {}", e);
                 }
             }
@@ -287,4 +277,42 @@ impl From<MyTheme> for Theme {
             MyTheme::Ferra => Theme::Ferra,
         }
     }
+}
+
+/// Serializes every read-modify-write of devices.json in this process.
+static DEVICES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read devices.json, let `f` change it, and write it back atomically. Every
+/// writer goes through here so no one overwrites the file from a stale copy.
+pub fn update_devices_file(
+    f: impl FnOnce(&mut std::collections::HashMap<String, crate::devices::enums::DeviceData>),
+) -> std::io::Result<()> {
+    let _guard = DEVICES_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = get_devices_path();
+    let mut devices = match std::fs::read_to_string(&path) {
+        // Refuse to write over a file we cannot parse: starting from an empty
+        // map here would silently drop every saved device.
+        Ok(json) => serde_json::from_str(&json).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not valid, not overwriting it: {e}", path.display()),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(e),
+    };
+    f(&mut devices);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_atomic(&path, &serde_json::to_string(&devices)?)
+}
+
+/// Write to a temp file and rename it into place, so a crash mid-write cannot
+/// leave a truncated file, and a concurrent reader sees the old or the new
+/// contents, never half of one.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
 }

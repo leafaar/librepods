@@ -1,16 +1,16 @@
 use crate::bluetooth::att::{ATTHandles, ATTManager};
 use crate::devices::enums::{DeviceData, DeviceInformation, DeviceType};
 use crate::ui::messages::BluetoothUIMessage;
-use crate::utils::get_devices_path;
+use crate::utils::{get_devices_path, update_devices_file};
 use bluer::Address;
-use log::{debug, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NothingInformation {
     pub serial_number: String,
     pub firmware_version: String,
@@ -25,12 +25,9 @@ impl NothingDevice {
     pub async fn new(
         mac_address: Address,
         ui_tx: mpsc::UnboundedSender<BluetoothUIMessage>,
-    ) -> Self {
+    ) -> bluer::Result<Self> {
         let mut att_manager = ATTManager::new();
-        att_manager
-            .connect(mac_address)
-            .await
-            .expect("Failed to connect");
+        att_manager.connect(mac_address).await?;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -69,8 +66,7 @@ impl NothingDevice {
                     0x00, // something, idk
                 ],
             )
-            .await
-            .expect("Failed to write");
+            .await?;
 
         sleep(Duration::from_millis(100)).await;
 
@@ -80,40 +76,23 @@ impl NothingDevice {
                 ATTHandles::NothingEverything,
                 &[0x55, 0x20, 0x01, 0x06, 0xC0, 0x00, 0x00, 0x13, 0x00, 0x00],
             )
-            .await
-            .expect("Failed to write");
+            .await?;
 
         // let ui_tx_clone = ui_tx.clone();
-        let information_l = information.clone();
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 if data.starts_with(&[0x55, 0x20, 0x01, 0x42, 0x40]) {
-                    let firmware_version = String::from_utf8_lossy(&data[8..]).to_string();
+                    let Some(version_bytes) = data.get(8..) else {
+                        continue;
+                    };
+                    let firmware_version = String::from_utf8_lossy(version_bytes).to_string();
                     info!(
                         "Received firmware version from Nothing device {}: {}",
                         mac_address, firmware_version
                     );
-                    let new_information = NothingInformation {
-                        serial_number: information_l.serial_number.clone(),
-                        firmware_version: firmware_version.clone(),
-                    };
-                    let mut new_devices = devices.clone();
-                    new_devices.insert(
-                        device_key.clone(),
-                        DeviceData {
-                            name: devices
-                                .get(&device_key)
-                                .map(|d| d.name.clone())
-                                .unwrap_or("Nothing Device".to_string()),
-                            type_: devices
-                                .get(&device_key)
-                                .map(|d| d.type_.clone())
-                                .unwrap_or(DeviceType::Nothing),
-                            information: Some(DeviceInformation::Nothing(new_information)),
-                        },
-                    );
-                    let json = serde_json::to_string(&new_devices).unwrap();
-                    std::fs::write(get_devices_path(), json).expect("Failed to write devices file");
+                    save_nothing_info(device_key.clone(), move |info| {
+                        info.firmware_version = firmware_version;
+                    });
                 } else if data.starts_with(&[0x55, 0x20, 0x01, 0x06, 0x40]) {
                     let serial_number_start_position = data
                         .iter()
@@ -134,28 +113,9 @@ impl NothingDevice {
                             "Received serial number from Nothing device {}: {}",
                             mac_address, serial_number
                         );
-                        let new_information = NothingInformation {
-                            serial_number: serial_number.clone(),
-                            firmware_version: information_l.firmware_version.clone(),
-                        };
-                        let mut new_devices = devices.clone();
-                        new_devices.insert(
-                            device_key.clone(),
-                            DeviceData {
-                                name: devices
-                                    .get(&device_key)
-                                    .map(|d| d.name.clone())
-                                    .unwrap_or("Nothing Device".to_string()),
-                                type_: devices
-                                    .get(&device_key)
-                                    .map(|d| d.type_.clone())
-                                    .unwrap_or(DeviceType::Nothing),
-                                information: Some(DeviceInformation::Nothing(new_information)),
-                            },
-                        );
-                        let json = serde_json::to_string(&new_devices).unwrap();
-                        std::fs::write(get_devices_path(), json)
-                            .expect("Failed to write devices file");
+                        save_nothing_info(device_key.clone(), move |info| {
+                            info.serial_number = serial_number;
+                        });
                     } else {
                         debug!(
                             "Serial number format unexpected from Nothing device {}: {:?}",
@@ -171,9 +131,32 @@ impl NothingDevice {
             }
         });
 
-        NothingDevice {
+        Ok(NothingDevice {
             att_manager,
             information,
-        }
+        })
     }
+}
+
+/// Update this device's saved information from the file's current contents, so
+/// the other field and every other device are kept.
+fn save_nothing_info(key: String, update: impl FnOnce(&mut NothingInformation) + Send + 'static) {
+    tokio::task::spawn_blocking(move || {
+        let result = update_devices_file(|devices| {
+            let entry = devices.entry(key).or_insert_with(|| DeviceData {
+                name: "Nothing Device".to_string(),
+                type_: DeviceType::Nothing,
+                information: None,
+            });
+            if !matches!(entry.information, Some(DeviceInformation::Nothing(_))) {
+                entry.information = Some(DeviceInformation::Nothing(NothingInformation::default()));
+            }
+            if let Some(DeviceInformation::Nothing(info)) = entry.information.as_mut() {
+                update(info);
+            }
+        });
+        if let Err(e) = result {
+            error!("Failed to save Nothing device information: {}", e);
+        }
+    });
 }
