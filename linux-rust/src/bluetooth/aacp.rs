@@ -448,7 +448,7 @@ impl AACPManager {
         }
         // AirPods don't echo this back, so record it in our own status list
         // (the source of truth for conversation_detection_enabled) and push it
-        // to the UI ourselves.
+        // to the UI and to the subscribers (the tray checkmark) ourselves.
         let mut state = self.state.lock().await;
         if let Some(existing) = state
             .control_command_status_list
@@ -463,6 +463,14 @@ impl AACPManager {
                     identifier: ControlCommandIdentifiers::ConversationDetectConfig,
                     value: vec![value],
                 });
+        }
+        if let Some(subscribers) = state
+            .control_command_subscribers
+            .get(&ControlCommandIdentifiers::ConversationDetectConfig)
+        {
+            for sub in subscribers {
+                let _ = sub.send(vec![value]);
+            }
         }
         if let Some(ref tx) = state.event_tx {
             let _ = tx.send(AACPEvent::ControlCommand(ControlCommandStatus {
