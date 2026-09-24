@@ -15,10 +15,7 @@ const AACP_HEADER: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
 /// Predicate for 0x58 *audio* frames (subtype 0x0001)
 #[inline]
 pub fn is_audio(sdu: &[u8]) -> bool {
-    sdu.len() >= 8
-        && sdu[..4] == AACP_HEADER
-        && u16le(sdu, 4) == 0x58
-        && u16le(sdu, 6) == 0x0001
+    sdu.len() >= 8 && sdu[..4] == AACP_HEADER && u16le(sdu, 4) == 0x58 && u16le(sdu, 6) == 0x0001
 }
 
 /// Walk the sub-frames of one 0x58 audio SDU, invoking `emit` per AAC-ELD AU.
