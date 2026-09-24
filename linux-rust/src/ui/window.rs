@@ -71,6 +71,11 @@ pub fn start_ui(
     .run()
 }
 
+/// Redraw rate while the level meter or the microphone test is on screen.
+const MIC_TICK: Duration = Duration::from_millis(50);
+/// Rate at which to check whether an app opened the hi-res microphone.
+const MIC_WATCH: Duration = Duration::from_secs(1);
+
 pub struct App {
     window: Option<window::Id>,
     panes: pane_grid::State<Pane>,
@@ -102,6 +107,9 @@ pub struct App {
     // Last case level each device reported. The case only reports while a bud
     // is in it, so the sidebar shows this, dimmed, the rest of the time.
     last_case_level: HashMap<String, u8>,
+    // Contents of devices.json. Reloaded on the messages that can change the
+    // file, never from view(), which runs on every frame.
+    devices: HashMap<String, DeviceData>,
 }
 
 /// The microphone test on the AirPods page. Holds the live recorder or player.
@@ -283,6 +291,7 @@ impl App {
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
                 last_case_level: HashMap::new(),
+                devices: load_devices(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -311,6 +320,7 @@ impl App {
         match message {
             Message::WindowOpened(id) => {
                 self.window = Some(id);
+                self.devices = load_devices();
                 Task::none()
             }
             Message::WindowClosed(id) => {
@@ -424,6 +434,7 @@ impl App {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         debug!("Opening main window...");
+                        self.devices = load_devices();
                         if let Some(window_id) = self.window {
                             Task::batch(vec![window::gain_focus(window_id), wait_task])
                         } else {
@@ -455,19 +466,8 @@ impl App {
                         //     conversation_awareness_enabled: false,
                         // }));
 
-                        let type_ = {
-                            let devices_json = std::fs::read_to_string(get_devices_path())
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to read devices file: {}", e);
-                                    "{}".to_string()
-                                });
-                            let devices_list: HashMap<String, DeviceData> =
-                                serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                    error!("Deserialization failed: {}", e);
-                                    HashMap::new()
-                                });
-                            devices_list.get(&mac).map(|d| d.type_.clone())
-                        };
+                        self.devices = load_devices();
+                        let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                         match type_ {
                             Some(DeviceType::AirPods) => {
                                 let managers = Arc::clone(&self.device_managers);
@@ -477,22 +477,11 @@ impl App {
                                 let aacp_manager_state = aacp_manager.state.clone();
                                 let state = aacp_manager_state.blocking_lock();
                                 debug!("AACP manager found for AirPods device {}", mac);
-                                let device_name = {
-                                    let devices_json = std::fs::read_to_string(get_devices_path())
-                                        .unwrap_or_else(|e| {
-                                            error!("Failed to read devices file: {}", e);
-                                            "{}".to_string()
-                                        });
-                                    let devices_list: HashMap<String, DeviceData> =
-                                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                            error!("Deserialization failed: {}", e);
-                                            HashMap::new()
-                                        });
-                                    devices_list
-                                        .get(&mac)
-                                        .map(|d| d.name.clone())
-                                        .unwrap_or_else(|| "Unknown Device".to_string())
-                                };
+                                let device_name = self
+                                    .devices
+                                    .get(&mac)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| "Unknown Device".to_string());
                                 self.remember_case_level(&mac, &state.battery_info);
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
@@ -582,6 +571,10 @@ impl App {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         debug!("AACP UI Event for {}: {:?}", mac, event);
+                        // The AACP handlers save the device information and name
+                        // to devices.json without a UI event of their own; the
+                        // events that follow are the next chance to pick it up.
+                        self.devices = load_devices();
                         match event {
                             AACPEvent::ControlCommand(status) => match status.identifier {
                                 ControlCommandIdentifiers::ListeningMode => {
@@ -728,6 +721,7 @@ impl App {
                     if let Err(e) = result {
                         error!("Failed to save device: {}", e);
                     }
+                    self.devices = load_devices();
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
                 Task::none()
@@ -746,19 +740,7 @@ impl App {
                 }
                 self.device_states.insert(mac.clone(), state);
                 // if airpods, update the noise control state combo box based on allow off mode
-                let type_ = {
-                    let devices_json =
-                        std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-                            error!("Failed to read devices file: {}", e);
-                            "{}".to_string()
-                        });
-                    let devices_list: HashMap<String, DeviceData> =
-                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
-                            HashMap::new()
-                        });
-                    devices_list.get(&mac).map(|d| d.type_.clone())
-                };
+                let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                 if let Some(DeviceType::AirPods) = type_
                     && let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac)
                 {
@@ -874,15 +856,7 @@ impl App {
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
-        let devices_json = std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-            error!("Failed to read devices file: {}", e);
-            "{}".to_string()
-        });
-        let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
-            .unwrap_or_else(|e| {
-                error!("Deserialization failed: {}", e);
-                HashMap::new()
-            });
+        let devices_list = &self.devices;
         let pane_grid = pane_grid::PaneGrid::new(&self.panes, |_pane_id, pane, _is_maximized| {
             match pane {
                 Pane::Sidebar => {
@@ -988,15 +962,14 @@ impl App {
                     };
 
                     let mut devices = column!().spacing(4);
-                    let mut devices_vec: Vec<(String, DeviceData)> = devices_list.clone().into_iter().collect();
+                    let mut devices_vec: Vec<(&String, &DeviceData)> = devices_list.iter().collect();
                     devices_vec.sort_by(|a, b| a.1.name.cmp(&b.1.name));
                     for (mac, device) in devices_vec {
-                        let name = device.name.clone();
                         let tab_button = create_tab_button(
                             Tab::Device(mac.clone()),
-                            &name,
-                            &mac,
-                            self.bluetooth_state.connected_devices.contains(&mac)
+                            &device.name,
+                            mac,
+                            self.bluetooth_state.connected_devices.contains(mac)
                         );
                         devices = devices.push(tab_button);
                     }
@@ -1077,7 +1050,7 @@ impl App {
                                                     device_managers.get(id).and_then(|managers| {
                                                         managers.get_aacp().map(|aacp_manager| airpods_view(
                                                                     id,
-                                                                    &devices_list,
+                                                                    devices_list,
                                                                     state,
                                                                     aacp_manager.clone(),
                                                                     self.hires_mic_pause_convo,
@@ -1103,7 +1076,7 @@ impl App {
                                         if let Some(DeviceState::Nothing(state)) = device_state {
                                             if let Some(device_managers) = device_managers.get(id) {
                                                 if let Some(att_manager) = device_managers.get_att() {
-                                                    nothing_view(id, &devices_list, state, att_manager.clone())
+                                                    nothing_view(id, devices_list, state, att_manager.clone())
                                                 } else {
                                                     error!("No ATT manager found for Nothing device {}", id);
                                                     container(
@@ -1726,20 +1699,63 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let close = window::close_events().map(Message::WindowClosed);
 
-        // Only tick while a hi-res mic is capturing.
-        let mic_active = self
-            .device_states
-            .values()
-            .any(|s| matches!(s, DeviceState::AirPods(a) if a.hires_mic_enabled));
-
-        if mic_active {
-            let tick = iced::time::every(std::time::Duration::from_millis(50))
-                .map(|_| Message::MicLevelTick);
-            Subscription::batch([close, tick])
-        } else {
-            close
+        match self.tick_interval() {
+            Some(interval) => {
+                let tick = iced::time::every(interval).map(|_| Message::MicLevelTick);
+                Subscription::batch([close, tick])
+            }
+            None => close,
         }
     }
+
+    /// How often to redraw for the level meter and the microphone test, or None
+    /// when nothing on screen moves by itself.
+    fn tick_interval(&self) -> Option<Duration> {
+        // Polled even with the window closed, to notice the recorder hitting
+        // MAX_RECORDING.
+        if matches!(self.mic_test, MicTest::Recording(_)) {
+            return Some(MIC_TICK);
+        }
+        self.window?;
+        if matches!(self.mic_test, MicTest::Ready(_)) || self.airpods_mic_active() {
+            return Some(MIC_TICK);
+        }
+        // Nothing tells the UI when an app opens the hi-res mic, so watch for it
+        // slowly to bring up the level meter.
+        let airpods_connected = self
+            .device_states
+            .values()
+            .any(|s| matches!(s, DeviceState::AirPods(_)));
+        (self.hires_mic_enabled && airpods_connected).then_some(MIC_WATCH)
+    }
+
+    fn airpods_mic_active(&self) -> bool {
+        let managers = self.device_managers.blocking_read();
+        self.device_states.iter().any(|(mac, state)| {
+            matches!(state, DeviceState::AirPods(_))
+                && managers
+                    .get(mac)
+                    .and_then(|m| m.get_aacp())
+                    .is_some_and(|aacp| aacp.mic_active())
+        })
+    }
+}
+
+/// Read devices.json. A missing or unreadable file gives an empty list.
+fn load_devices() -> HashMap<String, DeviceData> {
+    let devices_json = match std::fs::read_to_string(get_devices_path()) {
+        Ok(json) => json,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                error!("Failed to read devices file: {}", e);
+            }
+            return HashMap::new();
+        }
+    };
+    serde_json::from_str(&devices_json).unwrap_or_else(|e| {
+        error!("Deserialization failed: {}", e);
+        HashMap::new()
+    })
 }
 
 const CHARGING_MARK: &str = "\u{1002E6}";
