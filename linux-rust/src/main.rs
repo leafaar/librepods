@@ -156,7 +156,10 @@ async fn async_main(
             ui_tx: Some(ui_tx.clone()),
             shutdown_tx: Some(shutdown_tx.clone()),
         };
-        match tray.spawn().await {
+        // LibrePods can be started by the session manager before the desktop's
+        // StatusNotifierWatcher is ready. Assume it will appear so the tray
+        // registers when it does, instead of failing for the whole session.
+        match tray.assume_sni_available(true).spawn().await {
             Ok(handle) => Some(handle),
             Err(e) => {
                 log::warn!(
