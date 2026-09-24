@@ -31,6 +31,7 @@ use {
         blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
         message::MatchRule,
     },
+    gtk::glib,
     ksni::{Handle, TrayMethods},
     std::{collections::HashMap, env, sync::Arc, time::Duration},
     tokio::sync::{
@@ -66,30 +67,51 @@ struct Args {
     version: bool,
 }
 
-fn main() -> iced::Result {
+fn main() -> glib::ExitCode {
     let args = Args::parse();
 
     if args.version {
         print_version();
-        return Ok(());
+        return glib::ExitCode::SUCCESS;
     }
 
     init_tracing(args.debug, args.le_debug);
 
+    if !args.no_tray && ui::gtk::present_running_instance() {
+        info!("LibrePods is already running; showing its window");
+        return glib::ExitCode::SUCCESS;
+    }
+
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
     let device_managers: Managers = Arc::new(RwLock::new(HashMap::new()));
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!("LibrePods could not start the async runtime: {e}");
+            return glib::ExitCode::FAILURE;
+        },
+    };
 
     if args.no_tray {
-        // Run headless without UI
         info!("Running in headless mode (no GUI)");
-        run_backend(ui_tx, device_managers, args.no_tray);
-        Ok(())
-    } else {
-        let backend_managers = device_managers.clone();
-        let no_tray = args.no_tray;
-        std::thread::spawn(move || run_backend(ui_tx, backend_managers, no_tray));
-        ui::window::start_ui(ui_rx, args.start_minimized, device_managers)
+        run_backend(&runtime, ui_tx, device_managers, args.no_tray);
+        return glib::ExitCode::SUCCESS;
     }
+
+    // The UI spawns device work on the backend runtime through this handle.
+    let backend = runtime.handle().clone();
+    let backend_managers = device_managers.clone();
+    let no_tray = args.no_tray;
+    std::thread::spawn(move || run_backend(&runtime, ui_tx, backend_managers, no_tray));
+    ui::gtk::run(
+        ui_rx,
+        device_managers,
+        backend,
+        ui::gtk::Options {
+            start_minimized: args.start_minimized,
+            tray: true,
+        },
+    )
 }
 
 // --version is the one output meant for stdout rather than the log.
@@ -104,14 +126,12 @@ fn print_version() {
 /// Run the Bluetooth side on its own tokio runtime until the process exits.
 /// A failure to start ends the process, UI included.
 fn run_backend(
+    runtime: &tokio::runtime::Runtime,
     ui_tx: UnboundedSender<BluetoothUIMessage>,
     device_managers: Managers,
     no_tray: bool,
 ) {
-    let result = tokio::runtime::Runtime::new()
-        .context("could not start the async runtime")
-        .and_then(|rt| rt.block_on(async_main(ui_tx, device_managers, no_tray)));
-    if let Err(e) = result {
+    if let Err(e) = runtime.block_on(async_main(ui_tx, device_managers, no_tray)) {
         error!("LibrePods could not start: {e:#}");
         std::process::exit(1);
     }

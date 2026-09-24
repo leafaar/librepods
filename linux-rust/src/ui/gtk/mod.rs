@@ -32,6 +32,7 @@
 
 mod app;
 mod battery;
+mod instance;
 mod model;
 mod pages;
 mod sidebar;
@@ -41,4 +42,7 @@ mod theme;
 mod widgets;
 mod window;
 
-pub use app::{Options, run};
+pub use {
+    app::{Options, run},
+    instance::present_running_instance,
+};
