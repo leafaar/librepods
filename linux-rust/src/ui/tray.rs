@@ -347,6 +347,7 @@ mod tests {
             allow_off_option: None,
             command_tx: None,
             ui_tx: Some(ui_tx),
+            shutdown_tx: None,
         };
 
         <MyTray as ksni::Tray>::activate(&mut tray, TRAY_ACTIVATION_X, TRAY_ACTIVATION_Y);
