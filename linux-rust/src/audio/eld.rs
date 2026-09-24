@@ -5,7 +5,7 @@
 use {
     ffmpeg_sys_next as ff,
     std::{os::raw::c_int, ptr, sync::Once},
-    tracing::{info, warn},
+    tracing::{debug, warn},
 };
 
 pub const ELD_SAMPLE_RATE: u32 = 64000;
@@ -169,13 +169,19 @@ impl EldDecoder {
             }
             if !self.rate_logged {
                 self.rate_logged = true;
+                // The rate in the AudioSpecificConfig header reads 48 kHz, but the
+                // AirPods send 133 frames of 480 samples a second, so the stream
+                // runs at 64 kHz. The frame size is what has to match.
                 let rate = (*self.frame).sample_rate;
-                if u32::try_from(rate) == Ok(ELD_SAMPLE_RATE) {
-                    info!("[audio] AAC-ELD decoder output: {} Hz", rate);
+                if usize::try_from(ns) == Ok(ELD_FRAME_SAMPLES) {
+                    debug!(
+                        "[audio] AAC-ELD frames of {} samples (header rate {} Hz, played at {} Hz)",
+                        ns, rate, ELD_SAMPLE_RATE
+                    );
                 } else {
                     warn!(
-                        "[audio] AAC-ELD decoder output is {} Hz, expected {} Hz",
-                        rate, ELD_SAMPLE_RATE
+                        "[audio] AAC-ELD frames of {} samples, expected {}; the microphone will play at the wrong speed",
+                        ns, ELD_FRAME_SAMPLES
                     );
                 }
             }

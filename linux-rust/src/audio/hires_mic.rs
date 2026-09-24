@@ -5,7 +5,7 @@ use {
     crate::{
         audio::{
             eld::{ELD_CHANNELS, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, EldDecoder},
-            output::{self, Output, VirtualMic},
+            output::{self, Output, SourceConsumers, VirtualMic},
         },
         bluetooth::{aacp::AACPManager, aacp_audio},
     },
@@ -44,6 +44,17 @@ const HEALTHY_RUN: Duration = Duration::from_secs(30);
 /// is treated as wedged and recreated.
 const DECODER_RESET_ERRORS: u32 = 50;
 const LEVEL_RELEASE: f32 = 0.85;
+/// How long the recorder must be gone before the capture stops. The A2DP reset
+/// after a capture starts pauses the virtual source's streams for a moment, and
+/// stopping on that blip would restart the capture right away.
+const RECORDER_GONE_GRACE: Duration = Duration::from_millis(1500);
+/// A recorder that keeps the microphone open but paused this long no longer
+/// holds the capture, so the AirPods stop streaming.
+const RECORDER_PAUSED_GRACE: Duration = Duration::from_secs(10);
+/// Least time between stopping the 0x58 stream and starting it again. A quick
+/// stop and start makes the AirPods switch to a phone call (HFP), after which
+/// they send no hi-res audio.
+const RESTART_GAP: Duration = Duration::from_secs(2);
 
 // The status fields are plain values replaced whole, so a writer that panicked
 // cannot have left one half updated; a poisoned lock is still usable.
@@ -164,6 +175,49 @@ struct Capture {
     started: Instant,
 }
 
+/// Decides from the observed recorders when a capture may start and when it
+/// should stop, so that short gaps in what the sound server reports do not
+/// toggle the AirPods microphone.
+#[derive(Debug, Default)]
+struct CaptureGate {
+    last_active: Option<Instant>,
+    last_present: Option<Instant>,
+    stopped_at: Option<Instant>,
+}
+
+impl CaptureGate {
+    fn observe(&mut self, now: Instant, consumers: &SourceConsumers) {
+        if consumers.present {
+            self.last_present = Some(now);
+        }
+        if consumers.active.is_some() {
+            self.last_active = Some(now);
+        }
+    }
+
+    /// Whether a recorder still holds the microphone: seen recently, and not
+    /// paused for too long.
+    fn recorder_holds(&self, now: Instant) -> bool {
+        let seen_within =
+            |at: Option<Instant>, grace| at.is_some_and(|at| now.duration_since(at) <= grace);
+        seen_within(self.last_present, RECORDER_GONE_GRACE)
+            && seen_within(self.last_active, RECORDER_PAUSED_GRACE)
+    }
+
+    /// A capture starts only for a recorder that is running now, and not too
+    /// soon after the last stop.
+    fn may_start(&self, now: Instant, consumers: &SourceConsumers) -> bool {
+        consumers.active.is_some()
+            && self
+                .stopped_at
+                .is_none_or(|at| now.duration_since(at) >= RESTART_GAP)
+    }
+
+    fn stopped(&mut self, now: Instant) {
+        self.stopped_at = Some(now);
+    }
+}
+
 // Retry schedule for starting the capture while a recorder has the mic open:
 // exponential backoff, then give up until the recorder leaves.
 #[derive(Default)]
@@ -216,6 +270,23 @@ fn capture_failed(retry: &mut CaptureRetry, what: &str) {
     }
 }
 
+/// Ask the sound server who records from the virtual source. A failed check
+/// keeps the last answer: one missed reading must not look like the recorder
+/// leaving.
+async fn refresh_consumers(consumers: &mut SourceConsumers) {
+    if let Some(seen) =
+        tokio::task::spawn_blocking(|| output::source_consumers(output::SOURCE_NAME))
+            .await
+            .ok()
+            .and_then(|seen| {
+                seen.inspect_err(|e| debug!("[hires] could not check for recorders: {}", e))
+                    .ok()
+            })
+    {
+        *consumers = seen;
+    }
+}
+
 async fn monitor_loop(
     aacp: AACPManager,
     addr: String,
@@ -226,6 +297,8 @@ async fn monitor_loop(
 ) {
     let mut capture: Option<Capture> = None;
     let mut retry = CaptureRetry::default();
+    let mut gate = CaptureGate::default();
+    let mut consumers = SourceConsumers::default();
     // Conversation detection value saved while we override it off for capture.
     let mut old_convo_state: Option<bool> = None;
     info!(
@@ -240,20 +313,15 @@ async fn monitor_loop(
             () = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
-        let app = tokio::task::spawn_blocking(|| output::source_consumer(output::SOURCE_NAME))
-            .await
-            .ok()
-            .and_then(|consumer| {
-                consumer
-                    .inspect_err(|e| debug!("[hires] could not check for recorders: {}", e))
-                    .ok()
-            })
-            .flatten();
+        refresh_consumers(&mut consumers).await;
+        let now = Instant::now();
+        gate.observe(now, &consumers);
         let enabled = aacp.hires_mic_enabled();
-        let recording = app.is_some();
+        let recording = gate.recorder_holds(now);
+        let app = consumers.active.clone();
 
         capture = match (enabled, recording, capture.take()) {
-            (true, true, None) if retry.may_start(Instant::now()) => {
+            (true, _, None) if gate.may_start(now, &consumers) && retry.may_start(now) => {
                 info!("[hires] recorder detected ({:?}), starting capture", app);
                 if let Some(c) = start_capture(&aacp, &addr, &status).await {
                     status.set_capture(app);
@@ -273,11 +341,15 @@ async fn monitor_loop(
                 }
             },
             (true, true, Some(c)) => {
-                status.set_capture(app);
+                // Keep the last name through a short pause of the recorder.
+                if app.is_some() {
+                    status.set_capture(app);
+                }
                 let stalled = status.since_last_sdu().is_some_and(|d| d > STALL_TIMEOUT);
                 if stalled {
                     let healthy = c.started.elapsed() >= HEALTHY_RUN;
                     stop_capture(c, &aacp, &addr).await;
+                    gate.stopped(Instant::now());
                     status.reset();
                     if healthy {
                         retry.reset();
@@ -300,6 +372,7 @@ async fn monitor_loop(
                     enabled, recording
                 );
                 stop_capture(c, &aacp, &addr).await;
+                gate.stopped(Instant::now());
                 if let Some(prev) = old_convo_state.take() {
                     aacp.set_conversation_detection(prev).await;
                 }
@@ -503,6 +576,79 @@ fn decode_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn running(app: &str) -> SourceConsumers {
+        SourceConsumers {
+            active: Some(app.to_string()),
+            present: true,
+        }
+    }
+
+    fn paused() -> SourceConsumers {
+        SourceConsumers {
+            active: None,
+            present: true,
+        }
+    }
+
+    #[test]
+    fn a_short_pause_during_the_a2dp_reset_keeps_the_capture() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        gate.observe(start, &running("LibrePods"));
+
+        // The reset corks the recorder for a few polls.
+        for ms in [400, 800, 1200] {
+            let now = start + Duration::from_millis(ms);
+            gate.observe(now, &paused());
+            assert!(gate.recorder_holds(now), "stopped {ms} ms into a pause");
+        }
+        gate.observe(start + Duration::from_millis(1600), &running("LibrePods"));
+        assert!(gate.recorder_holds(start + Duration::from_millis(1600)));
+    }
+
+    #[test]
+    fn a_recorder_that_left_releases_the_capture_after_the_grace() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        gate.observe(start, &running("LibrePods"));
+
+        let gone = SourceConsumers::default();
+        gate.observe(start + Duration::from_millis(400), &gone);
+        assert!(gate.recorder_holds(start + Duration::from_millis(400)));
+        assert!(!gate.recorder_holds(start + RECORDER_GONE_GRACE + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_recorder_paused_for_long_releases_the_capture() {
+        let start = Instant::now();
+        let mut gate = CaptureGate::default();
+        gate.observe(start, &running("Discord"));
+
+        let later = start + RECORDER_PAUSED_GRACE + Duration::from_millis(1);
+        gate.observe(later, &paused());
+        assert!(!gate.recorder_holds(later));
+    }
+
+    #[test]
+    fn only_a_running_recorder_starts_a_capture() {
+        let now = Instant::now();
+        let gate = CaptureGate::default();
+        assert!(!gate.may_start(now, &paused()));
+        assert!(!gate.may_start(now, &SourceConsumers::default()));
+        assert!(gate.may_start(now, &running("LibrePods")));
+    }
+
+    #[test]
+    fn a_capture_does_not_restart_right_after_a_stop() {
+        let stop = Instant::now();
+        let mut gate = CaptureGate::default();
+        gate.stopped(stop);
+
+        let soon = stop + RESTART_GAP.saturating_sub(Duration::from_millis(1));
+        assert!(!gate.may_start(soon, &running("LibrePods")));
+        assert!(gate.may_start(stop + RESTART_GAP, &running("LibrePods")));
+    }
 
     #[test]
     fn capture_retry_backs_off_then_gives_up() {

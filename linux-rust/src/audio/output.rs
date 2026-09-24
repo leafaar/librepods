@@ -193,20 +193,29 @@ fn is_level_meter(item: &SourceOutputInfo) -> bool {
             .is_some_and(|id| LEVEL_METER_APPS.contains(&id.as_str()))
 }
 
-// Name of the application recording from the virtual source, or None if idle.
-// Corked (paused) streams and level meters do not count as recording.
-pub fn source_consumer(name: &str) -> Result<Option<String>, SoundServerError> {
+/// Who records from the virtual source. Level meters never count.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SourceConsumers {
+    /// The first application recording and not paused, if any.
+    pub active: Option<String>,
+    /// Whether any recorder is attached, paused (corked) ones included. The
+    /// sound server corks streams for a moment when the graph changes, such as
+    /// during an A2DP reset, so a paused stream is not a recorder that left.
+    pub present: bool,
+}
+
+pub fn source_consumers(name: &str) -> Result<SourceConsumers, SoundServerError> {
     let (mut mainloop, context) = connect()?;
-    let result = source_consumer_on(&mut mainloop, &context, name);
+    let result = source_consumers_on(&mut mainloop, &context, name);
     mainloop.quit(Retval(0));
     result
 }
 
-fn source_consumer_on(
+fn source_consumers_on(
     mainloop: &mut Mainloop,
     context: &Context,
     name: &str,
-) -> Result<Option<String>, SoundServerError> {
+) -> Result<SourceConsumers, SoundServerError> {
     let introspect = context.introspect();
     let index = Rc::new(Cell::new(None::<u32>));
     let mut op = introspect.get_source_info_by_name(name, {
@@ -219,29 +228,32 @@ fn source_consumer_on(
     });
     wait_for(mainloop, &mut op)?;
     let Some(idx) = index.get() else {
-        return Ok(None);
+        return Ok(SourceConsumers::default());
     };
 
-    let app = Rc::new(RefCell::new(None::<String>));
+    let consumers = Rc::new(RefCell::new(SourceConsumers::default()));
     let mut op = introspect.get_source_output_info_list({
-        let app = app.clone();
+        let consumers = consumers.clone();
         move |result| {
             if let ListResult::Item(item) = result
                 && item.source == idx
-                && !item.corked
                 && !is_level_meter(item)
-                && app.borrow().is_none()
             {
-                let label = item
-                    .proplist
-                    .get_str("application.name")
-                    .or_else(|| item.name.as_ref().map(ToString::to_string));
-                app.replace(label);
+                let mut consumers = consumers.borrow_mut();
+                consumers.present = true;
+                if !item.corked && consumers.active.is_none() {
+                    consumers.active = Some(
+                        item.proplist
+                            .get_str("application.name")
+                            .or_else(|| item.name.as_ref().map(ToString::to_string))
+                            .unwrap_or_else(|| "an application".to_string()),
+                    );
+                }
             }
         }
     });
     wait_for(mainloop, &mut op)?;
-    Ok(app.borrow_mut().take())
+    Ok(consumers.take())
 }
 
 // Serializes A2DP resets. A reset reads the active card profile, switches to
