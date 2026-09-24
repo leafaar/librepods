@@ -6,7 +6,7 @@ const TYPE58_HEADER_LEN: usize = 22;
 
 #[inline]
 fn u16le(b: &[u8], off: usize) -> u16 {
-    (b[off] as u16) | ((b[off + 1] as u16) << 8)
+    u16::from_le_bytes([b[off], b[off + 1]])
 }
 
 /// AACP packet header shared by every message: 04 00 04 00.
