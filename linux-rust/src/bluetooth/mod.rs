@@ -3,6 +3,7 @@ pub mod aacp_audio;
 pub mod att;
 pub(crate) mod discovery;
 pub(crate) mod eq;
+pub(crate) mod l2cap;
 pub mod le;
 pub mod managers;
 pub mod settings;
