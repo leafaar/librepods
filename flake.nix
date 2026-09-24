@@ -8,6 +8,10 @@
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
     systems.url = "github:nix-systems/default";
     treefmt-nix.url = "github:numtide/treefmt-nix";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -27,16 +31,23 @@
       perSystem =
         {
           self',
-          pkgs,
+          system,
           lib,
           ...
         }:
         let
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.rust-overlay.overlays.default ];
+          };
+
           buildInputs =
             with pkgs;
             [
               dbus
               libpulseaudio
+              # libavcodec/libavutil for the hi-res microphone's AAC-ELD decoder
+              ffmpeg-headless
               alsa-lib
               bluez
 
@@ -62,16 +73,24 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             makeWrapper
+            # libclang for ffmpeg-sys-next's bindgen step
+            rustPlatform.bindgenHook
           ];
 
-          craneLib = crane.mkLib pkgs;
+          # Build with the same toolchain the repo pins for everyone else.
+          craneLib = (crane.mkLib pkgs).overrideToolchain (
+            p: p.rust-bin.fromRustupToolchainFile ./linux-rust/rust-toolchain.toml
+          );
           unfilteredRoot = ./linux-rust/.;
           src = lib.fileset.toSource {
             root = unfilteredRoot;
             fileset = lib.fileset.unions [
               # Default files from crane (Rust and cargo files)
               (craneLib.fileset.commonCargoSources unfilteredRoot)
-              (lib.fileset.maybeMissing ./linux-rust/assets/font)
+              # The window icon is embedded with include_bytes!.
+              ./linux-rust/assets
+              ./linux-rust/clippy.toml
+              ./linux-rust/deny.toml
             ];
           };
 
@@ -82,10 +101,12 @@
             # RUST_BACKTRACE = "1";
           };
 
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
           librepods = craneLib.buildPackage (
             commonArgs
             // {
-              cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+              inherit cargoArtifacts;
 
               doCheck = false;
 
@@ -109,6 +130,23 @@
         {
           checks = {
             inherit librepods;
+
+            librepods-clippy = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets -- -D warnings";
+              }
+            );
+
+            librepods-test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+
+            # Advisories need the network, which the sandbox does not allow; CI
+            # runs that part of cargo deny separately.
+            librepods-deny = craneLib.cargoDeny {
+              inherit src;
+              cargoDenyChecks = "bans licenses sources";
+            };
           };
 
           packages.default = librepods;
