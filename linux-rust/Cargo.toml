@@ -28,6 +28,37 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # pkg-config (no bundled build); avformat/swscale/etc. are not needed.
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec"] }
 
+[lints.rust]
+# Edition 2024 only warns; every unsafe operation must sit in its own block
+# with its own SAFETY comment.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Docs and comments are protocol prose full of names (AirPods, AACP, PipeWire,
+# BlueZ, MPRIS); backticking every one makes them unreadable.
+doc_markdown = "allow"
+# Packet bytes, audio samples and UI geometry convert between integer widths and
+# floats on purpose; each conversion's range is known where it happens.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+# A binary crate: its errors and panics are not a public API to document.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Names such as AirPodsDevice in module airpods read better than the alternatives.
+module_name_repetitions = "allow"
+# Signals worth keeping loud:
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 [profile.release]
 opt-level = "s"
 lto = true
