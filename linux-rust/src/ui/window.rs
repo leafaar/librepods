@@ -1,5 +1,6 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
+    AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
+    ControlCommandIdentifiers,
 };
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
@@ -7,7 +8,7 @@ use crate::devices::enums::{
     NothingState,
 };
 use crate::audio::{mic_test, output};
-use crate::ui::airpods::airpods_view;
+use crate::ui::airpods::{airpods_view, validate_device_name};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
 use crate::utils::{
@@ -116,6 +117,9 @@ pub struct App {
     // Contents of devices.json. Reloaded on the messages that can change the
     // file, never from view(), which runs on every frame.
     devices: HashMap<String, DeviceData>,
+    // Name being typed on an AirPods page, as (mac, text). Sent on Enter only,
+    // so the AirPods do not get a rename packet per keystroke.
+    name_draft: Option<(String, String)>,
 }
 
 /// The microphone test on the AirPods page. Holds the live recorder or player.
@@ -224,6 +228,9 @@ pub enum Message {
     /// The backend dropped its UI sender. Not re-armed: waiting again would
     /// return at once and spin.
     UiChannelClosed,
+    RenameInput(String, String),
+    RenameSubmit(String),
+    DevicesChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -333,6 +340,7 @@ impl App {
                 mic_test_take: 0,
                 last_case_level: HashMap::new(),
                 devices: load_devices(),
+                name_draft: None,
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -376,6 +384,16 @@ impl App {
             }
             Message::SelectTab(tab) => {
                 self.selected_tab = tab;
+                self.name_draft = None;
+                Task::none()
+            }
+            Message::RenameInput(mac, name) => {
+                self.name_draft = Some((mac, name));
+                Task::none()
+            }
+            Message::RenameSubmit(mac) => self.rename(mac),
+            Message::DevicesChanged => {
+                self.devices = load_devices();
                 Task::none()
             }
             Message::ThemeSelected(theme) => {
@@ -647,6 +665,9 @@ impl App {
 
                         if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(_))) {
                             self.connect_status.remove(&mac);
+                        }
+                        if self.name_draft.as_ref().is_some_and(|(m, _)| *m == mac) {
+                            self.name_draft = None;
                         }
                         let removed = self.device_states.remove(&mac);
                         // The test records from the AirPods, and its Done button
@@ -947,6 +968,52 @@ impl App {
         Task::batch([stop, resume_players(std::mem::take(&mut self.mic_test_paused))])
     }
 
+    fn aacp_manager(&self, mac: &str) -> Option<Arc<AACPManager>> {
+        self.device_managers
+            .blocking_read()
+            .get(mac)
+            .and_then(|m| m.get_aacp())
+    }
+
+    /// Send the drafted name to the AirPods and save it to devices.json. An
+    /// invalid draft stays in the field with its hint shown.
+    fn rename(&mut self, mac: String) -> Task<Message> {
+        let Some((_, draft)) = self.name_draft.as_ref().filter(|(m, _)| *m == mac) else {
+            return Task::none();
+        };
+        let Ok(name) = validate_device_name(draft) else {
+            return Task::none();
+        };
+        let name = name.to_string();
+        let Some(aacp) = self.aacp_manager(&mac) else {
+            error!("Cannot rename {}, no AACP manager", mac);
+            return Task::none();
+        };
+        self.name_draft = None;
+        if let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) {
+            state.device_name = name.clone();
+        }
+        let packet_name = name.clone();
+        aacp.runtime().clone().spawn(async move {
+            if let Err(e) = aacp.send_rename_packet(&packet_name).await {
+                error!("Failed to send rename packet: {}", e);
+            }
+        });
+        let save = move || {
+            update_devices_file(|devices| {
+                if let Some(device) = devices.get_mut(&mac) {
+                    device.name = name;
+                }
+            })
+        };
+        Task::perform(off_ui_thread(save), |result| {
+            if let Some(Err(e)) = result {
+                error!("Failed to save the new name: {}", e);
+            }
+            Message::DevicesChanged
+        })
+    }
+
     fn start_connect(&mut self, mac: String) -> Task<Message> {
         if self.connect_status.get(&mac).is_some_and(ConnectStatus::in_progress) {
             return Task::none();
@@ -1197,7 +1264,11 @@ impl App {
                                                                     state,
                                                                     aacp_manager.clone(),
                                                                     self.hires_mic_pause_convo,
-                                                                    &self.mic_test
+                                                                    &self.mic_test,
+                                                                    self.name_draft
+                                                                        .as_ref()
+                                                                        .filter(|(mac, _)| mac == id)
+                                                                        .map(|(_, name)| name.as_str()),
                                                                 ))
                                                     })
                                                 }
