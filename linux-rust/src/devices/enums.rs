@@ -9,7 +9,7 @@ use {
     std::{collections::HashMap, fmt::Display},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeviceType {
     AirPods,
     Nothing,
@@ -24,14 +24,19 @@ impl Display for DeviceType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one record per paired device; boxing the AirPods variant would complicate \
+              every place that builds or matches one for a few hundred bytes"
+)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "data")]
 pub enum DeviceInformation {
     AirPods(AirPodsInformation),
     Nothing(NothingInformation),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceData {
     pub name: String,
     pub type_: DeviceType,
@@ -53,6 +58,10 @@ impl Display for DeviceState {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent AirPods settings shown in the UI, not the states of one machine"
+)]
 #[derive(Clone, Debug)]
 pub struct AirPodsState {
     pub device_name: String,
@@ -90,9 +99,13 @@ impl Display for AirPodsNoiseControlMode {
 }
 
 impl AirPodsNoiseControlMode {
+    /// 0x01 is off, and so is any value this app does not know.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "passed by name to Option<&u8>::map"
+    )]
     pub fn from_byte(value: &u8) -> Self {
         match value {
-            0x01 => AirPodsNoiseControlMode::Off,
             0x02 => AirPodsNoiseControlMode::NoiseCancellation,
             0x03 => AirPodsNoiseControlMode::Transparency,
             0x04 => AirPodsNoiseControlMode::Adaptive,
@@ -138,17 +151,6 @@ impl Display for NothingAncMode {
     }
 }
 impl NothingAncMode {
-    pub fn from_byte(value: u8) -> Self {
-        match value {
-            0x03 => NothingAncMode::LowNoiseCancellation,
-            0x02 => NothingAncMode::MidNoiseCancellation,
-            0x01 => NothingAncMode::HighNoiseCancellation,
-            0x04 => NothingAncMode::AdaptiveNoiseCancellation,
-            0x07 => NothingAncMode::Transparency,
-            0x05 => NothingAncMode::Off,
-            _ => NothingAncMode::Off,
-        }
-    }
     pub fn to_byte(&self) -> u8 {
         match self {
             NothingAncMode::LowNoiseCancellation => 0x03,
