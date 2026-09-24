@@ -1,13 +1,15 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, BatteryComponent, BatteryStatus, ControlCommandIdentifiers,
+    AACPEvent, AACPManager, BatteryComponent, BatteryInfo, BatteryStatus,
+    ControlCommandIdentifiers,
 };
+use crate::bluetooth::att::ATTHandles;
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
     AirPodsNoiseControlMode, AirPodsState, DeviceData, DeviceState, DeviceType, NothingAncMode,
     NothingState,
 };
 use crate::audio::{mic_test, output};
-use crate::ui::airpods::airpods_view;
+use crate::ui::airpods::{airpods_view, validate_device_name};
 use crate::ui::messages::BluetoothUIMessage;
 use crate::ui::nothing::nothing_view;
 use crate::utils::{
@@ -71,6 +73,11 @@ pub fn start_ui(
     .run()
 }
 
+/// Redraw rate while the level meter or the microphone test is on screen.
+const MIC_TICK: Duration = Duration::from_millis(50);
+/// Rate at which to check whether an app opened the hi-res microphone.
+const MIC_WATCH: Duration = Duration::from_secs(1);
+
 pub struct App {
     window: Option<window::Id>,
     panes: pane_grid::State<Pane>,
@@ -96,24 +103,66 @@ pub struct App {
     // Manual connect requests from the UI or tray, keyed by MAC; cleared once
     // the device connects.
     connect_status: HashMap<String, ConnectStatus>,
+    // Numbers each connect request, so a late result or timeout from an older
+    // request does not touch a newer one.
+    connect_attempt: u64,
     mic_test: MicTest,
     // Media players paused for the microphone test, resumed when it ends.
     mic_test_paused: Vec<String>,
+    // Bumped on every recorder stop and whenever the test ends, so a stop
+    // result that arrives late is dropped instead of reviving the test.
+    mic_test_take: u64,
+    // Last case level each device reported. The case only reports while a bud
+    // is in it, so the sidebar shows this, dimmed, the rest of the time.
+    last_case_level: HashMap<String, u8>,
+    // Contents of devices.json. Reloaded on the messages that can change the
+    // file, never from view(), which runs on every frame.
+    devices: HashMap<String, DeviceData>,
+    // Name being typed on an AirPods page, as (mac, text). Sent on Enter only,
+    // so the AirPods do not get a rename packet per keystroke.
+    name_draft: Option<(String, String)>,
 }
 
 /// The microphone test on the AirPods page. Holds the live recorder or player.
 pub enum MicTest {
     Idle,
+    /// Waiting for the playing media to pause before recording.
+    Starting,
     Recording(mic_test::Recorder),
+    /// The recorder was told to stop and its thread is being joined.
+    Stopping,
     Ready(mic_test::Player),
     Failed(String),
 }
 
+impl MicTest {
+    /// A test is under way and the media players stay paused.
+    fn is_running(&self) -> bool {
+        matches!(
+            self,
+            MicTest::Starting | MicTest::Recording(_) | MicTest::Stopping | MicTest::Ready(_)
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ConnectStatus {
-    Connecting,
+    /// The connect call for this attempt is running.
+    Connecting(u64),
+    /// The connect call returned; waiting for DeviceConnected, which comes once
+    /// the AACP session is set up.
+    SettingUp(u64),
     Failed(String),
 }
+
+impl ConnectStatus {
+    fn in_progress(&self) -> bool {
+        matches!(self, ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_))
+    }
+}
+
+/// How long to wait for DeviceConnected after the Bluetooth connect succeeded.
+const CONNECT_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The icon is embedded: a path is resolved against the working directory, which
 // is wherever the app was launched from. The application id becomes the X11
@@ -151,7 +200,8 @@ pub enum Message {
     CopyToClipboard(String),
     BluetoothMessage(BluetoothUIMessage),
     ConnectDevice(String),
-    ConnectFinished(String, Result<(), String>),
+    ConnectFinished(String, u64, Result<(), String>),
+    ConnectSetupTimedOut(String, u64),
     MicTestRecord,
     MicTestStop,
     MicTestPlay,
@@ -159,6 +209,8 @@ pub enum Message {
     MicTestSkip(bool), // true = forward
     MicTestSeek(f32),  // seconds
     MicTestDone,
+    MicTestMediaPaused(Vec<String>),
+    MicTestRecorded(u64, Result<Vec<u8>, String>),
     // ShowNewDialogTab,
     GotPairedDevices(HashMap<String, Address>),
     StartAddDevice(String, Address),
@@ -174,6 +226,13 @@ pub enum Message {
     HiResMicAgcChanged(bool),
     HiResMicPauseConvoChanged(bool),
     MicLevelTick,
+    /// The backend dropped its UI sender. Not re-armed: waiting again would
+    /// return at once and spin.
+    UiChannelClosed,
+    NothingAncModeSelected(String, NothingAncMode),
+    RenameInput(String, String),
+    RenameSubmit(String),
+    DevicesChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -197,8 +256,10 @@ impl App {
         // stem_control: Arc<AtomicBool>,
     ) -> (Self, Task<Message>) {
         let (mut panes, first_pane) = pane_grid::State::new(Pane::Sidebar);
-        let split = panes.split(pane_grid::Axis::Vertical, first_pane, Pane::Content);
-        panes.resize(split.unwrap().1, 0.2);
+        if let Some((_, split)) = panes.split(pane_grid::Axis::Vertical, first_pane, Pane::Content)
+        {
+            panes.resize(split, 0.2);
+        }
 
         let wait_task = Task::perform(wait_for_message(Arc::clone(&ui_rx)), |msg| msg);
 
@@ -277,8 +338,13 @@ impl App {
                 auto_switch_on_playback,
                 preferred_codec,
                 connect_status: HashMap::new(),
+                connect_attempt: 0,
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
+                mic_test_take: 0,
+                last_case_level: HashMap::new(),
+                devices: load_devices(),
+                name_draft: None,
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -307,6 +373,7 @@ impl App {
         match message {
             Message::WindowOpened(id) => {
                 self.window = Some(id);
+                self.devices = load_devices();
                 Task::none()
             }
             Message::WindowClosed(id) => {
@@ -321,6 +388,17 @@ impl App {
             }
             Message::SelectTab(tab) => {
                 self.selected_tab = tab;
+                self.name_draft = None;
+                Task::none()
+            }
+            Message::RenameInput(mac, name) => {
+                self.name_draft = Some((mac, name));
+                Task::none()
+            }
+            Message::RenameSubmit(mac) => self.rename(mac),
+            Message::NothingAncModeSelected(mac, mode) => self.set_nothing_anc_mode(mac, mode),
+            Message::DevicesChanged => {
+                self.devices = load_devices();
                 Task::none()
             }
             Message::ThemeSelected(theme) => {
@@ -331,17 +409,54 @@ impl App {
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
             Message::ConnectDevice(mac) => self.start_connect(mac),
             Message::MicTestRecord => {
+                if matches!(
+                    self.mic_test,
+                    MicTest::Starting | MicTest::Recording(_) | MicTest::Stopping
+                ) {
+                    return Task::none();
+                }
                 // Music would play over the recording and the playback, so pause it
                 // for the whole test. Players already paused by an earlier take stay listed.
                 if self.mic_test_paused.is_empty() {
-                    self.mic_test_paused = output::pause_media_players();
+                    self.mic_test = MicTest::Starting;
+                    return Task::perform(
+                        off_ui_thread(output::pause_media_players),
+                        |players| Message::MicTestMediaPaused(players.unwrap_or_default()),
+                    );
                 }
                 self.mic_test = MicTest::Recording(mic_test::Recorder::start());
                 Task::none()
             }
-            Message::MicTestStop => {
-                self.stop_recording();
-                Task::none()
+            Message::MicTestMediaPaused(players) => {
+                if matches!(self.mic_test, MicTest::Starting) {
+                    self.mic_test_paused = players;
+                    self.mic_test = MicTest::Recording(mic_test::Recorder::start());
+                    Task::none()
+                } else if self.mic_test.is_running() {
+                    // A pause from a test that ended while a new one started.
+                    self.mic_test_paused.extend(players);
+                    Task::none()
+                } else {
+                    // The test ended while the players were being paused.
+                    resume_players(players)
+                }
+            }
+            Message::MicTestStop => self.stop_recording(),
+            Message::MicTestRecorded(take, result) => {
+                if take != self.mic_test_take || !matches!(self.mic_test, MicTest::Stopping) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(pcm) => {
+                        self.mic_test = MicTest::Ready(mic_test::Player::new(pcm));
+                        Task::none()
+                    }
+                    Err(e) => {
+                        // No Done button on a failed test, so give the music back now.
+                        self.mic_test = MicTest::Failed(e);
+                        resume_players(std::mem::take(&mut self.mic_test_paused))
+                    }
+                }
             }
             Message::MicTestPlay => {
                 if let MicTest::Ready(player) = &self.mic_test {
@@ -373,36 +488,49 @@ impl App {
                 }
                 Task::none()
             }
-            Message::MicTestDone => {
-                self.mic_test = MicTest::Idle;
-                output::resume_media_players(&std::mem::take(&mut self.mic_test_paused));
-                Task::none()
-            }
-            Message::ConnectFinished(mac, result) => {
+            Message::MicTestDone => self.end_mic_test(),
+            Message::ConnectFinished(mac, attempt, result) => {
+                if !matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting(a)) if *a == attempt)
+                {
+                    return Task::none();
+                }
                 match result {
-                    // DeviceConnected arrives separately once the device is set up.
+                    // Stay in "Connecting" until DeviceConnected arrives, or the
+                    // panel would offer the Connect button again in between.
                     Ok(()) => {
-                        self.connect_status.remove(&mac);
+                        self.connect_status
+                            .insert(mac.clone(), ConnectStatus::SettingUp(attempt));
+                        Task::perform(tokio::time::sleep(CONNECT_SETUP_TIMEOUT), move |_| {
+                            Message::ConnectSetupTimedOut(mac, attempt)
+                        })
                     }
                     Err(e) => {
                         self.connect_status.insert(mac, ConnectStatus::Failed(e));
+                        Task::none()
                     }
+                }
+            }
+            Message::ConnectSetupTimedOut(mac, attempt) => {
+                if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(a)) if *a == attempt)
+                {
+                    self.connect_status.insert(
+                        mac,
+                        ConnectStatus::Failed(
+                            "Connected, but the AirPods did not respond. Try again.".to_string(),
+                        ),
+                    );
                 }
                 Task::none()
             }
+            Message::UiChannelClosed => Task::none(),
             Message::MicLevelTick => {
                 if matches!(&self.mic_test, MicTest::Recording(r) if r.finished()) {
-                    self.stop_recording();
+                    return self.stop_recording();
                 }
                 Task::none()
             }
             Message::BluetoothMessage(ui_message) => {
                 match ui_message {
-                    BluetoothUIMessage::NoOp => {
-                        let ui_rx = Arc::clone(&self.ui_rx);
-
-                        Task::perform(wait_for_message(ui_rx), |msg| msg)
-                    }
                     BluetoothUIMessage::ConnectAirPods => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let mut tasks = vec![Task::perform(wait_for_message(ui_rx), |msg| msg)];
@@ -420,6 +548,7 @@ impl App {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         debug!("Opening main window...");
+                        self.devices = load_devices();
                         if let Some(window_id) = self.window {
                             Task::batch(vec![window::gain_focus(window_id), wait_task])
                         } else {
@@ -451,43 +580,23 @@ impl App {
                         //     conversation_awareness_enabled: false,
                         // }));
 
-                        let type_ = {
-                            let devices_json = std::fs::read_to_string(get_devices_path())
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to read devices file: {}", e);
-                                    "{}".to_string()
-                                });
-                            let devices_list: HashMap<String, DeviceData> =
-                                serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                    error!("Deserialization failed: {}", e);
-                                    HashMap::new()
-                                });
-                            devices_list.get(&mac).map(|d| d.type_.clone())
-                        };
+                        self.devices = load_devices();
+                        let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                         match type_ {
                             Some(DeviceType::AirPods) => {
-                                let device_managers = self.device_managers.blocking_read();
-                                let device_manager = device_managers.get(&mac).unwrap();
-                                let aacp_manager = device_manager.get_aacp().unwrap();
+                                let Some(aacp_manager) = self.aacp_manager(&mac) else {
+                                    error!("No AACP manager for connected AirPods {}", mac);
+                                    return wait_task;
+                                };
                                 let aacp_manager_state = aacp_manager.state.clone();
                                 let state = aacp_manager_state.blocking_lock();
                                 debug!("AACP manager found for AirPods device {}", mac);
-                                let device_name = {
-                                    let devices_json = std::fs::read_to_string(get_devices_path())
-                                        .unwrap_or_else(|e| {
-                                            error!("Failed to read devices file: {}", e);
-                                            "{}".to_string()
-                                        });
-                                    let devices_list: HashMap<String, DeviceData> =
-                                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                                            error!("Deserialization failed: {}", e);
-                                            HashMap::new()
-                                        });
-                                    devices_list
-                                        .get(&mac)
-                                        .map(|d| d.name.clone())
-                                        .unwrap_or_else(|| "Unknown Device".to_string())
-                                };
+                                let device_name = self
+                                    .devices
+                                    .get(&mac)
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| "Unknown Device".to_string());
+                                self.remember_case_level(&mac, &state.battery_info);
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
                                     battery: state.battery_info.clone(),
@@ -559,7 +668,20 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        self.device_states.remove(&mac);
+                        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::SettingUp(_))) {
+                            self.connect_status.remove(&mac);
+                        }
+                        if self.name_draft.as_ref().is_some_and(|(m, _)| *m == mac) {
+                            self.name_draft = None;
+                        }
+                        let removed = self.device_states.remove(&mac);
+                        // The test records from the AirPods, and its Done button
+                        // goes away with them.
+                        let end_test = if matches!(removed, Some(DeviceState::AirPods(_))) {
+                            self.end_mic_test()
+                        } else {
+                            Task::none()
+                        };
 
                         let is_airpods = crate::auto_switch::known_airpods()
                             .iter()
@@ -570,12 +692,16 @@ impl App {
                             self.selected_tab = Tab::Device("none".to_string());
                         }
 
-                        Task::batch(vec![wait_task])
+                        Task::batch(vec![wait_task, end_test])
                     }
                     BluetoothUIMessage::AACPUIEvent(mac, event) => {
                         let ui_rx = Arc::clone(&self.ui_rx);
                         let wait_task = Task::perform(wait_for_message(ui_rx), |msg| msg);
                         debug!("AACP UI Event for {}: {:?}", mac, event);
+                        // The AACP handlers save the device information and name
+                        // to devices.json without a UI event of their own; the
+                        // events that follow are the next chance to pick it up.
+                        self.devices = load_devices();
                         match event {
                             AACPEvent::ControlCommand(status) => match status.identifier {
                                 ControlCommandIdentifiers::ListeningMode => {
@@ -660,6 +786,7 @@ impl App {
                                 }
                             },
                             AACPEvent::BatteryInfo(battery_info) => {
+                                self.remember_case_level(&mac, &battery_info);
                                 if let Some(DeviceState::AirPods(state)) =
                                     self.device_states.get_mut(&mac)
                                 {
@@ -721,6 +848,7 @@ impl App {
                     if let Err(e) = result {
                         error!("Failed to save device: {}", e);
                     }
+                    self.devices = load_devices();
                     self.selected_tab = Tab::Device(addr.to_string());
                 }
                 Task::none()
@@ -731,27 +859,25 @@ impl App {
                 Task::none()
             }
             Message::StateChanged(mac, state) => {
+                let mut end_test = Task::none();
                 if let DeviceState::AirPods(a) = &state
                     && a.hires_mic_enabled != self.hires_mic_enabled
                 {
                     self.hires_mic_enabled = a.hires_mic_enabled;
                     self.save_settings();
+                    // The test records from the hi-res source, which is going away.
+                    if !a.hires_mic_enabled {
+                        end_test = self.end_mic_test();
+                    }
                 }
-                self.device_states.insert(mac.clone(), state);
-                // if airpods, update the noise control state combo box based on allow off mode
-                let type_ = {
-                    let devices_json =
-                        std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-                            error!("Failed to read devices file: {}", e);
-                            "{}".to_string()
-                        });
-                    let devices_list: HashMap<String, DeviceData> =
-                        serde_json::from_str(&devices_json).unwrap_or_else(|e| {
-                            error!("Deserialization failed: {}", e);
-                            HashMap::new()
-                        });
-                    devices_list.get(&mac).map(|d| d.type_.clone())
+                // The state was cloned when the view was built. If the device
+                // disconnected since, inserting it would bring the device back.
+                let Some(current) = self.device_states.get_mut(&mac) else {
+                    return end_test;
                 };
+                *current = state;
+                // if airpods, update the noise control state combo box based on allow off mode
+                let type_ = self.devices.get(&mac).map(|d| d.type_.clone());
                 if let Some(DeviceType::AirPods) = type_
                     && let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac)
                 {
@@ -767,7 +893,7 @@ impl App {
                         modes
                     });
                 }
-                Task::none()
+                end_test
             }
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
@@ -807,32 +933,154 @@ impl App {
         }
     }
 
-    fn stop_recording(&mut self) {
-        if let MicTest::Recording(recorder) = std::mem::replace(&mut self.mic_test, MicTest::Idle) {
-            self.mic_test = match recorder.stop() {
-                Ok(pcm) => MicTest::Ready(mic_test::Player::new(pcm)),
-                Err(e) => MicTest::Failed(e),
-            };
+    fn remember_case_level(&mut self, mac: &str, battery: &[BatteryInfo]) {
+        if let Some(level) = live_case_level(battery) {
+            self.last_case_level.insert(mac.to_string(), level);
         }
     }
 
+    /// Stop the recorder. Its thread is joined off the UI thread and the result
+    /// comes back as MicTestRecorded.
+    fn stop_recording(&mut self) -> Task<Message> {
+        let recorder = match std::mem::replace(&mut self.mic_test, MicTest::Stopping) {
+            MicTest::Recording(recorder) => recorder,
+            other => {
+                self.mic_test = other;
+                return Task::none();
+            }
+        };
+        self.mic_test_take += 1;
+        let take = self.mic_test_take;
+        Task::perform(off_ui_thread(move || recorder.stop()), move |result| {
+            let result = result.unwrap_or_else(|| Err("The recorder crashed".to_string()));
+            Message::MicTestRecorded(take, result)
+        })
+    }
+
+    /// End the microphone test from any state: stop the recorder, drop the
+    /// player and resume the media players it paused.
+    fn end_mic_test(&mut self) -> Task<Message> {
+        self.mic_test_take += 1;
+        let stop = match std::mem::replace(&mut self.mic_test, MicTest::Idle) {
+            MicTest::Recording(recorder) => Task::future(off_ui_thread(move || {
+                if let Err(e) = recorder.stop() {
+                    debug!("Discarded microphone test recording: {}", e);
+                }
+            }))
+            .discard(),
+            _ => Task::none(),
+        };
+        Task::batch([stop, resume_players(std::mem::take(&mut self.mic_test_paused))])
+    }
+
+    fn aacp_manager(&self, mac: &str) -> Option<Arc<AACPManager>> {
+        self.device_managers
+            .blocking_read()
+            .get(mac)
+            .and_then(|m| m.get_aacp())
+    }
+
+    fn set_nothing_anc_mode(&mut self, mac: String, mode: NothingAncMode) -> Task<Message> {
+        let Some(DeviceState::Nothing(state)) = self.device_states.get_mut(&mac) else {
+            return Task::none();
+        };
+        state.anc_mode = mode.clone();
+        let att = self
+            .device_managers
+            .blocking_read()
+            .get(&mac)
+            .and_then(|m| m.get_att());
+        let Some(att) = att else {
+            error!("Cannot set noise control mode on {}, no ATT manager", mac);
+            return Task::none();
+        };
+        let packet = [
+            0x55,
+            0x60,
+            0x01,
+            0x0F,
+            0xF0,
+            0x03,
+            0x00,
+            0x00,
+            0x01,
+            mode.to_byte(),
+            0x00,
+            0x00,
+            0x00,
+        ];
+        Task::future(async move {
+            if let Err(e) = att.write(ATTHandles::NothingEverything, &packet).await {
+                error!(
+                    "Failed to set noise cancellation mode for device {}: {}",
+                    mac, e
+                );
+            }
+        })
+        .discard()
+    }
+
+    /// Send the drafted name to the AirPods and save it to devices.json. An
+    /// invalid draft stays in the field with its hint shown.
+    fn rename(&mut self, mac: String) -> Task<Message> {
+        let Some((_, draft)) = self.name_draft.as_ref().filter(|(m, _)| *m == mac) else {
+            return Task::none();
+        };
+        let Ok(name) = validate_device_name(draft) else {
+            return Task::none();
+        };
+        let name = name.to_string();
+        let Some(aacp) = self.aacp_manager(&mac) else {
+            error!("Cannot rename {}, no AACP manager", mac);
+            return Task::none();
+        };
+        self.name_draft = None;
+        if let Some(DeviceState::AirPods(state)) = self.device_states.get_mut(&mac) {
+            state.device_name = name.clone();
+        }
+        let packet_name = name.clone();
+        aacp.runtime().clone().spawn(async move {
+            if let Err(e) = aacp.send_rename_packet(&packet_name).await {
+                error!("Failed to send rename packet: {}", e);
+            }
+        });
+        let save = move || {
+            update_devices_file(|devices| {
+                if let Some(device) = devices.get_mut(&mac) {
+                    device.name = name;
+                }
+            })
+        };
+        Task::perform(off_ui_thread(save), |result| {
+            if let Some(Err(e)) = result {
+                error!("Failed to save the new name: {}", e);
+            }
+            Message::DevicesChanged
+        })
+    }
+
     fn start_connect(&mut self, mac: String) -> Task<Message> {
-        if matches!(self.connect_status.get(&mac), Some(ConnectStatus::Connecting)) {
+        if self.connect_status.get(&mac).is_some_and(ConnectStatus::in_progress) {
             return Task::none();
         }
         let Ok(addr) = mac.parse::<Address>() else {
             error!("Cannot connect, invalid address {}", mac);
             return Task::none();
         };
-        self.connect_status.insert(mac.clone(), ConnectStatus::Connecting);
+        self.connect_attempt += 1;
+        let attempt = self.connect_attempt;
+        self.connect_status
+            .insert(mac.clone(), ConnectStatus::Connecting(attempt));
         Task::perform(crate::auto_switch::connect_airpods(addr), move |result| {
-            Message::ConnectFinished(mac, result)
+            Message::ConnectFinished(mac, attempt, result)
         })
     }
 
     fn disconnected_view(&self, mac: &str) -> iced::widget::Container<'_, Message> {
         let (status, connecting) = match self.connect_status.get(mac) {
-            Some(ConnectStatus::Connecting) => ("Connecting…".to_string(), true),
+            Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
+                ("Connecting…".to_string(), true)
+            }
             Some(ConnectStatus::Failed(e)) => (e.clone(), false),
             None => (
                 "Not connected to this PC. If they are on your phone, connecting here takes them over."
@@ -861,73 +1109,53 @@ impl App {
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
-        let devices_json = std::fs::read_to_string(get_devices_path()).unwrap_or_else(|e| {
-            error!("Failed to read devices file: {}", e);
-            "{}".to_string()
-        });
-        let devices_list: HashMap<String, DeviceData> = serde_json::from_str(&devices_json)
-            .unwrap_or_else(|e| {
-                error!("Deserialization failed: {}", e);
-                HashMap::new()
-            });
+        let devices_list = &self.devices;
         let pane_grid = pane_grid::PaneGrid::new(&self.panes, |_pane_id, pane, _is_maximized| {
             match pane {
                 Pane::Sidebar => {
                     let create_tab_button = |tab: Tab, label: &str, mac_addr: &str, connected: bool| -> Element<'_, Message> {
                         let label = label.to_string() + if connected { " 􀉣" } else { "" };
                         let is_selected = self.selected_tab == tab;
-                        let col = column![
-                            text(label).size(16),
-                            text({
-                                if connected {
-                                    let mac = match tab {
-                                        Tab::Device(ref mac) => mac.as_str(),
-                                        _ => "",
-                                    };
-
-                                    match self.device_states.get(mac) {
-                                        Some(DeviceState::AirPods(state)) => {
-                                            let b = &state.battery;
-                                            let headphone = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                .map(|x| x.level);
-                                            // if headphones is not None, use only that
-                                            if let Some(level) = headphone {
-                                                let charging = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "􀺹 {}%{}",
-                                                    level, if charging {"\u{1002E6}"} else {""}
-                                                )
-                                            } else {
-                                                let left  = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let right = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let case  = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let left_charging = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let right_charging = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let case_charging = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "\u{1018E5} {}%{} \u{1018E8} {}%{} \u{100E6C} {}%{}",
-                                                    left, if left_charging {"\u{1002E6}"} else {""}, right, if right_charging {"\u{1002E6}"} else {""}, case, if case_charging {"\u{1002E6}"} else {""}
-                                                )
-                                            }
+                        let status: Element<'_, Message> = if connected {
+                            match self.device_states.get(mac_addr) {
+                                Some(DeviceState::AirPods(state)) => {
+                                    let parts = battery_parts(
+                                        &state.battery,
+                                        self.last_case_level.get(mac_addr).copied(),
+                                    );
+                                    let mut line = row![].spacing(4);
+                                    for (part, stale) in parts {
+                                        let mut part_text = text(part).size(12);
+                                        if stale {
+                                            part_text = part_text.style(move |theme: &Theme| {
+                                                let mut style = text::Style::default();
+                                                let color = if is_selected {
+                                                    Style::default().text_color
+                                                } else {
+                                                    theme.palette().text
+                                                };
+                                                style.color = Some(color.scale_alpha(0.5));
+                                                style
+                                            });
                                         }
-                                        _ => "Connected".to_string(),
+                                        line = line.push(part_text);
                                     }
-                                } else {
-                                    match self.connect_status.get(mac_addr) {
-                                        Some(ConnectStatus::Connecting) => "Connecting…".to_string(),
-                                        Some(ConnectStatus::Failed(_)) => "Couldn't connect".to_string(),
-                                        None => "Not connected".to_string(),
-                                    }
+                                    line.into()
                                 }
-                            }).size(12)
-                        ];
+                                _ => text("Connected").size(12).into(),
+                            }
+                        } else {
+                            text(match self.connect_status.get(mac_addr) {
+                                Some(ConnectStatus::Connecting(_) | ConnectStatus::SettingUp(_)) => {
+                                    "Connecting…"
+                                }
+                                Some(ConnectStatus::Failed(_)) => "Couldn't connect",
+                                None => "Not connected",
+                            })
+                            .size(12)
+                            .into()
+                        };
+                        let col = column![text(label).size(16), status];
                         let content = container(col)
                             .padding(8);
                         let style = move |theme: &Theme, _status| {
@@ -989,15 +1217,14 @@ impl App {
                     };
 
                     let mut devices = column!().spacing(4);
-                    let mut devices_vec: Vec<(String, DeviceData)> = devices_list.clone().into_iter().collect();
+                    let mut devices_vec: Vec<(&String, &DeviceData)> = devices_list.iter().collect();
                     devices_vec.sort_by(|a, b| a.1.name.cmp(&b.1.name));
                     for (mac, device) in devices_vec {
-                        let name = device.name.clone();
                         let tab_button = create_tab_button(
                             Tab::Device(mac.clone()),
-                            &name,
-                            &mac,
-                            self.bluetooth_state.connected_devices.contains(&mac)
+                            &device.name,
+                            mac,
+                            self.bluetooth_state.connected_devices.contains(mac)
                         );
                         devices = devices.push(tab_button);
                     }
@@ -1078,11 +1305,15 @@ impl App {
                                                     device_managers.get(id).and_then(|managers| {
                                                         managers.get_aacp().map(|aacp_manager| airpods_view(
                                                                     id,
-                                                                    &devices_list,
+                                                                    devices_list,
                                                                     state,
                                                                     aacp_manager.clone(),
                                                                     self.hires_mic_pause_convo,
-                                                                    &self.mic_test
+                                                                    &self.mic_test,
+                                                                    self.name_draft
+                                                                        .as_ref()
+                                                                        .filter(|(mac, _)| mac == id)
+                                                                        .map(|(_, name)| name.as_str()),
                                                                 ))
                                                     })
                                                 }
@@ -1103,8 +1334,8 @@ impl App {
                                     Some(DeviceType::Nothing) => {
                                         if let Some(DeviceState::Nothing(state)) = device_state {
                                             if let Some(device_managers) = device_managers.get(id) {
-                                                if let Some(att_manager) = device_managers.get_att() {
-                                                    nothing_view(id, &devices_list, state, att_manager.clone())
+                                                if device_managers.get_att().is_some() {
+                                                    nothing_view(id, devices_list, state)
                                                 } else {
                                                     error!("No ATT manager found for Nothing device {}", id);
                                                     container(
@@ -1727,20 +1958,128 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let close = window::close_events().map(Message::WindowClosed);
 
-        // Only tick while a hi-res mic is capturing.
-        let mic_active = self
-            .device_states
-            .values()
-            .any(|s| matches!(s, DeviceState::AirPods(a) if a.hires_mic_enabled));
-
-        if mic_active {
-            let tick = iced::time::every(std::time::Duration::from_millis(50))
-                .map(|_| Message::MicLevelTick);
-            Subscription::batch([close, tick])
-        } else {
-            close
+        match self.tick_interval() {
+            Some(interval) => {
+                let tick = iced::time::every(interval).map(|_| Message::MicLevelTick);
+                Subscription::batch([close, tick])
+            }
+            None => close,
         }
     }
+
+    /// How often to redraw for the level meter and the microphone test, or None
+    /// when nothing on screen moves by itself.
+    fn tick_interval(&self) -> Option<Duration> {
+        // Polled even with the window closed, to notice the recorder hitting
+        // MAX_RECORDING.
+        if matches!(self.mic_test, MicTest::Recording(_)) {
+            return Some(MIC_TICK);
+        }
+        self.window?;
+        if matches!(self.mic_test, MicTest::Ready(_)) || self.airpods_mic_active() {
+            return Some(MIC_TICK);
+        }
+        // Nothing tells the UI when an app opens the hi-res mic, so watch for it
+        // slowly to bring up the level meter.
+        let airpods_connected = self
+            .device_states
+            .values()
+            .any(|s| matches!(s, DeviceState::AirPods(_)));
+        (self.hires_mic_enabled && airpods_connected).then_some(MIC_WATCH)
+    }
+
+    fn airpods_mic_active(&self) -> bool {
+        let managers = self.device_managers.blocking_read();
+        self.device_states.iter().any(|(mac, state)| {
+            matches!(state, DeviceState::AirPods(_))
+                && managers
+                    .get(mac)
+                    .and_then(|m| m.get_aacp())
+                    .is_some_and(|aacp| aacp.mic_active())
+        })
+    }
+}
+
+/// Run blocking work (D-Bus calls, thread joins) on the runtime's blocking
+/// pool, so update() never waits on it. None if the work could not finish.
+async fn off_ui_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| error!("Blocking UI task failed: {}", e))
+        .ok()
+}
+
+fn resume_players(players: Vec<String>) -> Task<Message> {
+    if players.is_empty() {
+        return Task::none();
+    }
+    Task::future(off_ui_thread(move || output::resume_media_players(&players))).discard()
+}
+
+/// Read devices.json. A missing or unreadable file gives an empty list.
+fn load_devices() -> HashMap<String, DeviceData> {
+    let devices_json = match std::fs::read_to_string(get_devices_path()) {
+        Ok(json) => json,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                error!("Failed to read devices file: {}", e);
+            }
+            return HashMap::new();
+        }
+    };
+    serde_json::from_str(&devices_json).unwrap_or_else(|e| {
+        error!("Deserialization failed: {}", e);
+        HashMap::new()
+    })
+}
+
+const CHARGING_MARK: &str = "\u{1002E6}";
+
+/// The level of a battery entry, or None when the component is disconnected or
+/// the level is out of range.
+fn known_level(info: &BatteryInfo) -> Option<u8> {
+    (info.status != BatteryStatus::Disconnected && info.level <= 100).then_some(info.level)
+}
+
+/// "80%" with a charging mark, or "-" when the component is absent or disconnected.
+fn battery_text(info: Option<&BatteryInfo>) -> String {
+    match info.and_then(|b| known_level(b).map(|level| (level, b.status))) {
+        Some((level, status)) => {
+            let mark = if status.is_charging() { CHARGING_MARK } else { "" };
+            format!("{}%{}", level, mark)
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// The case level a battery report carries, if any. AirPods only know the case
+/// level while a bud sits in it: with both buds out, the case entry reports
+/// Disconnected with a level of 0 or 255.
+fn live_case_level(battery: &[BatteryInfo]) -> Option<u8> {
+    battery
+        .iter()
+        .find(|b| b.component == BatteryComponent::Case)
+        .and_then(known_level)
+}
+
+/// The sidebar battery line as (text, stale) parts. Headphones show a single
+/// level. For earbuds, a case that cannot report falls back to `last_case`,
+/// marked stale so it is drawn dimmed.
+fn battery_parts(battery: &[BatteryInfo], last_case: Option<u8>) -> Vec<(String, bool)> {
+    let find = |component| battery.iter().find(|b| b.component == component);
+    if let Some(headphone) = find(BatteryComponent::Headphone) {
+        return vec![(format!("􀺹 {}", battery_text(Some(headphone))), false)];
+    }
+    let (case, stale) = match (live_case_level(battery), last_case) {
+        (Some(_), _) => (battery_text(find(BatteryComponent::Case)), false),
+        (None, Some(level)) => (format!("{}%", level), true),
+        (None, None) => ("-".to_string(), false),
+    };
+    vec![
+        (format!("\u{1018E5} {}", battery_text(find(BatteryComponent::Left))), false),
+        (format!("\u{1018E8} {}", battery_text(find(BatteryComponent::Right))), false),
+        (format!("\u{100E6C} {}", case), stale),
+    ]
 }
 
 async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>>>) -> Message {
@@ -1748,8 +2087,8 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
     match rx.recv().await {
         Some(msg) => Message::BluetoothMessage(msg),
         None => {
-            error!("UI message channel closed");
-            Message::BluetoothMessage(BluetoothUIMessage::NoOp)
+            error!("UI message channel closed, no more device updates");
+            Message::UiChannelClosed
         }
     }
 }
@@ -1776,3 +2115,90 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(component: BatteryComponent, level: u8, status: BatteryStatus) -> BatteryInfo {
+        BatteryInfo {
+            component,
+            level,
+            status,
+        }
+    }
+
+    fn texts(parts: &[(String, bool)]) -> Vec<&str> {
+        parts.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn battery_text_marks_charging_and_unknown() {
+        let charging = entry(BatteryComponent::Left, 40, BatteryStatus::Charging);
+        let optimized = entry(BatteryComponent::Left, 80, BatteryStatus::OptimizedCharging);
+        let idle = entry(BatteryComponent::Left, 100, BatteryStatus::NotCharging);
+        let gone = entry(BatteryComponent::Left, 0, BatteryStatus::Disconnected);
+        let bogus = entry(BatteryComponent::Left, 255, BatteryStatus::NotCharging);
+        assert_eq!(battery_text(Some(&charging)), format!("40%{CHARGING_MARK}"));
+        assert_eq!(battery_text(Some(&optimized)), format!("80%{CHARGING_MARK}"));
+        assert_eq!(battery_text(Some(&idle)), "100%");
+        assert_eq!(battery_text(Some(&gone)), "-");
+        assert_eq!(battery_text(Some(&bogus)), "-");
+        assert_eq!(battery_text(None), "-");
+    }
+
+    #[test]
+    fn case_level_is_remembered_only_when_reported() {
+        let in_case = [entry(BatteryComponent::Case, 60, BatteryStatus::NotCharging)];
+        let buds_out = [entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected)];
+        let buds_out_255 = [entry(BatteryComponent::Case, 255, BatteryStatus::Disconnected)];
+        let bad_level = [entry(BatteryComponent::Case, 101, BatteryStatus::Charging)];
+        assert_eq!(live_case_level(&in_case), Some(60));
+        assert_eq!(live_case_level(&buds_out), None);
+        assert_eq!(live_case_level(&buds_out_255), None);
+        assert_eq!(live_case_level(&bad_level), None);
+        assert_eq!(live_case_level(&[]), None);
+    }
+
+    #[test]
+    fn case_falls_back_to_last_known_level() {
+        let battery = [
+            entry(BatteryComponent::Left, 90, BatteryStatus::NotCharging),
+            entry(BatteryComponent::Right, 85, BatteryStatus::NotCharging),
+            entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected),
+        ];
+        let parts = battery_parts(&battery, Some(60));
+        assert_eq!(
+            texts(&parts),
+            ["\u{1018E5} 90%", "\u{1018E8} 85%", "\u{100E6C} 60%"]
+        );
+        assert!(parts[2].1);
+
+        let parts = battery_parts(&battery, None);
+        assert_eq!(parts[2], ("\u{100E6C} -".to_string(), false));
+    }
+
+    #[test]
+    fn live_case_level_wins_over_last_known() {
+        let battery = [
+            entry(BatteryComponent::Left, 90, BatteryStatus::Charging),
+            entry(BatteryComponent::Case, 50, BatteryStatus::NotCharging),
+        ];
+        let parts = battery_parts(&battery, Some(70));
+        assert_eq!(
+            texts(&parts),
+            [
+                format!("\u{1018E5} 90%{CHARGING_MARK}").as_str(),
+                "\u{1018E8} -",
+                "\u{100E6C} 50%"
+            ]
+        );
+        assert!(!parts[2].1);
+    }
+
+    #[test]
+    fn headphones_show_one_level() {
+        let battery = [entry(BatteryComponent::Headphone, 30, BatteryStatus::NotCharging)];
+        assert_eq!(texts(&battery_parts(&battery, Some(70))), ["􀺹 30%"]);
+    }
+}

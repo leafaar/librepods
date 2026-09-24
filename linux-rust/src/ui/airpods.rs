@@ -12,9 +12,7 @@ use iced::{Background, Border, Center, Color, Length, Padding, Theme};
 use log::error;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 // use crate::bluetooth::att::ATTManager;
 use crate::devices::enums::{AirPodsState, DeviceData, DeviceInformation, DeviceState};
 use crate::audio::mic_test;
@@ -27,13 +25,17 @@ pub fn airpods_view<'a>(
     aacp_manager: Arc<AACPManager>,
     pause_convo: bool,
     mic_test: &'a MicTest,
+    name_draft: Option<&'a str>,
     // att_manager: Arc<ATTManager>
 ) -> iced::widget::Container<'a, Message> {
     let mac = mac.to_string();
     // order: name, noise control, press and hold config, call controls (not sure if why it might be needed, adding it just in case), audio (personalized volume, conversational awareness, adaptive audio slider), connection settings, microphone, head gestures (not adding this), off listening mode, device information
 
-    let aacp_manager_for_rename = aacp_manager.clone();
-    let rename_input = container(
+    let name_hint = name_draft.map(|draft| match validate_device_name(draft) {
+        Ok(_) => "Press Enter to rename",
+        Err(e) => e,
+    });
+    let mut rename_col = column![
         row![
             Space::new().width(10),
             text("Name").size(16).style(|theme: &Theme| {
@@ -42,7 +44,7 @@ pub fn airpods_view<'a>(
                 style
             }),
             Space::new().width(Length::Fill),
-            text_input("", &state.device_name)
+            text_input("", name_draft.unwrap_or(&state.device_name))
                 .padding(Padding {
                     top: 5.0,
                     bottom: 5.0,
@@ -62,40 +64,35 @@ pub fn airpods_view<'a>(
                 .align_x(End)
                 .on_input({
                     let mac = mac.clone();
-                    let state = state.clone();
-                    move |new_name| {
-                        let aacp_manager = aacp_manager_for_rename.clone();
-                        run_async_in_thread({
-                            let new_name = new_name.clone();
-                            async move {
-                                aacp_manager
-                                    .send_rename_packet(&new_name)
-                                    .await
-                                    .unwrap_or_else(|e| error!("Failed to send rename packet: {}", e));
-                            }
-                        });
-                        let mut state = state.clone();
-                        state.device_name = new_name.clone();
-                        Message::StateChanged(mac.to_string(), DeviceState::AirPods(state))
-                    }
+                    move |name| Message::RenameInput(mac.clone(), name)
                 })
+                .on_submit(Message::RenameSubmit(mac.clone()))
         ]
         .align_y(Center),
-    )
-    .padding(Padding {
-        top: 5.0,
-        bottom: 5.0,
-        left: 10.0,
-        right: 10.0,
-    })
-    .style(|theme: &Theme| {
-        let mut style = container::Style::default();
-        style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
-        let mut border = Border::default();
-        border.color = theme.palette().primary.scale_alpha(0.5);
-        style.border = border.rounded(16);
-        style
-    });
+    ];
+    if let Some(hint) = name_hint {
+        rename_col = rename_col.push(
+            row![Space::new().width(Length::Fill), dim_text(hint.to_string())].padding(Padding {
+                right: 10.0,
+                ..Padding::ZERO
+            }),
+        );
+    }
+    let rename_input = container(rename_col)
+        .padding(Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 10.0,
+            right: 10.0,
+        })
+        .style(|theme: &Theme| {
+            let mut style = container::Style::default();
+            style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+            let mut border = Border::default();
+            border.color = theme.palette().primary.scale_alpha(0.5);
+            style.border = border.rounded(16);
+            style
+        });
 
     let listening_mode = container(
         row![
@@ -118,7 +115,7 @@ pub fn airpods_view<'a>(
                         move |selected_mode| {
                             let aacp_manager = aacp_manager.clone();
                             let selected_mode_c = selected_mode.clone();
-                            run_async_in_thread(async move {
+                            aacp_manager.runtime().clone().spawn(async move {
                                 aacp_manager
                                     .send_control_command(
                                         ControlCommandIdentifiers::ListeningMode,
@@ -228,7 +225,7 @@ pub fn airpods_view<'a>(
                                 move |is_enabled| {
                                     let aacp_manager = aacp_manager_pv.clone();
                                     let mac = mac.clone();
-                                    run_async_in_thread(
+                                    aacp_manager.runtime().clone().spawn(
                                         async move {
                                             aacp_manager.send_control_command(
                                                 ControlCommandIdentifiers::AdaptiveVolumeConfig,
@@ -282,7 +279,7 @@ pub fn airpods_view<'a>(
                             } else {
                                 convo_toggler.on_toggle(move |is_enabled| {
                                     let aacp_manager = aacp_manager_conv_detect.clone();
-                                    run_async_in_thread(
+                                    aacp_manager.runtime().clone().spawn(
                                         async move {
                                             aacp_manager.set_conversation_detection(is_enabled).await;
                                         }
@@ -336,7 +333,7 @@ pub fn airpods_view<'a>(
             toggler(state.allow_off_mode)
                 .on_toggle(move |is_enabled| {
                     let aacp_manager = aacp_manager_olm.clone();
-                    run_async_in_thread(
+                    aacp_manager.runtime().clone().spawn(
                         async move {
                             aacp_manager.send_control_command(
                                 ControlCommandIdentifiers::AllowOffOption,
@@ -396,7 +393,7 @@ pub fn airpods_view<'a>(
             toggler(state.hires_mic_enabled)
                 .on_toggle(move |is_enabled| {
                     let aacp_manager = aacp_manager_mic.clone();
-                    run_async_in_thread(async move {
+                    aacp_manager.runtime().clone().spawn(async move {
                         aacp_manager.set_hires_mic_enabled(is_enabled).await;
                     });
                     let mut state = state.clone();
@@ -600,6 +597,21 @@ pub fn airpods_view<'a>(
         .height(Length::Fill)
 }
 
+/// Longest name the AirPods accept in a rename packet, in bytes.
+const MAX_NAME_BYTES: usize = 32;
+
+/// The name to send, trimmed, or a short hint saying why it cannot be sent.
+pub(crate) fn validate_device_name(name: &str) -> Result<&str, &'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        Err("Name can't be empty")
+    } else if name.len() > MAX_NAME_BYTES {
+        Err("Name is too long")
+    } else {
+        Ok(name)
+    }
+}
+
 fn mmss(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -631,6 +643,10 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
                 .spacing(12),
             ]
             .spacing(6)
+        }
+        MicTest::Starting => column![title, dim_text("Pausing media…".to_string())].spacing(6),
+        MicTest::Stopping => {
+            column![title, dim_text("Finishing the recording…".to_string())].spacing(6)
         }
         MicTest::Recording(recorder) => column![
             title,
@@ -743,12 +759,29 @@ fn level_meter<'a>(level: f32, app: Option<String>) -> iced::widget::Container<'
     })
 }
 
-fn run_async_in_thread<F>(fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(fut);
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmss_pads_seconds() {
+        assert_eq!(mmss(Duration::ZERO), "0:00");
+        assert_eq!(mmss(Duration::from_millis(59_999)), "0:59");
+        assert_eq!(mmss(Duration::from_secs(65)), "1:05");
+        assert_eq!(mmss(Duration::from_secs(300)), "5:00");
+        assert_eq!(mmss(Duration::from_secs(3600)), "60:00");
+    }
+
+    #[test]
+    fn device_name_is_trimmed_and_bounded() {
+        assert_eq!(validate_device_name("  Pods  "), Ok("Pods"));
+        assert!(validate_device_name("").is_err());
+        assert!(validate_device_name("   ").is_err());
+        let longest = "a".repeat(MAX_NAME_BYTES);
+        assert_eq!(validate_device_name(&longest), Ok(longest.as_str()));
+        assert!(validate_device_name(&"a".repeat(MAX_NAME_BYTES + 1)).is_err());
+        // Eleven three-byte characters are 33 bytes: the limit is in bytes, not chars.
+        assert!(validate_device_name(&"\u{20AC}".repeat(11)).is_err());
+        assert!(validate_device_name(&"\u{20AC}".repeat(10)).is_ok());
+    }
 }
