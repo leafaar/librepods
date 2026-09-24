@@ -39,7 +39,23 @@ pub struct VirtualMic {
 }
 
 impl VirtualMic {
-    pub fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
+    /// Load the pipe-source. The sound server round trips block for up to
+    /// PULSE_TIMEOUT each, so they run on the blocking pool, not on the async
+    /// worker that awaits this.
+    pub async fn open(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
+        tokio::task::spawn_blocking(move || Self::open_blocking(sample_rate, channels))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Unload the pipe-source on the blocking pool. Dropping a VirtualMic
+    /// instead does the same work on the current thread.
+    pub async fn close(self) {
+        let _ = tokio::task::spawn_blocking(move || drop(self)).await;
+    }
+
+    fn open_blocking(sample_rate: u32, channels: u8) -> Option<VirtualMic> {
         unload_stale_modules();
 
         let chan_map = if channels == 1 {

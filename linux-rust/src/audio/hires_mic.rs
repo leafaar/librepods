@@ -87,7 +87,7 @@ impl HiResMic {
     // Create the persistent virtual input and spawn the activity monitor. The
     // monitor owns the virtual device and unloads it when it exits.
     pub async fn start(aacp: &AACPManager, addr: String, status: MicStatus) -> Option<HiResMic> {
-        let vmic = VirtualMic::open(ELD_SAMPLE_RATE, ELD_CHANNELS as u8)?;
+        let vmic = VirtualMic::open(ELD_SAMPLE_RATE, ELD_CHANNELS as u8).await?;
         let stop = Arc::new(Notify::new());
         let wake = aacp.hires_wake();
         // Spawn on the backend runtime, not the caller's (the UI toggle uses a
@@ -134,7 +134,7 @@ async fn monitor_loop(
     status: MicStatus,
     stop: Arc<Notify>,
     wake: Arc<Notify>,
-    _vmic: VirtualMic,
+    vmic: VirtualMic,
 ) {
     let mut capture: Option<Capture> = None;
     // Conversation detection value saved while we override it off for capture.
@@ -229,6 +229,7 @@ async fn monitor_loop(
         aacp.set_conversation_detection(prev).await;
     }
     status.reset();
+    vmic.close().await;
 }
 
 async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Option<Capture> {
