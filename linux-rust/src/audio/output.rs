@@ -425,6 +425,11 @@ pub(crate) fn wait_for<T: ?Sized>(mainloop: &mut Mainloop, op: &mut Operation<T>
 
 /// Connect to the sound server, giving up after PULSE_TIMEOUT.
 pub(crate) fn connect() -> Option<(Mainloop, Context)> {
+    connect_cancellable(|| false)
+}
+
+/// Like connect(), but also gives up as soon as `cancelled` returns true.
+pub(crate) fn connect_cancellable(cancelled: impl Fn() -> bool) -> Option<(Mainloop, Context)> {
     let mut mainloop = Mainloop::new()?;
     let mut context = Context::new(&mainloop, "LibrePods")?;
     context
@@ -432,6 +437,9 @@ pub(crate) fn connect() -> Option<(Mainloop, Context)> {
         .ok()?;
     let deadline = Instant::now() + PULSE_TIMEOUT;
     loop {
+        if cancelled() {
+            return None;
+        }
         if Instant::now() >= deadline {
             warn!("[pw] could not connect to the sound server in time");
             return None;
