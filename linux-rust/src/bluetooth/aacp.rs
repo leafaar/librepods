@@ -443,12 +443,12 @@ impl AACPManager {
             )
             .await
         {
-            warn!("[hires] failed to set conversation detection: {}", e);
+            warn!("[aacp] failed to set conversation detection: {}", e);
             return;
         }
         // AirPods don't echo this back, so record it in our own status list
         // (the source of truth for conversation_detection_enabled) and push it
-        // to the UI ourselves.
+        // to the UI and to the subscribers (the tray checkmark) ourselves.
         let mut state = self.state.lock().await;
         if let Some(existing) = state
             .control_command_status_list
@@ -464,12 +464,26 @@ impl AACPManager {
                     value: vec![value],
                 });
         }
+        if let Some(subscribers) = state
+            .control_command_subscribers
+            .get(&ControlCommandIdentifiers::ConversationDetectConfig)
+        {
+            for sub in subscribers {
+                let _ = sub.send(vec![value]);
+            }
+        }
         if let Some(ref tx) = state.event_tx {
             let _ = tx.send(AACPEvent::ControlCommand(ControlCommandStatus {
                 identifier: ControlCommandIdentifiers::ConversationDetectConfig,
                 value: vec![value],
             }));
         }
+    }
+
+    /// Whether battery or ear detection status has arrived on this connection.
+    pub async fn has_device_status(&self) -> bool {
+        let state = self.state.lock().await;
+        !state.battery_info.is_empty() || !state.ear_detection_status.is_empty()
     }
 
     pub fn mic_level(&self) -> f32 {
@@ -679,25 +693,19 @@ impl AACPManager {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     ) {
         let mut state = self.state.lock().await;
-        state
-            .control_command_subscribers
-            .entry(identifier)
-            .or_default()
-            .push(tx);
         // send initial value if available
         if let Some(status) = state
             .control_command_status_list
             .iter()
             .find(|s| s.identifier == identifier)
         {
-            let _ = state
-                .control_command_subscribers
-                .get(&identifier)
-                .unwrap()
-                .last()
-                .unwrap()
-                .send(status.value.clone());
+            let _ = tx.send(status.value.clone());
         }
+        state
+            .control_command_subscribers
+            .entry(identifier)
+            .or_default()
+            .push(tx);
     }
 
     pub async fn receive_packet(&self, packet: &[u8]) {
@@ -1186,15 +1194,7 @@ impl AACPManager {
     }
 
     pub async fn send_rename_packet(&self, name: &str) -> Result<()> {
-        let name_bytes = name.as_bytes();
-        let size = name_bytes.len();
-        let mut packet = Vec::with_capacity(6 + size);
-        packet.push(opcodes::RENAME);
-        packet.push(0x00);
-        packet.push(0x01);
-        packet.push(size as u8);
-        packet.push(0x00);
-        packet.extend_from_slice(name_bytes);
+        let packet = rename_payload(name)?;
         self.send_data_packet(&packet).await
     }
 
@@ -1219,11 +1219,7 @@ impl AACPManager {
     ) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(112);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
 
         buffer.extend_from_slice(&[0x68, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
@@ -1254,11 +1250,7 @@ impl AACPManager {
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(106);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x62, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5]);
         buffer.push(0x4A);
@@ -1291,49 +1283,15 @@ impl AACPManager {
         target_mac_address: &str,
         streaming_state: bool,
     ) -> Result<()> {
-        let opcode = [opcodes::SMART_ROUTING, 0x00];
-        let mut buffer = Vec::with_capacity(138);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
-        buffer.extend_from_slice(&[0x82, 0x00]);
-        buffer.extend_from_slice(&[0x01, 0xE5, 0x4A]);
-        buffer.extend_from_slice(b"PlayingApp");
-        buffer.push(0x56);
-        buffer.extend_from_slice(b"com.google.ios.youtube");
-        buffer.push(0x52);
-        buffer.extend_from_slice(b"HostStreamingState");
-        buffer.push(0x42);
-        buffer.extend_from_slice(if streaming_state { b"YES" } else { b"NO" });
-        buffer.push(0x49);
-        buffer.extend_from_slice(b"btAddress");
-        buffer.push(0x51);
-        buffer.extend_from_slice(self_mac_address.as_bytes());
-        buffer.extend_from_slice(b"btName");
-        buffer.push(0x43);
-        buffer.extend_from_slice(b"Mac");
-        buffer.push(0x58);
-        buffer.extend_from_slice(b"otherDevice");
-        buffer.extend_from_slice(b"AudioCategory");
-        buffer.extend_from_slice(&[0x31, 0x2D, 0x01]);
-
-        while buffer.len() < 138 {
-            buffer.push(0x00);
-        }
-        let packet = [opcode.as_slice(), buffer.as_slice()].concat();
+        let packet =
+            media_information_payload(self_mac_address, target_mac_address, streaming_state)?;
         self.send_data_packet(&packet).await
     }
 
     pub async fn send_smart_routing_show_ui(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(134);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x7E, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE6, 0x5B]);
         buffer.extend_from_slice(b"SmartRoutingKeyShowNearbyUI");
@@ -1365,11 +1323,7 @@ impl AACPManager {
     pub async fn send_hijack_reversed(&self, target_mac_address: &str) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(97);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x59, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE3]);
         buffer.push(0x5F);
@@ -1398,14 +1352,10 @@ impl AACPManager {
     ) -> Result<()> {
         let opcode = [opcodes::SMART_ROUTING, 0x00];
         let mut buffer = Vec::with_capacity(86);
-        let target_mac_bytes: Vec<u8> = target_mac_address
-            .split(':')
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-        buffer.extend_from_slice(&target_mac_bytes.iter().rev().cloned().collect::<Vec<u8>>());
+        buffer.extend_from_slice(&mac_to_wire(target_mac_address)?);
         buffer.extend_from_slice(&[0x4E, 0x00]);
         buffer.extend_from_slice(&[0x01, 0xE5]);
-        buffer.extend_from_slice(&[0x48, 0x69]);
+        buffer.push(0x48);
         buffer.extend_from_slice(b"idleTime");
         buffer.extend_from_slice(&[0x08, 0x47]);
         buffer.extend_from_slice(b"newTipi");
@@ -1521,4 +1471,157 @@ async fn save_device(mac: String, data: DeviceData) {
 
 fn connect_error(kind: std::io::ErrorKind, msg: &str) -> Error {
     Error::from(std::io::Error::new(kind, msg))
+}
+
+fn invalid_input(msg: String) -> Error {
+    Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+}
+
+/// A colon-separated MAC address as the 6 bytes AACP sends, least significant
+/// byte first.
+fn mac_to_wire(mac: &str) -> Result<[u8; 6]> {
+    let addr: Address = mac
+        .parse()
+        .map_err(|_| invalid_input(format!("invalid MAC address: {mac:?}")))?;
+    let mut bytes = addr.0;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+/// Rename payload: opcode, 0x00, 0x01, name length (one byte), 0x00, name.
+fn rename_payload(name: &str) -> Result<Vec<u8>> {
+    let name_bytes = name.as_bytes();
+    let size = u8::try_from(name_bytes.len()).map_err(|_| {
+        invalid_input(format!(
+            "name is {} bytes long, at most 255 fit in the rename packet",
+            name_bytes.len()
+        ))
+    })?;
+    let mut packet = Vec::with_capacity(5 + name_bytes.len());
+    packet.extend_from_slice(&[opcodes::RENAME, 0x00, 0x01, size, 0x00]);
+    packet.extend_from_slice(name_bytes);
+    Ok(packet)
+}
+
+/// Smart routing media information for `target_mac_address`.
+///
+/// After the target MAC comes a little-endian u16 with the number of bytes
+/// that follow it, not counting the zero padding; every other smart routing
+/// packet here follows that rule. Each string is prefixed with 0x40 plus its
+/// length (0x4A before the 10 bytes of "PlayingApp", 0x46 before "btName").
+fn media_information_payload(
+    self_mac_address: &str,
+    target_mac_address: &str,
+    streaming_state: bool,
+) -> Result<Vec<u8>> {
+    // The 0x51 tag below is for a 17 character address.
+    mac_to_wire(self_mac_address)?;
+    let (state_tag, state): (u8, &[u8]) = if streaming_state {
+        (0x43, b"YES")
+    } else {
+        (0x42, b"NO")
+    };
+
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(&[0x01, 0xE5, 0x4A]);
+    body.extend_from_slice(b"PlayingApp");
+    body.push(0x56);
+    body.extend_from_slice(b"com.google.ios.youtube");
+    body.push(0x52);
+    body.extend_from_slice(b"HostStreamingState");
+    body.push(state_tag);
+    body.extend_from_slice(state);
+    body.push(0x49);
+    body.extend_from_slice(b"btAddress");
+    body.push(0x51);
+    body.extend_from_slice(self_mac_address.as_bytes());
+    body.push(0x46);
+    body.extend_from_slice(b"btName");
+    body.push(0x43);
+    body.extend_from_slice(b"Mac");
+    body.push(0x58);
+    body.extend_from_slice(b"otherDevice");
+    body.extend_from_slice(b"AudioCategory");
+    body.extend_from_slice(&[0x31, 0x2D, 0x01]);
+    let body_len = u16::try_from(body.len())
+        .map_err(|_| invalid_input(format!("media information is {} bytes", body.len())))?;
+
+    let mut packet = Vec::with_capacity(2 + 138);
+    packet.extend_from_slice(&[opcodes::SMART_ROUTING, 0x00]);
+    packet.extend_from_slice(&mac_to_wire(target_mac_address)?);
+    packet.extend_from_slice(&body_len.to_le_bytes());
+    packet.extend_from_slice(&body);
+    packet.resize(packet.len().max(2 + 138), 0x00);
+    Ok(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_information_length_counts_the_bytes_after_it() {
+        for streaming in [false, true] {
+            let packet =
+                media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", streaming)
+                    .unwrap();
+            assert_eq!(packet.len(), 2 + 138);
+            assert_eq!(packet[2..8], [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]);
+            let len = usize::from(u16::from_le_bytes([packet[8], packet[9]]));
+            let body = &packet[10..10 + len];
+            assert!(body.ends_with(&[0x31, 0x2D, 0x01]));
+            assert!(packet[10 + len..].iter().all(|&b| b == 0));
+            let name = body.windows(7).position(|w| w == b"\x46btName");
+            assert!(name.is_some(), "btName has no string tag");
+        }
+    }
+
+    #[test]
+    fn media_information_tags_the_streaming_state_by_length() {
+        let yes = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", true)
+            .unwrap();
+        assert!(yes.windows(4).any(|w| w == b"\x43YES"));
+        let no = media_information_payload("11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", false)
+            .unwrap();
+        assert!(no.windows(3).any(|w| w == b"\x42NO"));
+    }
+
+    #[test]
+    fn mac_to_wire_reverses_the_bytes() {
+        assert_eq!(
+            mac_to_wire("AA:BB:CC:DD:EE:0f").unwrap(),
+            [0x0F, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA]
+        );
+    }
+
+    #[test]
+    fn mac_to_wire_rejects_malformed_addresses() {
+        for mac in [
+            "",
+            "AA:BB:CC:DD:EE",
+            "AA:BB:CC:DD:EE:FF:00",
+            "AA:BB:CC:DD:EE:GG",
+            "AABBCCDDEEFF",
+            "AA:BB:CC:DD:EE:FFF",
+        ] {
+            assert!(mac_to_wire(mac).is_err(), "accepted {mac:?}");
+        }
+    }
+
+    #[test]
+    fn rename_payload_carries_the_name_length() {
+        assert_eq!(
+            rename_payload("Pods").unwrap(),
+            [opcodes::RENAME, 0x00, 0x01, 0x04, 0x00, b'P', b'o', b'd', b's']
+        );
+        let longest = "a".repeat(255);
+        assert_eq!(rename_payload(&longest).unwrap()[3], 255);
+    }
+
+    #[test]
+    fn rename_payload_rejects_names_over_255_bytes() {
+        assert!(rename_payload(&"a".repeat(256)).is_err());
+        // 128 two-byte characters: 128 chars but 256 bytes.
+        assert!(rename_payload(&"é".repeat(128)).is_err());
+    }
 }

@@ -1,5 +1,5 @@
 use bluer::Adapter;
-use log::debug;
+use log::{debug, warn};
 use std::io::Error;
 
 pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<bluer::Device> {
@@ -7,7 +7,13 @@ pub(crate) async fn find_connected_airpods(adapter: &Adapter) -> bluer::Result<b
 
     let addrs = adapter.device_addresses().await?;
     for addr in addrs {
-        let device = adapter.device(addr)?;
+        let device = match adapter.device(addr) {
+            Ok(device) => device,
+            Err(e) => {
+                warn!("Skipping device {}: {}", addr, e);
+                continue;
+            }
+        };
         if device.is_connected().await.unwrap_or(false)
             && let Ok(uuids) = device.uuids().await
             && let Some(uuids) = uuids
@@ -29,7 +35,14 @@ pub async fn find_other_managed_devices(
     let addrs = adapter.device_addresses().await?;
     let mut devices = Vec::new();
     for addr in addrs {
-        let device = adapter.device(addr)?;
+        // One device that cannot be looked up must not hide the others.
+        let device = match adapter.device(addr) {
+            Ok(device) => device,
+            Err(e) => {
+                warn!("Skipping device {}: {}", addr, e);
+                continue;
+            }
+        };
         let device_mac = device.address().to_string();
         let connected = device.is_connected().await.unwrap_or(false);
         debug!("Checking device: {}, connected: {}", device_mac, connected);

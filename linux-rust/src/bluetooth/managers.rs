@@ -22,14 +22,6 @@ impl DeviceManagers {
         }
     }
 
-    // keeping the att for airpods optional as it requires changes in system bluez config
-    pub fn with_both(aacp: AACPManager, att: ATTManager) -> Self {
-        Self {
-            att: Some(Arc::new(att)),
-            aacp: Some(Arc::new(aacp)),
-        }
-    }
-
     pub fn set_aacp(&mut self, manager: AACPManager) {
         self.aacp = Some(Arc::new(manager));
     }

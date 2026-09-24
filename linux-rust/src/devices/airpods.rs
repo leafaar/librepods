@@ -7,16 +7,50 @@ use bluer::Address;
 use ksni::Handle;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use crate::utils::get_app_settings_path;
+
+// AirPods taken over from another device (the Connect button, auto-switch) can
+// answer the first setup with information, keys and control commands but never
+// start sending battery (0x04) or ear detection (0x06). The Android app repeats
+// the setup right away with 200 ms gaps and again after 5 s, and the
+// notification request may be sent at any point of the connection, so it is
+// also repeated until one of the two arrives.
+const SETUP_REPEAT_GAP: Duration = Duration::from_millis(200);
+const SETUP_LATE_REPEAT: Duration = Duration::from_secs(5);
+const STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const STATUS_CHECKS: u32 = 10;
+
+/// Handshake, feature flags and notification request, `SETUP_REPEAT_GAP` apart.
+async fn send_setup_sequence(aacp_manager: &AACPManager) {
+    if let Err(e) = aacp_manager.send_handshake().await {
+        error!("Failed to send handshake to AirPods device: {}", e);
+    }
+    sleep(SETUP_REPEAT_GAP).await;
+    if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
+        error!("Failed to set feature flags: {}", e);
+    }
+    sleep(SETUP_REPEAT_GAP).await;
+    if let Err(e) = aacp_manager.send_notification_request().await {
+        error!("Failed to request notifications: {}", e);
+    }
+}
+
+async fn request_notifications_if_silent(aacp_manager: &AACPManager) {
+    if aacp_manager.has_device_status().await {
+        return;
+    }
+    info!("No battery or ear detection from the AirPods yet, requesting notifications again");
+    if let Err(e) = aacp_manager.send_notification_request().await {
+        error!("Failed to request notifications: {}", e);
+    }
+}
 
 pub struct AirPodsDevice {
     pub mac_address: Address,
     pub aacp_manager: AACPManager,
     // pub att_manager: ATTManager,
-    pub media_controller: Arc<Mutex<MediaController>>,
+    pub media_controller: MediaController,
     // pub command_tx: Option<tokio::sync::mpsc::UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>>,
 }
 
@@ -109,10 +143,11 @@ impl AirPodsDevice {
         let adapter = session.default_adapter().await?;
         let local_mac = adapter.address().await?.to_string();
 
-        let media_controller = Arc::new(Mutex::new(MediaController::new(
-            mac_address.to_string(),
-            local_mac.clone(),
-        )));
+        // MediaController is a cheap handle over shared state and its methods
+        // take &self, so each task gets a clone instead of sharing a lock:
+        // activate_a2dp_profile can take many seconds, and a lock held for it
+        // would stall every AACP event behind it.
+        let media_controller = MediaController::new(mac_address.to_string(), local_mac.clone());
         let mc_clone = media_controller.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -139,18 +174,16 @@ impl AirPodsDevice {
         // the microphone has no transport either. Claim a profile right away.
         let mc_profile = media_controller.clone();
         aacp_manager.spawn_connection_task(async move {
-            mc_profile.lock().await.activate_a2dp_profile().await;
+            mc_profile.activate_a2dp_profile().await;
         });
 
-        let mc_listener = media_controller.lock().await;
         let aacp_manager_clone_listener = aacp_manager.clone();
-        if let Some(listener) = mc_listener
+        if let Some(listener) = media_controller
             .start_playback_listener(aacp_manager_clone_listener, command_tx.clone())
             .await
         {
             aacp_manager.track_connection_task(listener);
         }
-        drop(mc_listener);
 
         let (listening_mode_tx, mut listening_mode_rx) = tokio::sync::mpsc::unbounded_channel();
         aacp_manager
@@ -218,14 +251,18 @@ impl AirPodsDevice {
             )
             .await;
         let mc_clone_owns = media_controller.clone();
+        let aacp_manager_owns = aacp_manager.clone();
         aacp_manager.spawn_connection_task(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
-                if !owns {
+                if owns {
+                    // A takeover on an open connection can leave the status
+                    // notifications off as well.
+                    request_notifications_if_silent(&aacp_manager_owns).await;
+                } else {
                     info!("Lost ownership, pausing media and disconnecting audio");
-                    let controller = mc_clone_owns.lock().await;
-                    controller.pause_all_media().await;
-                    controller.deactivate_a2dp_profile().await;
+                    mc_clone_owns.pause_all_media().await;
+                    mc_clone_owns.deactivate_a2dp_profile().await;
                 }
             }
         });
@@ -243,12 +280,11 @@ impl AirPodsDevice {
                             "Received EarDetection event: old_status={:?}, new_status={:?}",
                             old_status, new_status
                         );
-                        let controller = mc_clone.lock().await;
                         debug!(
                             "Calling handle_ear_detection with old_status: {:?}, new_status: {:?}",
                             old_status, new_status
                         );
-                        controller
+                        mc_clone
                             .handle_ear_detection(old_status, new_status)
                             .await;
                     }
@@ -299,8 +335,7 @@ impl AirPodsDevice {
                     }
                     AACPEvent::ConversationalAwareness(status) => {
                         debug!("Received ConversationalAwareness event: {}", status);
-                        let controller = mc_clone.lock().await;
-                        controller.handle_conversational_awareness(status).await;
+                        mc_clone.handle_conversational_awareness(status).await;
                     }
                     AACPEvent::ConnectedDevices(old_devices, new_devices) => {
                         let local_mac = local_mac_events.clone();
@@ -349,9 +384,8 @@ impl AirPodsDevice {
                         );
                         let _ = command_tx_clone
                             .send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
-                        let controller = mc_clone.lock().await;
-                        controller.pause_all_media().await;
-                        controller.deactivate_a2dp_profile().await;
+                        mc_clone.pause_all_media().await;
+                        mc_clone.deactivate_a2dp_profile().await;
                     }
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;
@@ -360,15 +394,14 @@ impl AirPodsDevice {
                             press_type, bud_type
                         );
                         if stem_control {
-                            let controller = mc_clone.lock().await;
                             match press_type {
                                 StemPressType::DoublePress => {
                                     info!("Double press detected, skipping to next track");
-                                    controller.next_track().await;
+                                    mc_clone.next_track().await;
                                 }
                                 StemPressType::TriplePress => {
                                     info!("Triple press detected, going to previous track");
-                                    controller.previous_track().await;
+                                    mc_clone.previous_track().await;
                                 }
                                 _ => {
                                     debug!("Unhandled stem press type: {:?}", press_type);
@@ -387,6 +420,23 @@ impl AirPodsDevice {
                         debug!("Sent unhandled AACP event to UI");
                     }
                 }
+            }
+        });
+
+        // Started last, so the event channel and subscribers are in place for
+        // whatever the repeated setup brings.
+        let aacp_manager_setup = aacp_manager.clone();
+        aacp_manager.spawn_connection_task(async move {
+            sleep(SETUP_REPEAT_GAP).await;
+            send_setup_sequence(&aacp_manager_setup).await;
+            sleep(SETUP_LATE_REPEAT).await;
+            send_setup_sequence(&aacp_manager_setup).await;
+            for _ in 0..STATUS_CHECKS {
+                sleep(STATUS_CHECK_INTERVAL).await;
+                if aacp_manager_setup.has_device_status().await {
+                    return;
+                }
+                request_notifications_if_silent(&aacp_manager_setup).await;
             }
         });
 
