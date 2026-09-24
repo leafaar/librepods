@@ -632,6 +632,10 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
             ]
             .spacing(6)
         }
+        MicTest::Starting => column![title, dim_text("Pausing media…".to_string())].spacing(6),
+        MicTest::Stopping => {
+            column![title, dim_text("Finishing the recording…".to_string())].spacing(6)
+        }
         MicTest::Recording(recorder) => column![
             title,
             row![

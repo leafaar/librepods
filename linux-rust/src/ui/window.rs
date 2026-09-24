@@ -104,6 +104,9 @@ pub struct App {
     mic_test: MicTest,
     // Media players paused for the microphone test, resumed when it ends.
     mic_test_paused: Vec<String>,
+    // Bumped on every recorder stop and whenever the test ends, so a stop
+    // result that arrives late is dropped instead of reviving the test.
+    mic_test_take: u64,
     // Last case level each device reported. The case only reports while a bud
     // is in it, so the sidebar shows this, dimmed, the rest of the time.
     last_case_level: HashMap<String, u8>,
@@ -115,9 +118,23 @@ pub struct App {
 /// The microphone test on the AirPods page. Holds the live recorder or player.
 pub enum MicTest {
     Idle,
+    /// Waiting for the playing media to pause before recording.
+    Starting,
     Recording(mic_test::Recorder),
+    /// The recorder was told to stop and its thread is being joined.
+    Stopping,
     Ready(mic_test::Player),
     Failed(String),
+}
+
+impl MicTest {
+    /// A test is under way and the media players stay paused.
+    fn is_running(&self) -> bool {
+        matches!(
+            self,
+            MicTest::Starting | MicTest::Recording(_) | MicTest::Stopping | MicTest::Ready(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +187,8 @@ pub enum Message {
     MicTestSkip(bool), // true = forward
     MicTestSeek(f32),  // seconds
     MicTestDone,
+    MicTestMediaPaused(Vec<String>),
+    MicTestRecorded(u64, Result<Vec<u8>, String>),
     // ShowNewDialogTab,
     GotPairedDevices(HashMap<String, Address>),
     StartAddDevice(String, Address),
@@ -290,6 +309,7 @@ impl App {
                 connect_status: HashMap::new(),
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
+                mic_test_take: 0,
                 last_case_level: HashMap::new(),
                 devices: load_devices(),
             },
@@ -345,17 +365,54 @@ impl App {
             Message::CopyToClipboard(data) => iced::clipboard::write(data),
             Message::ConnectDevice(mac) => self.start_connect(mac),
             Message::MicTestRecord => {
+                if matches!(
+                    self.mic_test,
+                    MicTest::Starting | MicTest::Recording(_) | MicTest::Stopping
+                ) {
+                    return Task::none();
+                }
                 // Music would play over the recording and the playback, so pause it
                 // for the whole test. Players already paused by an earlier take stay listed.
                 if self.mic_test_paused.is_empty() {
-                    self.mic_test_paused = output::pause_media_players();
+                    self.mic_test = MicTest::Starting;
+                    return Task::perform(
+                        off_ui_thread(output::pause_media_players),
+                        |players| Message::MicTestMediaPaused(players.unwrap_or_default()),
+                    );
                 }
                 self.mic_test = MicTest::Recording(mic_test::Recorder::start());
                 Task::none()
             }
-            Message::MicTestStop => {
-                self.stop_recording();
-                Task::none()
+            Message::MicTestMediaPaused(players) => {
+                if matches!(self.mic_test, MicTest::Starting) {
+                    self.mic_test_paused = players;
+                    self.mic_test = MicTest::Recording(mic_test::Recorder::start());
+                    Task::none()
+                } else if self.mic_test.is_running() {
+                    // A pause from a test that ended while a new one started.
+                    self.mic_test_paused.extend(players);
+                    Task::none()
+                } else {
+                    // The test ended while the players were being paused.
+                    resume_players(players)
+                }
+            }
+            Message::MicTestStop => self.stop_recording(),
+            Message::MicTestRecorded(take, result) => {
+                if take != self.mic_test_take || !matches!(self.mic_test, MicTest::Stopping) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(pcm) => {
+                        self.mic_test = MicTest::Ready(mic_test::Player::new(pcm));
+                        Task::none()
+                    }
+                    Err(e) => {
+                        // No Done button on a failed test, so give the music back now.
+                        self.mic_test = MicTest::Failed(e);
+                        resume_players(std::mem::take(&mut self.mic_test_paused))
+                    }
+                }
             }
             Message::MicTestPlay => {
                 if let MicTest::Ready(player) = &self.mic_test {
@@ -387,11 +444,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::MicTestDone => {
-                self.mic_test = MicTest::Idle;
-                output::resume_media_players(&std::mem::take(&mut self.mic_test_paused));
-                Task::none()
-            }
+            Message::MicTestDone => self.end_mic_test(),
             Message::ConnectFinished(mac, result) => {
                 match result {
                     // DeviceConnected arrives separately once the device is set up.
@@ -406,7 +459,7 @@ impl App {
             }
             Message::MicLevelTick => {
                 if matches!(&self.mic_test, MicTest::Recording(r) if r.finished()) {
-                    self.stop_recording();
+                    return self.stop_recording();
                 }
                 Task::none()
             }
@@ -554,7 +607,14 @@ impl App {
                             .connected_devices
                             .retain(|device| device != &mac);
 
-                        self.device_states.remove(&mac);
+                        let removed = self.device_states.remove(&mac);
+                        // The test records from the AirPods, and its Done button
+                        // goes away with them.
+                        let end_test = if matches!(removed, Some(DeviceState::AirPods(_))) {
+                            self.end_mic_test()
+                        } else {
+                            Task::none()
+                        };
 
                         let is_airpods = crate::auto_switch::known_airpods()
                             .iter()
@@ -565,7 +625,7 @@ impl App {
                             self.selected_tab = Tab::Device("none".to_string());
                         }
 
-                        Task::batch(vec![wait_task])
+                        Task::batch(vec![wait_task, end_test])
                     }
                     BluetoothUIMessage::AACPUIEvent(mac, event) => {
                         let ui_rx = Arc::clone(&self.ui_rx);
@@ -732,11 +792,16 @@ impl App {
                 Task::none()
             }
             Message::StateChanged(mac, state) => {
+                let mut end_test = Task::none();
                 if let DeviceState::AirPods(a) = &state
                     && a.hires_mic_enabled != self.hires_mic_enabled
                 {
                     self.hires_mic_enabled = a.hires_mic_enabled;
                     self.save_settings();
+                    // The test records from the hi-res source, which is going away.
+                    if !a.hires_mic_enabled {
+                        end_test = self.end_mic_test();
+                    }
                 }
                 self.device_states.insert(mac.clone(), state);
                 // if airpods, update the noise control state combo box based on allow off mode
@@ -756,7 +821,7 @@ impl App {
                         modes
                     });
                 }
-                Task::none()
+                end_test
             }
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
@@ -802,13 +867,38 @@ impl App {
         }
     }
 
-    fn stop_recording(&mut self) {
-        if let MicTest::Recording(recorder) = std::mem::replace(&mut self.mic_test, MicTest::Idle) {
-            self.mic_test = match recorder.stop() {
-                Ok(pcm) => MicTest::Ready(mic_test::Player::new(pcm)),
-                Err(e) => MicTest::Failed(e),
-            };
-        }
+    /// Stop the recorder. Its thread is joined off the UI thread and the result
+    /// comes back as MicTestRecorded.
+    fn stop_recording(&mut self) -> Task<Message> {
+        let recorder = match std::mem::replace(&mut self.mic_test, MicTest::Stopping) {
+            MicTest::Recording(recorder) => recorder,
+            other => {
+                self.mic_test = other;
+                return Task::none();
+            }
+        };
+        self.mic_test_take += 1;
+        let take = self.mic_test_take;
+        Task::perform(off_ui_thread(move || recorder.stop()), move |result| {
+            let result = result.unwrap_or_else(|| Err("The recorder crashed".to_string()));
+            Message::MicTestRecorded(take, result)
+        })
+    }
+
+    /// End the microphone test from any state: stop the recorder, drop the
+    /// player and resume the media players it paused.
+    fn end_mic_test(&mut self) -> Task<Message> {
+        self.mic_test_take += 1;
+        let stop = match std::mem::replace(&mut self.mic_test, MicTest::Idle) {
+            MicTest::Recording(recorder) => Task::future(off_ui_thread(move || {
+                if let Err(e) = recorder.stop() {
+                    debug!("Discarded microphone test recording: {}", e);
+                }
+            }))
+            .discard(),
+            _ => Task::none(),
+        };
+        Task::batch([stop, resume_players(std::mem::take(&mut self.mic_test_paused))])
     }
 
     fn start_connect(&mut self, mac: String) -> Task<Message> {
@@ -1739,6 +1829,22 @@ impl App {
                     .is_some_and(|aacp| aacp.mic_active())
         })
     }
+}
+
+/// Run blocking work (D-Bus calls, thread joins) on the runtime's blocking
+/// pool, so update() never waits on it. None if the work could not finish.
+async fn off_ui_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| error!("Blocking UI task failed: {}", e))
+        .ok()
+}
+
+fn resume_players(players: Vec<String>) -> Task<Message> {
+    if players.is_empty() {
+        return Task::none();
+    }
+    Task::future(off_ui_thread(move || output::resume_media_players(&players))).discard()
 }
 
 /// Read devices.json. A missing or unreadable file gives an empty list.
