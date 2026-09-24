@@ -916,10 +916,13 @@ impl App {
         };
         self.mic_test_take += 1;
         let take = self.mic_test_take;
-        Task::perform(off_ui_thread(move || recorder.stop()), move |result| {
-            let result = result.unwrap_or_else(|| Err("The recorder crashed".to_string()));
-            Message::MicTestRecorded(take, result)
-        })
+        Task::perform(
+            off_ui_thread(move || recorder.stop().map_err(|e| e.to_string())),
+            move |result| {
+                let result = result.unwrap_or_else(|| Err("The recorder crashed".to_string()));
+                Message::MicTestRecorded(take, result)
+            },
+        )
     }
 
     /// End the microphone test from any state: stop the recorder, drop the
@@ -1037,7 +1040,7 @@ impl App {
         };
         let attempt = self.connects.start(mac.clone());
         Task::perform(crate::auto_switch::connect_airpods(addr), move |result| {
-            Message::ConnectFinished(mac, attempt, result)
+            Message::ConnectFinished(mac, attempt, result.map_err(|e| e.to_string()))
         })
     }
 

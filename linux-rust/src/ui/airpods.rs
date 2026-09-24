@@ -687,7 +687,7 @@ fn mic_test_row<'a>(mic_test: &'a MicTest) -> iced::widget::Column<'a, Message> 
             ]
             .spacing(6);
             if let Some(e) = player.error() {
-                col = col.push(dim_text(e));
+                col = col.push(dim_text(e.to_string()));
             }
             col
         },

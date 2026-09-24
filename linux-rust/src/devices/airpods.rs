@@ -182,12 +182,9 @@ impl AirPodsDevice {
         });
 
         let aacp_manager_clone_listener = aacp_manager.clone();
-        if let Some(listener) = media_controller
-            .start_playback_listener(aacp_manager_clone_listener, command_tx.clone())
-            .await
-        {
-            aacp_manager.track_connection_task(listener);
-        }
+        let listener = media_controller
+            .start_playback_listener(aacp_manager_clone_listener, command_tx.clone());
+        aacp_manager.track_connection_task(listener);
 
         let (listening_mode_tx, mut listening_mode_rx) = tokio::sync::mpsc::unbounded_channel();
         aacp_manager

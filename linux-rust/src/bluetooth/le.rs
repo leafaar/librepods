@@ -44,7 +44,7 @@ fn verify_rpa(addr: Address, irk: &[u8; 16]) -> bool {
     rpa.reverse();
     let hash = [rpa[0], rpa[1], rpa[2]];
     let prand = [rpa[3], rpa[4], rpa[5]];
-    let computed_hash = ah(irk, &prand);
+    let computed_hash = ah(irk, prand);
     debug!(
         "Verifying RPA: addr={}, hash={:?}, computed_hash={:?}",
         addr, hash, computed_hash
