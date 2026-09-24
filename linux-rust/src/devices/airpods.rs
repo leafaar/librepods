@@ -10,6 +10,42 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 use crate::utils::get_app_settings_path;
 
+// AirPods taken over from another device (the Connect button, auto-switch) can
+// answer the first setup with information, keys and control commands but never
+// start sending battery (0x04) or ear detection (0x06). The Android app repeats
+// the setup right away with 200 ms gaps and again after 5 s, and the
+// notification request may be sent at any point of the connection, so it is
+// also repeated until one of the two arrives.
+const SETUP_REPEAT_GAP: Duration = Duration::from_millis(200);
+const SETUP_LATE_REPEAT: Duration = Duration::from_secs(5);
+const STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const STATUS_CHECKS: u32 = 10;
+
+/// Handshake, feature flags and notification request, `SETUP_REPEAT_GAP` apart.
+async fn send_setup_sequence(aacp_manager: &AACPManager) {
+    if let Err(e) = aacp_manager.send_handshake().await {
+        error!("Failed to send handshake to AirPods device: {}", e);
+    }
+    sleep(SETUP_REPEAT_GAP).await;
+    if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
+        error!("Failed to set feature flags: {}", e);
+    }
+    sleep(SETUP_REPEAT_GAP).await;
+    if let Err(e) = aacp_manager.send_notification_request().await {
+        error!("Failed to request notifications: {}", e);
+    }
+}
+
+async fn request_notifications_if_silent(aacp_manager: &AACPManager) {
+    if aacp_manager.has_device_status().await {
+        return;
+    }
+    info!("No battery or ear detection from the AirPods yet, requesting notifications again");
+    if let Err(e) = aacp_manager.send_notification_request().await {
+        error!("Failed to request notifications: {}", e);
+    }
+}
+
 pub struct AirPodsDevice {
     pub mac_address: Address,
     pub aacp_manager: AACPManager,
@@ -215,10 +251,15 @@ impl AirPodsDevice {
             )
             .await;
         let mc_clone_owns = media_controller.clone();
+        let aacp_manager_owns = aacp_manager.clone();
         aacp_manager.spawn_connection_task(async move {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
-                if !owns {
+                if owns {
+                    // A takeover on an open connection can leave the status
+                    // notifications off as well.
+                    request_notifications_if_silent(&aacp_manager_owns).await;
+                } else {
                     info!("Lost ownership, pausing media and disconnecting audio");
                     mc_clone_owns.pause_all_media().await;
                     mc_clone_owns.deactivate_a2dp_profile().await;
@@ -379,6 +420,23 @@ impl AirPodsDevice {
                         debug!("Sent unhandled AACP event to UI");
                     }
                 }
+            }
+        });
+
+        // Started last, so the event channel and subscribers are in place for
+        // whatever the repeated setup brings.
+        let aacp_manager_setup = aacp_manager.clone();
+        aacp_manager.spawn_connection_task(async move {
+            sleep(SETUP_REPEAT_GAP).await;
+            send_setup_sequence(&aacp_manager_setup).await;
+            sleep(SETUP_LATE_REPEAT).await;
+            send_setup_sequence(&aacp_manager_setup).await;
+            for _ in 0..STATUS_CHECKS {
+                sleep(STATUS_CHECK_INTERVAL).await;
+                if aacp_manager_setup.has_device_status().await {
+                    return;
+                }
+                request_notifications_if_silent(&aacp_manager_setup).await;
             }
         });
 

@@ -480,6 +480,12 @@ impl AACPManager {
         }
     }
 
+    /// Whether battery or ear detection status has arrived on this connection.
+    pub async fn has_device_status(&self) -> bool {
+        let state = self.state.lock().await;
+        !state.battery_info.is_empty() || !state.ear_detection_status.is_empty()
+    }
+
     pub fn mic_level(&self) -> f32 {
         self.mic_status.level()
     }
