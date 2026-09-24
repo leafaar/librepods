@@ -1,5 +1,5 @@
 use crate::bluetooth::aacp::{
-    AACPEvent, BatteryComponent, BatteryStatus, ControlCommandIdentifiers,
+    AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus, ControlCommandIdentifiers,
 };
 use crate::bluetooth::managers::DeviceManagers;
 use crate::devices::enums::{
@@ -99,6 +99,9 @@ pub struct App {
     mic_test: MicTest,
     // Media players paused for the microphone test, resumed when it ends.
     mic_test_paused: Vec<String>,
+    // Last case level each device reported. The case only reports while a bud
+    // is in it, so the sidebar shows this, dimmed, the rest of the time.
+    last_case_level: HashMap<String, u8>,
 }
 
 /// The microphone test on the AirPods page. Holds the live recorder or player.
@@ -279,6 +282,7 @@ impl App {
                 connect_status: HashMap::new(),
                 mic_test: MicTest::Idle,
                 mic_test_paused: Vec::new(),
+                last_case_level: HashMap::new(),
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -466,7 +470,8 @@ impl App {
                         };
                         match type_ {
                             Some(DeviceType::AirPods) => {
-                                let device_managers = self.device_managers.blocking_read();
+                                let managers = Arc::clone(&self.device_managers);
+                                let device_managers = managers.blocking_read();
                                 let device_manager = device_managers.get(&mac).unwrap();
                                 let aacp_manager = device_manager.get_aacp().unwrap();
                                 let aacp_manager_state = aacp_manager.state.clone();
@@ -488,6 +493,7 @@ impl App {
                                         .map(|d| d.name.clone())
                                         .unwrap_or_else(|| "Unknown Device".to_string())
                                 };
+                                self.remember_case_level(&mac, &state.battery_info);
                                 self.device_states.insert(mac.clone(), DeviceState::AirPods(AirPodsState {
                                     device_name,
                                     battery: state.battery_info.clone(),
@@ -660,6 +666,7 @@ impl App {
                                 }
                             },
                             AACPEvent::BatteryInfo(battery_info) => {
+                                self.remember_case_level(&mac, &battery_info);
                                 if let Some(DeviceState::AirPods(state)) =
                                     self.device_states.get_mut(&mac)
                                 {
@@ -807,6 +814,12 @@ impl App {
         }
     }
 
+    fn remember_case_level(&mut self, mac: &str, battery: &[BatteryInfo]) {
+        if let Some(level) = live_case_level(battery) {
+            self.last_case_level.insert(mac.to_string(), level);
+        }
+    }
+
     fn stop_recording(&mut self) {
         if let MicTest::Recording(recorder) = std::mem::replace(&mut self.mic_test, MicTest::Idle) {
             self.mic_test = match recorder.stop() {
@@ -876,58 +889,44 @@ impl App {
                     let create_tab_button = |tab: Tab, label: &str, mac_addr: &str, connected: bool| -> Element<'_, Message> {
                         let label = label.to_string() + if connected { " 􀉣" } else { "" };
                         let is_selected = self.selected_tab == tab;
-                        let col = column![
-                            text(label).size(16),
-                            text({
-                                if connected {
-                                    let mac = match tab {
-                                        Tab::Device(ref mac) => mac.as_str(),
-                                        _ => "",
-                                    };
-
-                                    match self.device_states.get(mac) {
-                                        Some(DeviceState::AirPods(state)) => {
-                                            let b = &state.battery;
-                                            let headphone = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                .map(|x| x.level);
-                                            // if headphones is not None, use only that
-                                            if let Some(level) = headphone {
-                                                let charging = b.iter().find(|x| x.component == BatteryComponent::Headphone)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "􀺹 {}%{}",
-                                                    level, if charging {"\u{1002E6}"} else {""}
-                                                )
-                                            } else {
-                                                let left  = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let right = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let case  = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.level).unwrap_or_default();
-                                                let left_charging = b.iter().find(|x| x.component == BatteryComponent::Left)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let right_charging = b.iter().find(|x| x.component == BatteryComponent::Right)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                let case_charging = b.iter().find(|x| x.component == BatteryComponent::Case)
-                                                    .map(|x| x.status == BatteryStatus::Charging).unwrap_or(false);
-                                                format!(
-                                                    "\u{1018E5} {}%{} \u{1018E8} {}%{} \u{100E6C} {}%{}",
-                                                    left, if left_charging {"\u{1002E6}"} else {""}, right, if right_charging {"\u{1002E6}"} else {""}, case, if case_charging {"\u{1002E6}"} else {""}
-                                                )
-                                            }
+                        let status: Element<'_, Message> = if connected {
+                            match self.device_states.get(mac_addr) {
+                                Some(DeviceState::AirPods(state)) => {
+                                    let parts = battery_parts(
+                                        &state.battery,
+                                        self.last_case_level.get(mac_addr).copied(),
+                                    );
+                                    let mut line = row![].spacing(4);
+                                    for (part, stale) in parts {
+                                        let mut part_text = text(part).size(12);
+                                        if stale {
+                                            part_text = part_text.style(move |theme: &Theme| {
+                                                let mut style = text::Style::default();
+                                                let color = if is_selected {
+                                                    Style::default().text_color
+                                                } else {
+                                                    theme.palette().text
+                                                };
+                                                style.color = Some(color.scale_alpha(0.5));
+                                                style
+                                            });
                                         }
-                                        _ => "Connected".to_string(),
+                                        line = line.push(part_text);
                                     }
-                                } else {
-                                    match self.connect_status.get(mac_addr) {
-                                        Some(ConnectStatus::Connecting) => "Connecting…".to_string(),
-                                        Some(ConnectStatus::Failed(_)) => "Couldn't connect".to_string(),
-                                        None => "Not connected".to_string(),
-                                    }
+                                    line.into()
                                 }
-                            }).size(12)
-                        ];
+                                _ => text("Connected").size(12).into(),
+                            }
+                        } else {
+                            text(match self.connect_status.get(mac_addr) {
+                                Some(ConnectStatus::Connecting) => "Connecting…",
+                                Some(ConnectStatus::Failed(_)) => "Couldn't connect",
+                                None => "Not connected",
+                            })
+                            .size(12)
+                            .into()
+                        };
+                        let col = column![text(label).size(16), status];
                         let content = container(col)
                             .padding(8);
                         let style = move |theme: &Theme, _status| {
@@ -1743,6 +1742,55 @@ impl App {
     }
 }
 
+const CHARGING_MARK: &str = "\u{1002E6}";
+
+/// The level of a battery entry, or None when the component is disconnected or
+/// the level is out of range.
+fn known_level(info: &BatteryInfo) -> Option<u8> {
+    (info.status != BatteryStatus::Disconnected && info.level <= 100).then_some(info.level)
+}
+
+/// "80%" with a charging mark, or "-" when the component is absent or disconnected.
+fn battery_text(info: Option<&BatteryInfo>) -> String {
+    match info.and_then(|b| known_level(b).map(|level| (level, b.status))) {
+        Some((level, status)) => {
+            let mark = if status.is_charging() { CHARGING_MARK } else { "" };
+            format!("{}%{}", level, mark)
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// The case level a battery report carries, if any. AirPods only know the case
+/// level while a bud sits in it: with both buds out, the case entry reports
+/// Disconnected with a level of 0 or 255.
+fn live_case_level(battery: &[BatteryInfo]) -> Option<u8> {
+    battery
+        .iter()
+        .find(|b| b.component == BatteryComponent::Case)
+        .and_then(known_level)
+}
+
+/// The sidebar battery line as (text, stale) parts. Headphones show a single
+/// level. For earbuds, a case that cannot report falls back to `last_case`,
+/// marked stale so it is drawn dimmed.
+fn battery_parts(battery: &[BatteryInfo], last_case: Option<u8>) -> Vec<(String, bool)> {
+    let find = |component| battery.iter().find(|b| b.component == component);
+    if let Some(headphone) = find(BatteryComponent::Headphone) {
+        return vec![(format!("􀺹 {}", battery_text(Some(headphone))), false)];
+    }
+    let (case, stale) = match (live_case_level(battery), last_case) {
+        (Some(_), _) => (battery_text(find(BatteryComponent::Case)), false),
+        (None, Some(level)) => (format!("{}%", level), true),
+        (None, None) => ("-".to_string(), false),
+    };
+    vec![
+        (format!("\u{1018E5} {}", battery_text(find(BatteryComponent::Left))), false),
+        (format!("\u{1018E8} {}", battery_text(find(BatteryComponent::Right))), false),
+        (format!("\u{100E6C} {}", case), stale),
+    ]
+}
+
 async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>>>) -> Message {
     let mut rx = ui_rx.lock().await;
     match rx.recv().await {
@@ -1776,3 +1824,90 @@ async fn wait_for_message(ui_rx: Arc<Mutex<UnboundedReceiver<BluetoothUIMessage>
 //
 //     devices
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(component: BatteryComponent, level: u8, status: BatteryStatus) -> BatteryInfo {
+        BatteryInfo {
+            component,
+            level,
+            status,
+        }
+    }
+
+    fn texts(parts: &[(String, bool)]) -> Vec<&str> {
+        parts.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn battery_text_marks_charging_and_unknown() {
+        let charging = entry(BatteryComponent::Left, 40, BatteryStatus::Charging);
+        let optimized = entry(BatteryComponent::Left, 80, BatteryStatus::OptimizedCharging);
+        let idle = entry(BatteryComponent::Left, 100, BatteryStatus::NotCharging);
+        let gone = entry(BatteryComponent::Left, 0, BatteryStatus::Disconnected);
+        let bogus = entry(BatteryComponent::Left, 255, BatteryStatus::NotCharging);
+        assert_eq!(battery_text(Some(&charging)), format!("40%{CHARGING_MARK}"));
+        assert_eq!(battery_text(Some(&optimized)), format!("80%{CHARGING_MARK}"));
+        assert_eq!(battery_text(Some(&idle)), "100%");
+        assert_eq!(battery_text(Some(&gone)), "-");
+        assert_eq!(battery_text(Some(&bogus)), "-");
+        assert_eq!(battery_text(None), "-");
+    }
+
+    #[test]
+    fn case_level_is_remembered_only_when_reported() {
+        let in_case = [entry(BatteryComponent::Case, 60, BatteryStatus::NotCharging)];
+        let buds_out = [entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected)];
+        let buds_out_255 = [entry(BatteryComponent::Case, 255, BatteryStatus::Disconnected)];
+        let bad_level = [entry(BatteryComponent::Case, 101, BatteryStatus::Charging)];
+        assert_eq!(live_case_level(&in_case), Some(60));
+        assert_eq!(live_case_level(&buds_out), None);
+        assert_eq!(live_case_level(&buds_out_255), None);
+        assert_eq!(live_case_level(&bad_level), None);
+        assert_eq!(live_case_level(&[]), None);
+    }
+
+    #[test]
+    fn case_falls_back_to_last_known_level() {
+        let battery = [
+            entry(BatteryComponent::Left, 90, BatteryStatus::NotCharging),
+            entry(BatteryComponent::Right, 85, BatteryStatus::NotCharging),
+            entry(BatteryComponent::Case, 0, BatteryStatus::Disconnected),
+        ];
+        let parts = battery_parts(&battery, Some(60));
+        assert_eq!(
+            texts(&parts),
+            ["\u{1018E5} 90%", "\u{1018E8} 85%", "\u{100E6C} 60%"]
+        );
+        assert!(parts[2].1);
+
+        let parts = battery_parts(&battery, None);
+        assert_eq!(parts[2], ("\u{100E6C} -".to_string(), false));
+    }
+
+    #[test]
+    fn live_case_level_wins_over_last_known() {
+        let battery = [
+            entry(BatteryComponent::Left, 90, BatteryStatus::Charging),
+            entry(BatteryComponent::Case, 50, BatteryStatus::NotCharging),
+        ];
+        let parts = battery_parts(&battery, Some(70));
+        assert_eq!(
+            texts(&parts),
+            [
+                format!("\u{1018E5} 90%{CHARGING_MARK}").as_str(),
+                "\u{1018E8} -",
+                "\u{100E6C} 50%"
+            ]
+        );
+        assert!(!parts[2].1);
+    }
+
+    #[test]
+    fn headphones_show_one_level() {
+        let battery = [entry(BatteryComponent::Headphone, 30, BatteryStatus::NotCharging)];
+        assert_eq!(texts(&battery_parts(&battery, Some(70))), ["􀺹 30%"]);
+    }
+}

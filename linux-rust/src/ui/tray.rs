@@ -35,38 +35,6 @@ impl ksni::Tray for MyTray {
         "AirPods".into()
     }
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let text = {
-            let mut levels: Vec<u8> = Vec::new();
-            if let Some(h) = self.battery_headphone {
-                if self.battery_headphone_status != Some(BatteryStatus::Disconnected) {
-                    levels.push(h);
-                }
-            } else {
-                if let Some(l) = self.battery_l
-                    && self.battery_l_status != Some(BatteryStatus::Disconnected)
-                {
-                    levels.push(l);
-                }
-                if let Some(r) = self.battery_r
-                    && self.battery_r_status != Some(BatteryStatus::Disconnected)
-                {
-                    levels.push(r);
-                }
-                // if let Some(c) = self.battery_c {
-                //     if self.battery_c_status != Some(BatteryStatus::Disconnected) {
-                //         levels.push(c);
-                //     }
-                // }
-            }
-            let min_battery = levels.iter().min().copied();
-            if let Some(b) = min_battery {
-                format!("{}", b)
-            } else {
-                "?".to_string()
-            }
-        };
-        let any_bud_charging = matches!(self.battery_l_status, Some(BatteryStatus::Charging))
-            || matches!(self.battery_r_status, Some(BatteryStatus::Charging));
         let app_settings_path = get_app_settings_path();
         let settings = std::fs::read_to_string(&app_settings_path)
             .ok()
@@ -76,35 +44,15 @@ impl ksni::Tray for MyTray {
             .and_then(|v| v.get("tray_text_mode").cloned())
             .and_then(|ttm| serde_json::from_value(ttm).ok())
             .unwrap_or(false);
-        let icon = generate_icon(&text, text_mode, any_bud_charging);
+        let icon = generate_icon(self.icon_level(), text_mode, self.any_bud_charging());
         vec![icon]
     }
     fn tool_tip(&self) -> ToolTip {
-        let format_component =
-            |label: &str, level: Option<u8>, status: Option<BatteryStatus>| -> String {
-                match status {
-                    Some(BatteryStatus::Disconnected) => format!("{}: -", label),
-                    _ => {
-                        let pct = level.map(|b| format!("{}%", b)).unwrap_or("?".to_string());
-                        let suffix = if status == Some(BatteryStatus::Charging) {
-                            "⚡"
-                        } else {
-                            ""
-                        };
-                        format!("{}: {}{}", label, pct, suffix)
-                    }
-                }
-            };
-
-        let l = format_component("L", self.battery_l, self.battery_l_status);
-        let r = format_component("R", self.battery_r, self.battery_r_status);
-        let c = format_component("C", self.battery_c, self.battery_c_status);
-
         ToolTip {
             icon_name: "".to_string(),
             icon_pixmap: vec![],
             title: "Battery Status".to_string(),
-            description: format!("{} {} {}", l, r, c),
+            description: self.battery_description(),
         }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -211,6 +159,51 @@ impl ksni::Tray for MyTray {
 }
 
 impl MyTray {
+    fn is_headphone(&self) -> bool {
+        self.battery_headphone.is_some() || self.battery_headphone_status.is_some()
+    }
+
+    /// The level the icon shows: the headphone level, or the lower of the two
+    /// buds. None when nothing reports a usable level.
+    fn icon_level(&self) -> Option<u8> {
+        if self.is_headphone() {
+            return known_level(self.battery_headphone, self.battery_headphone_status);
+        }
+        [
+            known_level(self.battery_l, self.battery_l_status),
+            known_level(self.battery_r, self.battery_r_status),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    fn any_bud_charging(&self) -> bool {
+        [
+            self.battery_headphone_status,
+            self.battery_l_status,
+            self.battery_r_status,
+        ]
+        .into_iter()
+        .flatten()
+        .any(BatteryStatus::is_charging)
+    }
+
+    fn battery_description(&self) -> String {
+        if self.is_headphone() {
+            return format!(
+                "Battery: {}",
+                battery_text(self.battery_headphone, self.battery_headphone_status)
+            );
+        }
+        format!(
+            "L: {} R: {} C: {}",
+            battery_text(self.battery_l, self.battery_l_status),
+            battery_text(self.battery_r, self.battery_r_status),
+            battery_text(self.battery_c, self.battery_c_status),
+        )
+    }
+
     fn open_window(&self) {
         if let Some(tx) = &self.ui_tx {
             let _ = tx.send(BluetoothUIMessage::OpenWindow);
@@ -218,7 +211,29 @@ impl MyTray {
     }
 }
 
-fn generate_icon(text: &str, text_mode: bool, charging: bool) -> Icon {
+/// A level worth drawing: reported, in range and not flagged as disconnected.
+fn known_level(level: Option<u8>, status: Option<BatteryStatus>) -> Option<u8> {
+    level.filter(|&l| l <= 100 && status != Some(BatteryStatus::Disconnected))
+}
+
+/// "80%" with a charging mark, or "-" when the level is unknown.
+fn battery_text(level: Option<u8>, status: Option<BatteryStatus>) -> String {
+    match known_level(level, status) {
+        Some(l) => {
+            let mark = if status.is_some_and(BatteryStatus::is_charging) {
+                "⚡"
+            } else {
+                ""
+            };
+            format!("{}%{}", l, mark)
+        }
+        None => "-".to_string(),
+    }
+}
+
+/// Draw the tray icon. `level` None draws "-" in text mode and an empty ring
+/// otherwise, so an unknown battery never looks like an empty one.
+fn generate_icon(level: Option<u8>, text_mode: bool, charging: bool) -> Icon {
     use ab_glyph::{FontRef, PxScale};
     use image::{ImageBuffer, Rgba};
     use imageproc::drawing::draw_text_mut;
@@ -240,8 +255,6 @@ fn generate_icon(text: &str, text_mode: bool, charging: bool) -> Icon {
         }
     };
     if !text_mode {
-        let percentage = text.parse::<f32>().unwrap_or(0.0) / 100.0;
-
         let center_x = width as f32 / 2.0;
         let center_y = height as f32 / 2.0;
         let inner_radius = 22.0;
@@ -259,18 +272,21 @@ fn generate_icon(text: &str, text_mode: bool, charging: bool) -> Icon {
             }
         }
 
-        // ring
-        for y in 0..height {
-            for x in 0..width {
-                let dx = x as f32 - center_x;
-                let dy = y as f32 - center_y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist > inner_radius && dist <= outer_radius {
-                    let angle = dy.atan2(dx);
-                    let angle_from_top =
-                        (angle + std::f32::consts::PI / 2.0).rem_euclid(2.0 * std::f32::consts::PI);
-                    if angle_from_top <= percentage * 2.0 * std::f32::consts::PI {
-                        img.put_pixel(x, y, Rgba([0u8, 255u8, 0u8, 255u8]));
+        // ring, left grey when the level is unknown
+        if let Some(level) = level {
+            let percentage = f32::from(level) / 100.0;
+            for y in 0..height {
+                for x in 0..width {
+                    let dx = x as f32 - center_x;
+                    let dy = y as f32 - center_y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist > inner_radius && dist <= outer_radius {
+                        let angle = dy.atan2(dx);
+                        let angle_from_top = (angle + std::f32::consts::PI / 2.0)
+                            .rem_euclid(2.0 * std::f32::consts::PI);
+                        if angle_from_top <= percentage * 2.0 * std::f32::consts::PI {
+                            img.put_pixel(x, y, Rgba([0u8, 255u8, 0u8, 255u8]));
+                        }
                     }
                 }
             }
@@ -291,6 +307,8 @@ fn generate_icon(text: &str, text_mode: bool, charging: bool) -> Icon {
         }
     } else {
         // battery text
+        let text = level.map_or_else(|| "-".to_string(), |l| l.to_string());
+        let text = text.as_str();
         let scale = PxScale::from(48.0);
         let color = if charging {
             Rgba([0u8, 255u8, 0u8, 255u8])
@@ -357,4 +375,70 @@ mod tests {
 
     const TRAY_ACTIVATION_X: i32 = 0;
     const TRAY_ACTIVATION_Y: i32 = 0;
+
+    fn empty_tray() -> MyTray {
+        MyTray {
+            conversation_detect_enabled: None,
+            battery_headphone: None,
+            battery_headphone_status: None,
+            battery_l: None,
+            battery_l_status: None,
+            battery_r: None,
+            battery_r_status: None,
+            battery_c: None,
+            battery_c_status: None,
+            connected: false,
+            listening_mode: None,
+            allow_off_option: None,
+            command_tx: None,
+            ui_tx: None,
+            shutdown_tx: None,
+        }
+    }
+
+    #[test]
+    fn unknown_battery_has_no_level() {
+        let mut tray = empty_tray();
+        assert_eq!(tray.icon_level(), None);
+        assert_eq!(tray.battery_description(), "L: - R: - C: -");
+
+        tray.battery_l = Some(0);
+        tray.battery_l_status = Some(BatteryStatus::Disconnected);
+        tray.battery_r = Some(255);
+        tray.battery_r_status = Some(BatteryStatus::NotCharging);
+        assert_eq!(tray.icon_level(), None);
+        assert_eq!(tray.battery_description(), "L: - R: - C: -");
+    }
+
+    #[test]
+    fn icon_level_is_lowest_known_bud() {
+        let mut tray = empty_tray();
+        tray.battery_l = Some(80);
+        tray.battery_l_status = Some(BatteryStatus::NotCharging);
+        tray.battery_r = Some(40);
+        tray.battery_r_status = Some(BatteryStatus::Disconnected);
+        tray.battery_c = Some(0);
+        tray.battery_c_status = Some(BatteryStatus::Disconnected);
+        assert_eq!(tray.icon_level(), Some(80));
+        assert_eq!(tray.battery_description(), "L: 80% R: - C: -");
+    }
+
+    #[test]
+    fn headphones_show_a_single_level() {
+        let mut tray = empty_tray();
+        tray.battery_headphone = Some(55);
+        tray.battery_headphone_status = Some(BatteryStatus::Charging);
+        assert_eq!(tray.icon_level(), Some(55));
+        assert!(tray.any_bud_charging());
+        assert_eq!(tray.battery_description(), "Battery: 55%⚡");
+    }
+
+    #[test]
+    fn optimized_charging_counts_as_charging() {
+        let mut tray = empty_tray();
+        tray.battery_l = Some(90);
+        tray.battery_l_status = Some(BatteryStatus::OptimizedCharging);
+        assert!(tray.any_bud_charging());
+        assert_eq!(tray.battery_description(), "L: 90%⚡ R: - C: -");
+    }
 }
