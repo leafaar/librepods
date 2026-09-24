@@ -2415,6 +2415,7 @@ mod tests {
 
     proptest! {
         #[test]
+        #[cfg_attr(miri, ignore = "proptest reads the working directory, which miri isolates; too slow under miri anyway")]
         fn receive_packet_never_panics_on_arbitrary_bytes(
             bytes in proptest::collection::vec(any::<u8>(), 0..64),
         ) {
@@ -2422,6 +2423,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(miri, ignore = "proptest reads the working directory, which miri isolates; too slow under miri anyway")]
         fn receive_packet_never_panics_on_known_opcodes_with_any_body(
             opcode in proptest::sample::select(KNOWN_OPCODES.as_slice()),
             // Small counts and lengths so the count and length fields often
