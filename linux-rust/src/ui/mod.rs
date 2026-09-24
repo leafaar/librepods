@@ -6,4 +6,5 @@ mod format;
 pub mod messages;
 mod nothing;
 pub mod tray;
+mod tray_icon;
 pub mod window;
