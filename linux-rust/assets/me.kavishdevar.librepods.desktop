@@ -1,6 +1,8 @@
 [Desktop Entry]
 Name=LibrePods
+Comment=Control your AirPods
 Exec=librepods
 Icon=me.kavishdevar.librepods
 Type=Application
 Categories=Utility;
+StartupWMClass=me.kavishdevar.librepods

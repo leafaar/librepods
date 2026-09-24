@@ -53,7 +53,7 @@ struct Args {
     debug: bool,
     #[arg(
         long,
-        help = "Disable system tray, useful if your environment doesn't support AppIndicator or StatusNotifier"
+        help = "Run headless: no window and no tray, only the Bluetooth logic"
     )]
     no_tray: bool,
     #[arg(long, help = "Start the application minimized to tray")]
