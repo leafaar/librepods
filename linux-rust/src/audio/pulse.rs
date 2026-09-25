@@ -48,8 +48,6 @@ pub enum SoundServerError {
     ProfileRejected { card: u32, profile: String },
     #[error("could not load {0}")]
     ModuleLoadFailed(String),
-    #[error("could not restart WirePlumber: {0}")]
-    RestartFailed(String),
 }
 
 /// Profiles of one sound card.
@@ -81,8 +79,6 @@ pub trait SoundServer: Send + Sync {
     /// Average volume over the sink's channels, in percent.
     fn sink_volume(&self, sink: &str) -> Result<u32, SoundServerError>;
     fn set_sink_volume(&self, sink: &str, percent: u32) -> Result<(), SoundServerError>;
-    /// Restart WirePlumber, which makes it enumerate the card profiles again.
-    fn restart_session_manager(&self) -> Result<(), SoundServerError>;
 }
 
 /// The system's PipeWire or PulseAudio server, one connection per request.
@@ -198,18 +194,6 @@ impl SoundServer for PulseSoundServer {
         });
         mainloop.quit(Retval(0));
         result
-    }
-
-    fn restart_session_manager(&self) -> Result<(), SoundServerError> {
-        let output = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "wireplumber"])
-            .output()
-            .map_err(|e| SoundServerError::RestartFailed(e.to_string()))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(SoundServerError::RestartFailed(output.status.to_string()))
-        }
     }
 }
 

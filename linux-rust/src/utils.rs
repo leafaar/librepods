@@ -245,6 +245,9 @@ pub struct AppSettings {
     pub hires_mic_enabled: bool,
     pub hires_mic_agc: bool,
     pub hires_mic_pause_convo: bool,
+    /// Cycle the card profile after the hi-res mic starts or stops. Off by
+    /// default: BlueZ can refuse to reacquire the transport afterwards, which
+    /// drops playback and any call using the AirPods.
     pub a2dp_reset: bool,
     /// Connect the AirPods to this PC when local media starts playing, taking
     /// them from the phone like an Apple device does.
@@ -262,7 +265,7 @@ impl Default for AppSettings {
             hires_mic_enabled: true,
             hires_mic_agc: true,
             hires_mic_pause_convo: true,
-            a2dp_reset: true,
+            a2dp_reset: false,
             auto_switch_on_playback: true,
             preferred_codec: PreferredCodec::default(),
         }
@@ -545,12 +548,12 @@ mod tests {
     fn settings_fields_missing_from_the_file_take_their_default() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("app_settings.json");
-        std::fs::write(&path, r#"{"theme":"Nord","a2dp_reset":false}"#).unwrap();
+        std::fs::write(&path, r#"{"theme":"Nord","a2dp_reset":true}"#).unwrap();
 
         let settings = SettingsStore::new(path).load().unwrap();
 
         assert_eq!(settings.theme, ThemePreference::Dark);
-        assert!(!settings.a2dp_reset);
+        assert!(settings.a2dp_reset);
         assert!(settings.hires_mic_enabled);
         assert_eq!(settings.preferred_codec, PreferredCodec::Aac);
     }

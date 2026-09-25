@@ -8,7 +8,7 @@ use {
         ui::{
             gtk::{
                 controls::SETTLE_DELAY,
-                model::{AirPodsSnapshot, DeviceSnapshot, Effect, Input, Model},
+                model::{AirPodsSnapshot, DeviceSnapshot, Effect, Input, MicInput, Model},
                 widgets::Dispatch,
                 window::{APP_ID, Window},
             },
@@ -187,7 +187,10 @@ impl Controller {
     }
 
     fn apply(&self, input: Input) -> Vec<Effect> {
-        debug!("UI input: {:?}", input);
+        // The mic test sends a tick 20 times a second; logging those floods the log.
+        if !matches!(input, Input::Microphone(MicInput::Tick(..))) {
+            debug!("UI input: {:?}", input);
+        }
         self.model.borrow_mut().update(input)
     }
 

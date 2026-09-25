@@ -35,8 +35,6 @@ const A2DP_ENUMERATION_INTERVAL: Duration = Duration::from_secs(1);
 /// that happens, so a card lookup is retried this often, this far apart.
 const CARD_LOOKUP_ATTEMPTS: u32 = 12;
 const CARD_LOOKUP_INTERVAL: Duration = Duration::from_millis(250);
-/// Time WirePlumber gets after a restart before the card is looked up again.
-const WIREPLUMBER_SETTLE: Duration = Duration::from_secs(2);
 
 type ControlSender = UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>;
 
@@ -106,9 +104,6 @@ struct MediaControllerState {
     i_paused_the_media_at: Option<Instant>,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
-    /// Restarting WirePlumber interrupts every audio device on the system, so
-    /// it happens at most once per connection.
-    wireplumber_restarted: bool,
 }
 
 /// The playback listener's view of the local players between two polls.
@@ -430,31 +425,9 @@ impl MediaController {
         None
     }
 
-    async fn restart_wire_plumber(&self) -> bool {
-        info!("Restarting WirePlumber to rediscover A2DP profiles");
-        {
-            let mut state = self.state.lock().await;
-            if state.wireplumber_restarted {
-                warn!("WirePlumber was already restarted for this connection; not again");
-                return false;
-            }
-            state.wireplumber_restarted = true;
-        }
-        match self.sound(|s| s.restart_session_manager()).await {
-            Ok(()) => {
-                info!("WirePlumber restarted successfully");
-                tokio::time::sleep(WIREPLUMBER_SETTLE).await;
-                true
-            },
-            Err(e) => {
-                error!("{}. Do you use wireplumber?", e);
-                false
-            },
-        }
-    }
-
     /// Resolve the card and make sure it exposes an A2DP profile, waiting for
-    /// enumeration and restarting WirePlumber as a last resort.
+    /// enumeration. The session manager is never restarted here: that tears
+    /// down every audio stream on the system, including a call in progress.
     async fn card_with_a2dp(&self) -> Option<u32> {
         // Always resolve the card by MAC first: a reconnect can change its index.
         let Some(index) = self.find_card_with_retry().await else {
@@ -465,16 +438,9 @@ impl MediaController {
             return Some(index);
         }
         // A freshly connected card can show up before its profiles are
-        // enumerated. Give that a grace period before restarting WirePlumber,
-        // which interrupts playback for several seconds.
+        // enumerated, so give that a grace period.
         warn!("A2DP profile not available yet, waiting for enumeration");
         if let Some(index) = self.wait_for_a2dp_profile().await {
-            return Some(index);
-        }
-        warn!("A2DP profile still missing, restarting WirePlumber as a last resort");
-        if self.restart_wire_plumber().await
-            && let Some(index) = self.wait_for_a2dp_profile().await
-        {
             return Some(index);
         }
         error!("A2DP profile unavailable, skipping profile activation");
@@ -839,7 +805,6 @@ mod tests {
         card_present: bool,
         profiles: CardProfiles,
         profile_sets: Vec<String>,
-        restarts: u32,
         volume: u32,
         volume_sets: Vec<u32>,
     }
@@ -908,11 +873,6 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.volume = percent;
             state.volume_sets.push(percent);
-            Ok(())
-        }
-
-        fn restart_session_manager(&self) -> Result<(), SoundServerError> {
-            self.state.lock().unwrap().restarts += 1;
             Ok(())
         }
     }
@@ -1146,16 +1106,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wireplumber_is_restarted_at_most_once_per_connection() {
+    async fn missing_a2dp_profile_leaves_the_card_alone() {
         let h = harness_with(
             FakeSound::with_card("off", &["off", "headset-head-unit"]),
             None,
         );
 
         h.controller.activate_a2dp_profile().await;
-        h.controller.activate_a2dp_profile().await;
 
-        assert_eq!(h.sound.state.lock().unwrap().restarts, 1);
         assert!(h.sound.profile_sets().is_empty());
     }
 
@@ -1170,7 +1128,6 @@ mod tests {
             started.elapsed(),
             CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS - 1)
         );
-        assert_eq!(h.sound.state.lock().unwrap().restarts, 0);
     }
 
     #[tokio::test(start_paused = true)]
