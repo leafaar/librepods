@@ -132,6 +132,9 @@ pub(crate) enum Effect {
     /// Write `Model::settings` to disk.
     SaveSettings,
     ApplyTheme(ThemePreference),
+    /// Apply stem control to every connected pair of AirPods now, so the
+    /// setting works without reconnecting them.
+    ApplyStemControl(bool),
     PresentWindow,
     Toast(String),
     // AirPods settings sections (controls.rs).
@@ -682,7 +685,10 @@ impl Model {
             SettingChange::A2dpReset(on) => settings.a2dp_reset = on,
             SettingChange::HiResMicAgc(on) => settings.hires_mic_agc = on,
             SettingChange::HiResMicPauseConvo(on) => settings.hires_mic_pause_convo = on,
-            SettingChange::StemControl(on) => settings.stem_control = on,
+            SettingChange::StemControl(on) => {
+                settings.stem_control = on;
+                effects.push(Effect::ApplyStemControl(on));
+            },
         }
         effects.push(Effect::SaveSettings);
         effects
@@ -1349,6 +1355,17 @@ pub(super) mod tests {
         );
         assert_eq!(model.settings().theme, ThemePreference::Dark);
         assert_eq!(model.theme(), ThemePreference::Dark);
+    }
+
+    #[test]
+    fn stem_control_applies_to_connected_airpods_and_saves() {
+        let mut model = model();
+        let effects = model.update(Input::Setting(SettingChange::StemControl(true)));
+        assert_eq!(
+            effects,
+            [Effect::ApplyStemControl(true), Effect::SaveSettings]
+        );
+        assert!(model.settings().stem_control);
     }
 
     #[test]

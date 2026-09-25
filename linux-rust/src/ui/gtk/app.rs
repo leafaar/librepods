@@ -261,6 +261,7 @@ impl Controller {
                 }
             },
             Effect::ApplyTheme(theme) => apply_theme(theme),
+            Effect::ApplyStemControl(on) => self.apply_stem_control(on),
             Effect::PresentWindow => self.window.present(),
             Effect::Toast(text) => self.window.toast(&text),
             // AirPods settings sections (controls.rs).
@@ -304,6 +305,24 @@ impl Controller {
                 }
             }
             this.devices_loading.set(false);
+        });
+    }
+
+    /// Turn stem control on or off on every connected pair of AirPods.
+    fn apply_stem_control(&self, on: bool) {
+        let managers = Arc::clone(&self.device_managers);
+        self.backend.spawn(async move {
+            let connected: Vec<_> = managers
+                .read()
+                .await
+                .values()
+                .filter_map(DeviceManagers::get_aacp)
+                .collect();
+            for aacp in connected {
+                if let Err(e) = aacp.set_stem_control(on).await {
+                    warn!("Could not apply stem control: {e}");
+                }
+            }
         });
     }
 

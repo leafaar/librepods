@@ -9,7 +9,7 @@ use {
         },
         media_controller::MediaController,
         ui::{messages::BluetoothUIMessage, tray::MyTray},
-        utils::get_app_settings_path,
+        utils::AppSettings,
     },
     bluer::Address,
     ksni::Handle,
@@ -35,11 +35,6 @@ const SETUP_REPEAT_GAP: Duration = Duration::from_millis(200);
 const SETUP_LATE_REPEAT: Duration = Duration::from_secs(5);
 const STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_CHECKS: u32 = 10;
-
-/// StemConfig bitmask asking for double and triple press events (single 0x01,
-/// double 0x02, triple 0x04, long 0x08). These differ from the StemPressType
-/// values the events carry.
-const STEM_CONFIG_DOUBLE_AND_TRIPLE: u8 = 0x02 | 0x04;
 
 /// Why connected AirPods could not be set up. The cause is part of the message
 /// because the callers log these with `{}`.
@@ -86,13 +81,7 @@ async fn send_initial_setup(aacp_manager: &AACPManager, stem_control: bool) {
 
     if stem_control {
         info!("Enabling stem press detection for double and triple tap");
-        if let Err(e) = aacp_manager
-            .send_control_command(
-                ControlCommandIdentifiers::StemConfig,
-                &[STEM_CONFIG_DOUBLE_AND_TRIPLE],
-            )
-            .await
-        {
+        if let Err(e) = aacp_manager.set_stem_control(true).await {
             error!("Failed to enable stem press detection: {e}");
         }
     }
@@ -138,16 +127,6 @@ async fn repeat_setup_until_status(aacp_manager: &AACPManager) {
         }
         request_notifications_if_silent(aacp_manager).await;
     }
-}
-
-/// Whether stem presses skip tracks, from the app settings file.
-fn load_stem_control() -> bool {
-    std::fs::read_to_string(get_app_settings_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("stem_control").cloned())
-        .and_then(|s| serde_json::from_value(s).ok())
-        .unwrap_or(false)
 }
 
 async fn local_adapter_address() -> bluer::Result<String> {
@@ -219,7 +198,6 @@ struct EventHandler {
     tray_handle: Option<Handle<MyTray>>,
     ui_tx: UnboundedSender<BluetoothUIMessage>,
     command_tx: UnboundedSender<(ControlCommandIdentifiers, Vec<u8>)>,
-    stem_control: bool,
 }
 
 impl EventHandler {
@@ -330,7 +308,8 @@ impl EventHandler {
     }
 
     async fn handle_stem_press(&self, press_type: StemPressType) {
-        if !self.stem_control {
+        // Read on every press: the setting can change while connected.
+        if !self.aacp_manager.stem_control() {
             debug!("Stem control disabled, ignoring stem press event");
             return;
         }
@@ -371,7 +350,7 @@ impl AirPodsDevice {
             reset_tray(handle).await;
         }
 
-        let stem_control = load_stem_control();
+        let stem_control = AppSettings::load().stem_control;
         send_initial_setup(&aacp_manager, stem_control).await;
 
         let local_mac = local_adapter_address()
@@ -426,7 +405,6 @@ impl AirPodsDevice {
             tray_handle,
             ui_tx,
             command_tx,
-            stem_control,
         };
         aacp_manager.spawn_connection_task(async move {
             while let Some(event) = event_rx.recv().await {

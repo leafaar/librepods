@@ -962,6 +962,11 @@ impl AACPManagerState {
     }
 }
 
+/// StemConfig bitmask asking for double and triple press events (single 0x01,
+/// double 0x02, triple 0x04, long 0x08). These differ from the StemPressType
+/// values the events carry.
+pub const STEM_CONFIG_DOUBLE_AND_TRIPLE: u8 = 0x02 | 0x04;
+
 #[derive(Clone)]
 pub struct AACPManager {
     pub state: Arc<Mutex<AACPManagerState>>,
@@ -972,6 +977,9 @@ pub struct AACPManager {
     /// their own; recv_thread aborts them when the link goes away.
     connection_tasks: Arc<std::sync::Mutex<Vec<AbortHandle>>>,
     hires_enabled: Arc<AtomicBool>,
+    /// Whether this app handles double and triple stem presses (skip tracks)
+    /// instead of the AirPods sending them as AVRCP media keys.
+    stem_control: Arc<AtomicBool>,
     hires_mic: Arc<Mutex<Option<HiResMic>>>,
     /// Wakes the hi-res monitor so it re-polls promptly when the feature is
     /// toggled, instead of waiting out the poll interval.
@@ -998,6 +1006,7 @@ impl AACPManager {
             tasks: Arc::new(Mutex::new(JoinSet::new())),
             connection_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             hires_enabled: Arc::new(AtomicBool::new(hires_enabled)),
+            stem_control: Arc::new(AtomicBool::new(false)),
             hires_mic: Arc::new(Mutex::new(None)),
             hires_wake: Arc::new(Notify::new()),
             mic_status: MicStatus::new(),
@@ -1080,6 +1089,20 @@ impl AACPManager {
 
     pub fn runtime(&self) -> &tokio::runtime::Handle {
         &self.runtime
+    }
+
+    pub fn stem_control(&self) -> bool {
+        self.stem_control.load(Ordering::Relaxed)
+    }
+
+    /// Ask the AirPods for double and triple stem press events, or hand the
+    /// presses back to them (sent as AVRCP media keys) when `on` is false. Takes
+    /// effect at once; the app setting also applies it on every connect.
+    pub async fn set_stem_control(&self, on: bool) -> Result<(), AacpError> {
+        self.stem_control.store(on, Ordering::Relaxed);
+        let presses = if on { STEM_CONFIG_DOUBLE_AND_TRIPLE } else { 0 };
+        self.send_control_command(ControlCommandIdentifiers::StemConfig, &[presses])
+            .await
     }
 
     pub fn hires_mic_enabled(&self) -> bool {
@@ -1774,6 +1797,30 @@ mod tests {
         fn next_sent(&mut self) -> Vec<u8> {
             self.sent.try_recv().expect("a packet was sent")
         }
+    }
+
+    #[tokio::test]
+    async fn stem_control_is_applied_at_once_and_can_be_handed_back() {
+        let mut h = Harness::new().await;
+        assert!(!h.manager.stem_control());
+
+        h.manager.set_stem_control(true).await.expect("sent");
+        assert!(h.manager.stem_control());
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x39, 0x06, 0x00, 0x00, 0x00
+            ]
+        );
+
+        h.manager.set_stem_control(false).await.expect("sent");
+        assert!(!h.manager.stem_control());
+        assert_eq!(
+            h.next_sent(),
+            [
+                0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x39, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
     }
 
     fn airpods_record(le_keys: AirPodsLEKeys) -> DeviceData {
