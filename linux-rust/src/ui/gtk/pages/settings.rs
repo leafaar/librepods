@@ -69,9 +69,9 @@ impl SettingsPage {
         );
         let (a2dp_row, a2dp_reset) = switch(
             "Reset A2DP transport",
-            "Briefly suspends and resumes A2DP after the hi-res mic starts or stops. Disabling \
-             removes the short pause when the mic turns on or off, but on some setups it causes \
-             playback on one AirPod to drop once capture ends.",
+            "Briefly suspends and resumes A2DP after the hi-res mic starts or stops. Only turn \
+             on if playback stays on one AirPod after capture ends: some setups lose the audio \
+             transport after the reset, which cuts calls.",
             SettingChange::A2dpReset,
         );
         let audio = group(
