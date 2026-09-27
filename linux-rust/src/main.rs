@@ -33,17 +33,27 @@ use {
     },
     gtk::glib,
     ksni::{Handle, TrayMethods},
-    std::{collections::HashMap, env, sync::Arc, time::Duration},
+    std::{
+        collections::{HashMap, HashSet},
+        env,
+        sync::{Arc, Mutex},
+        time::Duration,
+    },
     tokio::sync::{
         RwLock,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
-    tracing::{error, info, warn},
+    tracing::{debug, error, info, warn},
 };
 
 const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
 type Managers = Arc<RwLock<HashMap<String, DeviceManagers>>>;
+
+/// AirPods busy with another device accept the Bluetooth link but refuse the
+/// AACP channel. When they later switch to this PC BlueZ raises no new connect
+/// signal, so setup is retried this often for as long as the link stays up.
+const SETUP_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
 // Command line flags are independent switches by nature.
 #[allow(clippy::struct_excessive_bools)]
@@ -179,7 +189,14 @@ async fn async_main(
 
     info!("Listening for new connections.");
     info!("Checking for connected devices...");
-    set_up_connected_airpods(&adapter, tray_handle.as_ref(), &ui_tx, &device_managers).await;
+    let airpods_setup = AirPodsSetup {
+        adapter: adapter.clone(),
+        tray_handle: tray_handle.clone(),
+        ui_tx: ui_tx.clone(),
+        device_managers: device_managers.clone(),
+        in_progress: Arc::default(),
+    };
+    set_up_connected_airpods(&adapter, &airpods_setup).await;
     set_up_connected_managed_devices(
         &adapter,
         &managed_devices_mac,
@@ -195,6 +212,7 @@ async fn async_main(
         managed_devices_mac,
         devices_list,
         device_managers,
+        airpods_setup,
     };
     let result = watch_connections(watcher);
     drop(shutdown_tx);
@@ -254,12 +272,7 @@ async fn bluetooth_adapter() -> anyhow::Result<Adapter> {
     Ok(adapter)
 }
 
-async fn set_up_connected_airpods(
-    adapter: &Adapter,
-    tray_handle: Option<&Handle<MyTray>>,
-    ui_tx: &UnboundedSender<BluetoothUIMessage>,
-    device_managers: &Managers,
-) {
+async fn set_up_connected_airpods(adapter: &Adapter, airpods_setup: &AirPodsSetup) {
     let Ok(device) = find_connected_airpods(adapter).await else {
         info!("No connected AirPods found.");
         return;
@@ -273,13 +286,80 @@ async fn set_up_connected_airpods(
         .flatten()
         .unwrap_or_else(|| "Unknown".to_string());
     info!("Found connected AirPods: {}, initializing.", name);
-    let addr_str = device.address().to_string();
-    ensure_device_registered(&addr_str, &name, DeviceType::AirPods);
-    match AirPodsDevice::new(device.address(), tray_handle.cloned(), ui_tx.clone()).await {
-        Ok(airpods_device) => {
-            register_airpods(airpods_device, addr_str, device_managers, ui_tx).await;
-        },
-        Err(e) => error!("Could not set up AirPods {}: {}", device.address(), e),
+    ensure_device_registered(&device.address().to_string(), &name, DeviceType::AirPods);
+    airpods_setup.spawn(device.address());
+}
+
+/// Sets up the AACP connection to connected AirPods, retrying while the
+/// Bluetooth link stays up.
+#[derive(Clone)]
+struct AirPodsSetup {
+    adapter: Adapter,
+    tray_handle: Option<Handle<MyTray>>,
+    ui_tx: UnboundedSender<BluetoothUIMessage>,
+    device_managers: Managers,
+    /// AirPods with a setup running, so a second connect signal during the
+    /// retries does not start another one.
+    in_progress: Arc<Mutex<HashSet<Address>>>,
+}
+
+impl AirPodsSetup {
+    fn spawn(&self, addr: Address) {
+        if !self
+            .in_progress
+            .lock()
+            .expect("in_progress is never poisoned: no code panics while holding it")
+            .insert(addr)
+        {
+            debug!("Setup for AirPods {addr} is already running");
+            return;
+        }
+        let setup = self.clone();
+        tokio::spawn(async move {
+            if let Some(airpods_device) = setup.connect(addr).await {
+                register_airpods(
+                    airpods_device,
+                    addr.to_string(),
+                    &setup.device_managers,
+                    &setup.ui_tx,
+                )
+                .await;
+            }
+            setup
+                .in_progress
+                .lock()
+                .expect("in_progress is never poisoned: no code panics while holding it")
+                .remove(&addr);
+        });
+    }
+
+    async fn connect(&self, addr: Address) -> Option<AirPodsDevice> {
+        let mut first_failure = true;
+        loop {
+            match AirPodsDevice::new(addr, self.tray_handle.clone(), self.ui_tx.clone()).await {
+                Ok(device) => return Some(device),
+                Err(e) if first_failure => {
+                    warn!(
+                        "Could not set up AirPods {addr}: {e}. They may be in use by another \
+                         device; retrying while they stay connected"
+                    );
+                    first_failure = false;
+                },
+                Err(e) => debug!("Could not set up AirPods {addr}: {e}"),
+            }
+            tokio::time::sleep(SETUP_RETRY_INTERVAL).await;
+            if !self.is_connected(addr).await {
+                info!("AirPods {addr} disconnected, stopping setup");
+                return None;
+            }
+        }
+    }
+
+    async fn is_connected(&self, addr: Address) -> bool {
+        match self.adapter.device(addr) {
+            Ok(device) => device.is_connected().await.unwrap_or(false),
+            Err(_) => false,
+        }
     }
 }
 
@@ -354,6 +434,7 @@ struct ConnectionWatcher {
     managed_devices_mac: Vec<String>,
     devices_list: HashMap<String, DeviceData>,
     device_managers: Managers,
+    airpods_setup: AirPodsSetup,
 }
 
 /// Process BlueZ PropertiesChanged signals until the system bus fails.
@@ -413,7 +494,7 @@ impl ConnectionWatcher {
             let name = proxy
                 .get::<String>("org.bluez.Device1", "Name")
                 .unwrap_or_else(|_| "Unknown".to_string());
-            self.on_airpods_connected(addr, addr_str, &name);
+            self.on_airpods_connected(addr, &addr_str, &name);
         }
     }
 
@@ -462,22 +543,10 @@ impl ConnectionWatcher {
         }
     }
 
-    fn on_airpods_connected(&self, addr: Address, addr_str: String, name: &str) {
+    fn on_airpods_connected(&self, addr: Address, addr_str: &str, name: &str) {
         info!("AirPods connected: {}, initializing", name);
-        ensure_device_registered(&addr_str, name, DeviceType::AirPods);
-        let tray_handle = self.tray_handle.clone();
-        let ui_tx = self.ui_tx.clone();
-        let device_managers = self.device_managers.clone();
-        tokio::spawn(async move {
-            let airpods_device = match AirPodsDevice::new(addr, tray_handle, ui_tx.clone()).await {
-                Ok(device) => device,
-                Err(e) => {
-                    error!("Could not set up AirPods {}: {}", addr_str, e);
-                    return;
-                },
-            };
-            register_airpods(airpods_device, addr_str, &device_managers, &ui_tx).await;
-        });
+        ensure_device_registered(addr_str, name, DeviceType::AirPods);
+        self.airpods_setup.spawn(addr);
     }
 }
 
