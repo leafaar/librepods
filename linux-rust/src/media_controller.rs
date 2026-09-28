@@ -5,7 +5,10 @@ use {
             pulse::{CardProfiles, PulseSoundServer, SoundServer, SoundServerError},
         },
         auto_switch::TakeoverRequests,
-        bluetooth::aacp::{AACPManager, ControlCommandIdentifiers, EarDetectionStatus},
+        bluetooth::{
+            aacp::{AACPManager, ControlCommandIdentifiers, EarDetectionStatus},
+            audio_profile::{AudioProfile, AudioProfileError, BluezAudioProfile},
+        },
         utils::SettingsStore,
     },
     std::{
@@ -72,6 +75,7 @@ impl PlaybackListeners {
 #[derive(Clone)]
 pub struct MediaDeps {
     pub sound: Arc<dyn SoundServer>,
+    pub audio_profile: Arc<dyn AudioProfile>,
     pub players: Arc<dyn MediaPlayers>,
     pub settings: SettingsStore,
     pub takeovers: TakeoverRequests,
@@ -84,6 +88,7 @@ impl MediaDeps {
     pub fn system() -> Self {
         Self {
             sound: Arc::new(PulseSoundServer),
+            audio_profile: Arc::new(BluezAudioProfile),
             players: Arc::new(DbusMediaPlayers),
             settings: SettingsStore::default_location(),
             takeovers: TakeoverRequests::shared(),
@@ -195,6 +200,15 @@ impl MediaController {
         tokio::task::spawn_blocking(move || f(sound.as_ref()))
             .await
             .map_err(|_| SoundServerError::OperationCancelled)?
+    }
+
+    /// Ask BlueZ to connect the A2DP profile, on the blocking pool.
+    async fn connect_a2dp(&self) -> Result<(), AudioProfileError> {
+        let audio_profile = Arc::clone(&self.deps.audio_profile);
+        let mac = self.mac.to_string();
+        tokio::task::spawn_blocking(move || audio_profile.connect_a2dp(&mac))
+            .await
+            .map_err(|_| AudioProfileError::Cancelled)?
     }
 
     /// Run `f` against the media players on the blocking pool.
@@ -431,8 +445,21 @@ impl MediaController {
     async fn card_with_a2dp(&self) -> Option<u32> {
         // Always resolve the card by MAC first: a reconnect can change its index.
         let Some(index) = self.find_card_with_retry().await else {
-            warn!("Could not get device index. Cannot activate A2DP profile.");
-            return None;
+            // AirPods taken out of the case bring back only the AACP channel,
+            // so there is no card until the audio profile is connected again.
+            warn!(
+                "No sound card for {}, connecting its A2DP profile",
+                self.mac
+            );
+            if let Err(e) = self.connect_a2dp().await {
+                error!("Cannot activate A2DP profile: {}", e);
+                return None;
+            }
+            let index = self.wait_for_a2dp_profile().await;
+            if index.is_none() {
+                error!("A2DP profile connected but no sound card appeared");
+            }
+            return index;
         };
         if self.has_a2dp_sink(index).await {
             return Some(index);
@@ -814,6 +841,31 @@ mod tests {
         state: StdMutex<FakeSoundState>,
     }
 
+    /// BlueZ connecting the audio profile: with `brings_card` set, the card
+    /// shows up in the sound server with A2DP available.
+    struct FakeAudioProfile {
+        sound: Arc<FakeSound>,
+        brings_card: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AudioProfile for FakeAudioProfile {
+        fn connect_a2dp(&self, mac: &str) -> Result<(), AudioProfileError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            if !self.brings_card.load(SeqCst) {
+                return Err(AudioProfileError::UnknownDevice(mac.to_string()));
+            }
+            let mut state = self.sound.state.lock().unwrap();
+            state.card_present = true;
+            state.profiles = CardProfiles {
+                active: Some("off".to_string()),
+                available: vec!["off".to_string(), "a2dp-sink".to_string()],
+            };
+            Ok(())
+        }
+    }
+
     impl FakeSound {
         fn with_card(active: &str, available: &[&str]) -> Self {
             let sound = Self::default();
@@ -880,6 +932,7 @@ mod tests {
     struct Harness {
         controller: MediaController,
         sound: Arc<FakeSound>,
+        audio_profile: Arc<FakeAudioProfile>,
         players: Arc<FakePlayers>,
         takeovers: TakeoverRequests,
         listeners: PlaybackListeners,
@@ -898,11 +951,17 @@ mod tests {
                 .unwrap();
         }
         let sound = Arc::new(sound);
+        let audio_profile = Arc::new(FakeAudioProfile {
+            sound: sound.clone(),
+            brings_card: false.into(),
+            calls: 0.into(),
+        });
         let players = Arc::new(FakePlayers::default());
         let takeovers = TakeoverRequests::default();
         let listeners = PlaybackListeners::default();
         let deps = MediaDeps {
             sound: sound.clone(),
+            audio_profile: audio_profile.clone(),
             players: players.clone(),
             settings,
             takeovers: takeovers.clone(),
@@ -911,6 +970,7 @@ mod tests {
         Harness {
             controller: MediaController::with_deps(MAC.to_string(), String::new(), deps),
             sound,
+            audio_profile,
             players,
             takeovers,
             listeners,
@@ -1128,6 +1188,25 @@ mod tests {
             started.elapsed(),
             CARD_LOOKUP_INTERVAL * (CARD_LOOKUP_ATTEMPTS - 1)
         );
+        assert_eq!(
+            h.audio_profile
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(h.sound.profile_sets().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_card_comes_back_once_the_audio_profile_connects() {
+        let h = harness_with(FakeSound::default(), None);
+        h.audio_profile
+            .brings_card
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        h.controller.activate_a2dp_profile().await;
+
+        assert_eq!(h.sound.profile_sets(), ["a2dp-sink"]);
     }
 
     #[tokio::test(start_paused = true)]

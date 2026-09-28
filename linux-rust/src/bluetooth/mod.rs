@@ -1,6 +1,7 @@
 pub mod aacp;
 pub mod aacp_audio;
 pub mod att;
+pub mod audio_profile;
 pub(crate) mod discovery;
 pub(crate) mod eq;
 pub(crate) mod l2cap;
