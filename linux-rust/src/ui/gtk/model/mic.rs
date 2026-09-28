@@ -157,6 +157,14 @@ impl MicTest {
             MicTest::Starting | MicTest::Recording { .. } | MicTest::Stopping | MicTest::Ready(_)
         )
     }
+
+    /// The recorder is starting, running or finishing.
+    fn is_recording(&self) -> bool {
+        matches!(
+            self,
+            MicTest::Starting | MicTest::Recording { .. } | MicTest::Stopping
+        )
+    }
 }
 
 /// The player of a finished recording, as of the last tick.
@@ -196,8 +204,8 @@ pub(crate) struct PlaybackView {
 }
 
 const TEST_HINT: &str = "Record yourself, then play it back to hear what apps receive. Music is \
-                         paused until you press Done.";
-const READY_HINT: &str = "Music stays paused until you press Done.";
+                         paused until you press Done or close the window.";
+const READY_HINT: &str = "Music stays paused until you press Done or close the window.";
 
 impl MicTest {
     pub(crate) fn view(&self) -> MicTestView {
@@ -217,6 +225,12 @@ impl MicTest {
                 ..status(e.clone())
             },
             MicTest::Starting => status("Pausing media…".to_string()),
+            // The recorder keeps nothing until the AirPods send sound, which
+            // takes most of a second after the capture starts.
+            MicTest::Recording { elapsed } if elapsed.is_zero() => MicTestView {
+                stop: true,
+                ..status("Starting the microphone… speak when the timer runs".to_string())
+            },
             MicTest::Recording { elapsed } => MicTestView {
                 stop: true,
                 ..status(format!(
@@ -399,6 +413,7 @@ impl Model {
             return Vec::new();
         }
         match result {
+            Ok(_) if !mic.window_visible => self.end_mic_test(),
             Ok(recording) => {
                 mic.test = MicTest::Ready(Playback::default());
                 effects([MicEffect::LoadPlayer(recording)])
@@ -483,8 +498,15 @@ impl Model {
         }
     }
 
-    pub(super) fn set_window_visible(&mut self, visible: bool) {
+    /// Closing the window ends a test that is not recording, so the music it
+    /// paused does not stay paused with nothing on screen to resume it. A
+    /// running recording goes on and ends the test when it finishes.
+    pub(super) fn set_window_visible(&mut self, visible: bool) -> Vec<Effect> {
         self.mic.window_visible = visible;
+        if visible || self.mic.test.is_recording() {
+            return Vec::new();
+        }
+        self.end_mic_test()
     }
 
     // Read access for the view and the app.
@@ -635,6 +657,12 @@ mod tests {
 
         let effects = mic(&mut model, MicInput::MediaPaused(vec!["spotify".into()]));
         assert_eq!(effects, only(MicEffect::StartRecording));
+        let view = model.mic_test().view();
+        assert_eq!(
+            view.status,
+            "Starting the microphone… speak when the timer runs"
+        );
+        assert!(view.stop);
         mic(&mut model, MicInput::Tick(recorder(65, false)));
         let view = model.mic_test().view();
         assert_eq!(view.status, "Recording 1:05 (max 5:00)");
@@ -703,6 +731,41 @@ mod tests {
                 Effect::Microphone(MicEffect::Release),
                 Effect::Microphone(MicEffect::ResumeMedia(vec!["spotify".into()])),
             ]
+        );
+        assert_eq!(model.mic_test(), &MicTest::Idle);
+    }
+
+    #[test]
+    fn closing_the_window_ends_the_test_and_resumes_the_music() {
+        let mut model = visible_with_airpods();
+        ready(&mut model, &["spotify"]);
+
+        assert_eq!(
+            model.update(Input::WindowVisible(false)),
+            vec![
+                Effect::Microphone(MicEffect::Release),
+                Effect::Microphone(MicEffect::ResumeMedia(vec!["spotify".into()])),
+            ]
+        );
+        assert_eq!(model.mic_test(), &MicTest::Idle);
+        assert!(model.update(Input::WindowVisible(true)).is_empty());
+    }
+
+    #[test]
+    fn a_recording_hidden_with_the_window_resumes_the_music_when_it_ends() {
+        let mut model = visible_with_airpods();
+        let take = recorded_take(&mut model, &["spotify"]);
+        assert!(model.update(Input::WindowVisible(false)).is_empty());
+
+        assert_eq!(
+            mic(
+                &mut model,
+                MicInput::Recorded {
+                    take,
+                    result: Ok(Recording(vec![1, 2]))
+                }
+            ),
+            only(MicEffect::ResumeMedia(vec!["spotify".into()]))
         );
         assert_eq!(model.mic_test(), &MicTest::Idle);
     }

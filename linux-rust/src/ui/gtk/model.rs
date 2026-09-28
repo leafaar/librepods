@@ -470,10 +470,7 @@ impl Model {
             },
             Input::Microphone(input) => self.microphone(input),
             Input::Equalizer(input) => self.equalizer(input),
-            Input::WindowVisible(visible) => {
-                self.set_window_visible(visible);
-                Vec::new()
-            },
+            Input::WindowVisible(visible) => self.set_window_visible(visible),
         }
     }
 

@@ -35,6 +35,10 @@ pub const MAX_RECORDING: Duration = Duration::from_secs(300);
 pub const SKIP: Duration = Duration::from_secs(5);
 
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
+/// How long the recorder keeps going after Stop: it catches the audio still
+/// on its way from the AirPods (Bluetooth, the decoder, the pipe-source) and
+/// the end of the last word, which people tend to cut off by pressing Stop.
+const STOP_TAIL: Duration = Duration::from_millis(600);
 /// When the recorder leaves, the monitor stops capture and resets the A2DP
 /// transport (card profile off and back). A playback stream opened inside that
 /// window is cut off, so the player waits this long after the recording ended.
@@ -183,8 +187,8 @@ impl Recorder {
         }
     }
 
-    /// Stop and return the recording. Returns quickly: the thread checks the
-    /// flag every few milliseconds, also while connecting to the sound server.
+    /// Stop and return the recording. Blocks for STOP_TAIL while the audio
+    /// still in flight arrives, so call it off the UI thread.
     pub fn stop(self) -> Result<Vec<u8>, MicTestError> {
         self.stop.store(true, Ordering::Relaxed);
         self.thread?
@@ -216,9 +220,16 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), MicTestErr
         .map_err(|_| MicTestError::SourceUnavailable)?;
     wait_ready(&mut mainloop, &stream, stopped)?;
 
+    // Until the AirPods send sound the pipe-source fills its underruns with
+    // exact zeros. Keeping those would start the recording with dead air and
+    // run the timer while nothing is captured.
+    let mut heard = false;
+    let mut stop_at = None;
     let result = loop {
-        if stop.load(Ordering::Relaxed) {
-            break Ok(());
+        match stop_at {
+            None if stopped() => stop_at = Some(Instant::now() + STOP_TAIL),
+            Some(at) if Instant::now() >= at => break Ok(()),
+            _ => {},
         }
         // Non-blocking so the stop flag is seen even when no audio arrives.
         if let Err(e) = iterate(&mut mainloop, false) {
@@ -230,6 +241,11 @@ fn record_loop(stop: &AtomicBool, pcm: &Mutex<Vec<u8>>) -> Result<(), MicTestErr
                 let _ = stream.discard();
             },
             Ok(PeekResult::Data(data)) => {
+                heard = heard || data.iter().any(|&b| b != 0);
+                if !heard {
+                    let _ = stream.discard();
+                    continue;
+                }
                 let full = {
                     let mut pcm = pcm.lock().map_err(|_| MicTestError::RecordingLost)?;
                     let room = max.saturating_sub(pcm.len());
