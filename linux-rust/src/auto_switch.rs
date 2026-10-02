@@ -33,6 +33,13 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 /// How long a takeover request stays valid. Covers connecting plus AACP setup;
 /// an older request must not grab the audio on some later, unrelated connect.
 const TAKEOVER_REQUEST_TTL: Duration = Duration::from_secs(30);
+/// Time BlueZ and the AirPods get to tear the link down before a restart
+/// connects it again.
+const RESTART_SETTLE: Duration = Duration::from_secs(2);
+/// A restart's connect can find BlueZ already reconnecting on its own; the
+/// link is then waited for this often, this many times.
+const RESTART_WAIT_INTERVAL: Duration = Duration::from_millis(500);
+const RESTART_WAIT_ATTEMPTS: u32 = 20;
 
 /// Why connecting the AirPods failed. The UI shows the message as is, so it is
 /// a sentence for the user, not a BlueZ code.
@@ -245,6 +252,43 @@ pub async fn connect_airpods(addr: Address) -> Result<(), ConnectError> {
         .map_err(ConnectError::NoAdapter)?;
     info!("[switch] connect requested for AirPods {}", addr);
     connect_device(&adapter, addr, &TakeoverRequests::shared()).await
+}
+
+/// Disconnect `addr` and connect it again (UI button, tray item). This resets
+/// an audio transport that BlueZ reports as running but that no longer
+/// carries sound, which only a new connection clears.
+pub async fn restart_airpods(addr: Address) -> Result<(), ConnectError> {
+    let session = bluer::Session::new()
+        .await
+        .map_err(ConnectError::BluetoothUnavailable)?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(ConnectError::NoAdapter)?;
+    let device = adapter
+        .device(addr)
+        .map_err(|err| ConnectError::UnknownDevice { addr, err })?;
+    info!("[switch] restarting the connection to AirPods {}", addr);
+    if let Err(e) = device.disconnect().await {
+        debug!("[switch] disconnect before restart: {}", e);
+    }
+    tokio::time::sleep(RESTART_SETTLE).await;
+    match connect_device(&adapter, addr, &TakeoverRequests::shared()).await {
+        // BlueZ or the AirPods can bring the link back on their own while
+        // this connect is on its way.
+        Err(ConnectError::InProgress) => wait_connected(&device).await,
+        result => result,
+    }
+}
+
+async fn wait_connected(device: &bluer::Device) -> Result<(), ConnectError> {
+    for _ in 0..RESTART_WAIT_ATTEMPTS {
+        if device.is_connected().await.unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::time::sleep(RESTART_WAIT_INTERVAL).await;
+    }
+    Err(ConnectError::NotAnswering)
 }
 
 async fn connect_device(

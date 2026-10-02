@@ -7,4 +7,5 @@ pub enum BluetoothUIMessage {
     DeviceDisconnected(String),     // mac
     AACPUIEvent(String, AACPEvent), // mac, event
     ConnectAirPods,                 // tray: connect known AirPods to this PC
+    RestartAudio,                   // tray: reconnect the connected AirPods
 }

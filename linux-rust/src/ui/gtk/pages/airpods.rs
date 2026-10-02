@@ -57,6 +57,7 @@ impl AirPodsPage {
         };
         let sections: Vec<Box<dyn Section>> = vec![
             Box::new(BatterySection::new()),
+            Box::new(RestartSection::new(&cx)),
             Box::new(NameSection::new(&cx)),
             Box::new(NoiseControlSection::new(&cx)),
             Box::new(EqualizerSection::new(&cx)),
@@ -190,6 +191,51 @@ fn update_battery_card(card: &gtk::Widget, level: Level) {
         }
     }
     card.set_tooltip_text(level.stale.then_some("Last known level"));
+}
+
+/// Reconnects the AirPods, for when their audio stops while they stay
+/// connected.
+struct RestartSection {
+    group: adw::PreferencesGroup,
+    button: gtk::Button,
+}
+
+impl RestartSection {
+    fn new(cx: &SectionContext<'_>) -> Self {
+        let button = gtk::Button::builder()
+            .label("Restart")
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let dispatch = cx.dispatch.clone();
+            let mac = cx.mac.clone();
+            button.connect_clicked(move |_| dispatch.send(Input::RestartAudio(mac.get())));
+        }
+        let row = adw::ActionRow::builder()
+            .title("Audio stopped?")
+            .subtitle("Reconnect the AirPods to this PC")
+            .build();
+        row.add_suffix(&button);
+        let group = adw::PreferencesGroup::new();
+        group.add(&row);
+        Self { group, button }
+    }
+}
+
+impl Section for RestartSection {
+    fn group(&self) -> &adw::PreferencesGroup {
+        &self.group
+    }
+
+    fn render(&self, mac: &str, _airpods: &AirPods, model: &Model) {
+        let restarting = model.is_restarting(mac);
+        self.button.set_sensitive(!restarting);
+        self.button.set_label(if restarting {
+            "Restarting…"
+        } else {
+            "Restart"
+        });
+    }
 }
 
 /// Name field, renamed on Enter.

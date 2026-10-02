@@ -65,6 +65,12 @@ pub(crate) enum Input {
         mac: String,
         attempt: u64,
     },
+    /// Disconnect and reconnect the AirPods, to clear audio that stopped.
+    RestartAudio(String),
+    RestartAudioFinished {
+        mac: String,
+        result: Result<(), String>,
+    },
     SetListeningMode(String, AirPodsNoiseControlMode),
     SetConversationAwareness(String, bool),
     SetPersonalizedVolume(String, bool),
@@ -105,6 +111,11 @@ pub(crate) enum Effect {
         mac: String,
         address: Address,
         attempt: u64,
+    },
+    /// Reconnect the AirPods and come back with `Input::RestartAudioFinished`.
+    RestartAudio {
+        mac: String,
+        address: Address,
     },
     /// Come back with `Input::ConnectSetupTimedOut` after CONNECT_SETUP_TIMEOUT.
     SetupTimeout {
@@ -355,6 +366,8 @@ pub(crate) struct Model {
     /// silent.
     last_case_level: HashMap<String, u8>,
     connects: ConnectRequests,
+    /// AirPods whose connection is being restarted.
+    restarting: HashSet<String>,
     selection: Selection,
     settings: AppSettings,
     /// Hint for the name field of the device being renamed.
@@ -375,6 +388,7 @@ impl Model {
             nothing: HashMap::new(),
             last_case_level: HashMap::new(),
             connects: ConnectRequests::default(),
+            restarting: HashSet::new(),
             selection: Selection::None,
             settings,
             name_hint: None,
@@ -403,6 +417,8 @@ impl Model {
                 Vec::new()
             },
             Input::Connect(mac) => self.start_connect(mac).into_iter().collect(),
+            Input::RestartAudio(mac) => self.start_restart(mac).into_iter().collect(),
+            Input::RestartAudioFinished { mac, result } => self.restart_finished(&mac, result),
             Input::ConnectFinished {
                 mac,
                 attempt,
@@ -477,6 +493,17 @@ impl Model {
     fn backend(&mut self, message: BluetoothUIMessage) -> Vec<Effect> {
         match message {
             BluetoothUIMessage::OpenWindow => vec![Effect::PresentWindow, Effect::LoadDevices],
+            BluetoothUIMessage::RestartAudio => {
+                let connected: Vec<String> = self
+                    .devices_of_type(&DeviceType::AirPods)
+                    .filter(|mac| self.connected.contains(*mac))
+                    .cloned()
+                    .collect();
+                connected
+                    .into_iter()
+                    .filter_map(|mac| self.start_restart(mac))
+                    .collect()
+            },
             BluetoothUIMessage::ConnectAirPods => {
                 let away: Vec<String> = self
                     .devices_of_type(&DeviceType::AirPods)
@@ -593,6 +620,31 @@ impl Model {
             address,
             attempt,
         })
+    }
+
+    fn start_restart(&mut self, mac: String) -> Option<Effect> {
+        let Ok(address) = mac.parse::<Address>() else {
+            error!("Cannot restart, invalid address {}", mac);
+            return None;
+        };
+        self.restarting
+            .insert(mac.clone())
+            .then_some(Effect::RestartAudio { mac, address })
+    }
+
+    fn restart_finished(&mut self, mac: &str, result: Result<(), String>) -> Vec<Effect> {
+        self.restarting.remove(mac);
+        let name = self.device_name(mac);
+        let message = match result {
+            Ok(()) => format!("Reconnected {name}"),
+            Err(e) => format!("Could not reconnect {name}: {e}"),
+        };
+        vec![Effect::Toast(message)]
+    }
+
+    /// The AirPods' connection is being restarted.
+    pub(crate) fn is_restarting(&self, mac: &str) -> bool {
+        self.restarting.contains(mac)
     }
 
     fn connect_finished(
@@ -1307,6 +1359,51 @@ pub(super) mod tests {
             [Effect::Toast("Could not connect Pods".to_string())]
         );
         assert_eq!(model.disconnected(PODS).status, SETUP_TIMEOUT_ERROR);
+    }
+
+    #[test]
+    fn restart_runs_once_and_reports_the_result() {
+        let mut model = model();
+        let effects = model.update(Input::RestartAudio(PODS.to_string()));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RestartAudio { mac, .. }] if mac == PODS
+        ));
+        assert!(model.is_restarting(PODS));
+        assert!(
+            model
+                .update(Input::RestartAudio(PODS.to_string()))
+                .is_empty()
+        );
+
+        let effects = model.update(Input::RestartAudioFinished {
+            mac: PODS.to_string(),
+            result: Err("no answer".to_string()),
+        });
+        assert_eq!(
+            effects,
+            [Effect::Toast(
+                "Could not reconnect Pods: no answer".to_string()
+            )]
+        );
+        assert!(!model.is_restarting(PODS));
+    }
+
+    #[test]
+    fn tray_restart_reconnects_only_connected_airpods() {
+        let mut model = model();
+        model.update(Input::Backend(BluetoothUIMessage::DeviceConnected(
+            PODS.to_string(),
+        )));
+        let effects = model.update(Input::Backend(BluetoothUIMessage::RestartAudio));
+        let macs: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::RestartAudio { mac, .. } => Some(mac.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(macs, [PODS]);
     }
 
     #[test]

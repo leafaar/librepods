@@ -90,18 +90,8 @@ impl ksni::Tray for MyTray {
                 ..Default::default()
             }
             .into(),
-            StandardItem {
-                label: "Connect AirPods to this PC".into(),
-                icon_name: "bluetooth-active".into(),
-                enabled: !self.connected,
-                activate: Box::new(|this: &mut Self| {
-                    if let Some(tx) = &this.ui_tx {
-                        let _ = tx.send(BluetoothUIMessage::ConnectAirPods);
-                    }
-                }),
-                ..Default::default()
-            }
-            .into(),
+            self.connection_item(),
+            self.restart_item(),
             RadioGroup {
                 selected,
                 select: Box::new(move |this: &mut Self, current| {
@@ -157,6 +147,38 @@ impl ksni::Tray for MyTray {
 }
 
 impl MyTray {
+    /// Connect the known AirPods, offered while none is connected.
+    fn connection_item(&self) -> ksni::MenuItem<Self> {
+        StandardItem {
+            label: "Connect AirPods to this PC".into(),
+            icon_name: "bluetooth-active".into(),
+            enabled: !self.connected,
+            activate: Box::new(|this: &mut Self| {
+                if let Some(tx) = &this.ui_tx {
+                    let _ = tx.send(BluetoothUIMessage::ConnectAirPods);
+                }
+            }),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// Reconnect the connected AirPods, for audio that stopped.
+    fn restart_item(&self) -> ksni::MenuItem<Self> {
+        StandardItem {
+            label: "Restart AirPods Audio".into(),
+            icon_name: "view-refresh".into(),
+            enabled: self.connected,
+            activate: Box::new(|this: &mut Self| {
+                if let Some(tx) = &this.ui_tx {
+                    let _ = tx.send(BluetoothUIMessage::RestartAudio);
+                }
+            }),
+            ..Default::default()
+        }
+        .into()
+    }
+
     fn is_headphone(&self) -> bool {
         self.battery_headphone.is_some() || self.battery_headphone_status.is_some()
     }

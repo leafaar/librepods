@@ -194,6 +194,21 @@ impl Controller {
         self.model.borrow_mut().update(input)
     }
 
+    /// Reconnect the AirPods off the GTK thread and report how it went.
+    fn restart_audio(&self, mac: String, address: bluer::Address) {
+        let task = self
+            .backend
+            .spawn(crate::auto_switch::restart_airpods(address));
+        let dispatch = self.dispatch.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = match task.await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            dispatch.send(Input::RestartAudioFinished { mac, result });
+        });
+    }
+
     fn run(self: &Rc<Self>, effect: Effect) {
         match effect {
             Effect::LoadDevices => self.load_devices(),
@@ -233,6 +248,7 @@ impl Controller {
                     });
                 });
             },
+            Effect::RestartAudio { mac, address } => self.restart_audio(mac, address),
             Effect::SetupTimeout { mac, attempt } => {
                 let dispatch = self.dispatch.clone();
                 glib::MainContext::default().spawn_local(async move {
