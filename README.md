@@ -16,11 +16,12 @@ unchanged here. For Android, use [upstream](https://github.com/librepods-org/lib
 
 - **A native GNOME app.** The UI is GTK 4 and libadwaita instead of iced: system font,
   Adwaita icons, follows GNOME's light and dark style, one instance per session, closes to
-  the tray. It works back to GTK 4.6 and libadwaita 1.1 (Ubuntu and Pop!_OS 22.04).
+  the tray. It needs GTK 4.22 and libadwaita 1.9, the versions GNOME 50 ships (NixOS 26.05
+  and other current distributions).
 - **The hi-res microphone works on this branch.** Apple's high-quality AirPods microphone
   stream (AAC-ELD over AACP) shows up as a PipeWire input while music keeps playing in full
   quality, with a built-in microphone test (record, play back, seek). It builds against
-  FFmpeg 4.4 through 8.
+  FFmpeg 4.4 through 9.
 - **Switching between your phone and this PC.** A "Connect to this PC" button and tray
   item, and an optional automatic switch when media starts playing here.
 - **Settings backported from the Android app.** Press and hold, call controls, microphone
@@ -63,6 +64,9 @@ The app builds from source; AppImage and Flatpak packaging have not been updated
 GTK UI yet.
 
 ### Dependencies
+
+The app needs GTK 4.22 and libadwaita 1.9 or newer. On releases that ship older ones
+(Ubuntu 24.04, Pop!_OS 22.04, Debian 13), build it with Nix instead (see below).
 
 Ubuntu, Pop!_OS, Debian:
 

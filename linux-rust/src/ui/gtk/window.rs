@@ -1,5 +1,6 @@
-//! The main window: a leaflet with the sidebar and the content pane, each
-//! under its own header bar, inside a toast overlay.
+//! The main window: a split view with the sidebar and the content pane, each
+//! under its own header bar, inside a toast overlay. A narrow window shows one
+//! pane at a time.
 
 use {
     crate::ui::gtk::{
@@ -23,10 +24,16 @@ const PAGE_NOTHING: &str = "nothing";
 const PAGE_SETTINGS: &str = "settings";
 const PAGE_STATUS: &str = "status";
 
+/// Narrowest the sidebar gets while both panes show, in sp.
+const SIDEBAR_WIDTH: f64 = 260.0;
+/// Below this window width, in sp, only one pane shows at a time.
+const COLLAPSE_BELOW: f64 = 600.0;
+
 pub(crate) struct Window {
     root: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
-    title: adw::WindowTitle,
+    /// The content pane; its title is the header bar title.
+    content: adw::NavigationPage,
     stack: gtk::Stack,
     /// Placeholder for the pages that are only a message.
     status: adw::StatusPage,
@@ -56,73 +63,28 @@ impl Window {
         stack.add_named(settings.widget(), Some(PAGE_SETTINGS));
         stack.add_named(&status, Some(PAGE_STATUS));
 
-        let leaflet = adw::Leaflet::builder().can_navigate_back(true).build();
-
-        let sidebar_header = adw::HeaderBar::builder()
-            .title_widget(&adw::WindowTitle::new("LibrePods", ""))
-            .show_end_title_buttons(false)
+        let sidebar_page = adw::NavigationPage::builder()
+            .title("LibrePods")
+            .child(&toolbar(sidebar.widget()))
             .build();
-        let sidebar_pane = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .width_request(260)
+        let content = adw::NavigationPage::builder()
+            .title("")
+            .child(&toolbar(&stack))
             .build();
-        sidebar_pane.append(&sidebar_header);
-        sidebar_pane.append(sidebar.widget());
-
-        let title = adw::WindowTitle::new("", "");
-        let back = gtk::Button::builder()
-            .icon_name("go-previous-symbolic")
-            .tooltip_text("Back")
-            .visible(false)
+        let split = adw::NavigationSplitView::builder()
+            .sidebar(&sidebar_page)
+            .content(&content)
+            .min_sidebar_width(SIDEBAR_WIDTH)
             .build();
-        let content_header = adw::HeaderBar::builder()
-            .title_widget(&title)
-            .show_start_title_buttons(false)
-            .build();
-        content_header.pack_start(&back);
-        let content_pane = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .hexpand(true)
-            .build();
-        content_pane.append(&content_header);
-        content_pane.append(&stack);
-
-        leaflet.append(&sidebar_pane);
-        leaflet
-            .append(&gtk::Separator::new(gtk::Orientation::Vertical))
-            .set_navigatable(false);
-        leaflet.append(&content_pane);
-
-        // Folded, each pane fills the window and carries the window buttons,
-        // and the content pane gets a way back to the list.
-        for (target, property) in [
-            (
-                sidebar_header.upcast_ref::<gtk::Widget>(),
-                "show-end-title-buttons",
-            ),
-            (content_header.upcast_ref(), "show-start-title-buttons"),
-            (back.upcast_ref(), "visible"),
-        ] {
-            leaflet
-                .bind_property("folded", target, property)
-                .sync_create()
-                .build();
-        }
-        {
-            let leaflet = leaflet.clone();
-            back.connect_clicked(move |_| {
-                leaflet.navigate(adw::NavigationDirection::Back);
-            });
-        }
+        // Collapsed, the split view shows one pane at a time and gives the
+        // content pane a back button; picking an entry shows its content.
         for list in [sidebar.device_list(), sidebar.settings_list()] {
-            let leaflet = leaflet.clone();
-            list.connect_row_activated(move |_, _| {
-                leaflet.navigate(adw::NavigationDirection::Forward);
-            });
+            let split = split.clone();
+            list.connect_row_activated(move |_, _| split.set_show_content(true));
         }
 
         let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&leaflet));
+        toasts.set_child(Some(&split));
         let root = adw::ApplicationWindow::builder()
             .application(app)
             .title("LibrePods")
@@ -133,11 +95,18 @@ impl Window {
             .height_request(400)
             .content(&toasts)
             .build();
+        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            COLLAPSE_BELOW,
+            adw::LengthUnit::Sp,
+        ));
+        narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+        root.add_breakpoint(narrow);
 
         Self {
             root,
             toasts,
-            title,
+            content,
             stack,
             status,
             sidebar,
@@ -150,6 +119,11 @@ impl Window {
 
     pub(crate) fn root(&self) -> &adw::ApplicationWindow {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidebar(&self) -> &Sidebar {
+        &self.sidebar
     }
 
     pub(crate) fn present(&self) {
@@ -211,8 +185,8 @@ impl Window {
         if self.stack.visible_child_name().as_deref() != Some(page) {
             self.stack.set_visible_child_name(page);
         }
-        if self.title.title() != title {
-            self.title.set_title(&title);
+        if self.content.title() != title {
+            self.content.set_title(&title);
         }
     }
 
@@ -221,4 +195,11 @@ impl Window {
         self.status.set_title(title);
         self.status.set_description(Some(description));
     }
+}
+
+/// A pane under its own header bar.
+fn toolbar(child: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
+    let view = adw::ToolbarView::builder().content(child).build();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view
 }

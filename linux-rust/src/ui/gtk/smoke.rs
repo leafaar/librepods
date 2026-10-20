@@ -118,6 +118,26 @@ fn render_builds_widgets_and_sends_nothing() {
         queued.push(format!("{input:?}"));
     }
     assert!(queued.is_empty(), "render sent inputs: {queued:?}");
+
+    let split = window
+        .root()
+        .content()
+        .and_downcast::<adw::ToastOverlay>()
+        .and_then(|toasts| toasts.child())
+        .and_downcast::<adw::NavigationSplitView>()
+        .expect("the window holds a split view");
+    let content = split.content().expect("the split view has a content pane");
+    assert_eq!(content.title(), model.title(&mac));
+    // Collapsed, as in a narrow window: activating a device shows its page.
+    split.set_collapsed(true);
+    assert!(!split.shows_content());
+    window
+        .sidebar()
+        .device_list()
+        .row_at_index(0)
+        .expect("a device row")
+        .activate();
+    assert!(split.shows_content());
 }
 
 /// Report every setting of the AirPods settings sections, some with values

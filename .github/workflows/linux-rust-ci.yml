@@ -32,18 +32,23 @@ defaults:
 
 jobs:
   check:
-    # 22.04 carries the oldest system libraries we support (FFmpeg 4.4, GTK 4.6,
-    # libadwaita 1.1).
-    runs-on: ubuntu-22.04
+    # The UI needs GTK 4.22 and libadwaita 1.9 (GNOME 50), newer than the
+    # ubuntu-24.04 image has, so the job runs in an Ubuntu 26.04 container.
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
     steps:
-      - uses: actions/checkout@v4
-
+      # Before checkout, so it gets a git repository; linux-rust does not
+      # exist yet, hence the working directory.
       - name: install system libraries
+        working-directory: /
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential \
             pkg-config libclang-dev libdbus-1-dev libpulse-dev \
             libavcodec-dev libavutil-dev libgtk-4-dev libadwaita-1-dev
+
+      - uses: actions/checkout@v4
 
       - name: read toolchain pins
         run: |

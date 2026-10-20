@@ -45,9 +45,10 @@ shows that window and exits, before a second backend could compete for the AirPo
 4. Decisions live in the model (`model.rs`, `model/`, `controls.rs`, `battery.rs`), which
    has no GTK in it and is unit tested.
 
-Only widgets available in GTK 4.6 and libadwaita 1.1 are used, so the app runs on Ubuntu
-and Pop!_OS 22.04. `ui::gtk::smoke` builds the real widgets and renders a sequence of
-states; it needs a display and is ignored by default.
+The UI targets GTK 4.22 and libadwaita 1.9 (GNOME 50), the versions the flake's nixpkgs
+pins; the `v4_22` and `v1_9` features of gtk4-rs and libadwaita-rs set that floor.
+`ui::gtk::smoke` builds the real widgets and renders a sequence of states; it needs a
+display and is ignored by default.
 
 ### Testing seams
 
@@ -81,7 +82,7 @@ G_DEBUG=fatal-criticals cargo test smoke -- --ignored --test-threads=1   # needs
   in `Cargo.toml`; `unwrap_used` is only allowed in tests.
 - `deny.toml` has no advisory exceptions. Adding one needs a reason next to it.
 - The FFmpeg channel API differs across versions; `build.rs` selects it, and the code builds
-  against FFmpeg 4.4 through 8.
+  against FFmpeg 4.4 through 9.
 
 ## Conventions
 

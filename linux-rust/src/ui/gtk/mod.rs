@@ -1,5 +1,5 @@
-//! Native GNOME UI with GTK 4 and libadwaita. Targets GTK 4.6 and
-//! libadwaita 1.1, so only widgets from those versions are used.
+//! Native GNOME UI with GTK 4 and libadwaita. Needs GTK 4.22 and
+//! libadwaita 1.9 (GNOME 50).
 //!
 //! # Layout
 //!
@@ -19,7 +19,7 @@
 //! # Rules for widget code
 //!
 //! 1. A signal handler only sends an `Input` through `Dispatch`, apart from
-//!    purely visual actions (leaflet navigation, copying a label). It never
+//!    purely visual actions (split view navigation, copying a label). It never
 //!    reads or changes the model and never talks to a device. The loop in
 //!    `app` applies inputs one at a time, draws, then runs the effects.
 //! 2. Every widget whose handler sends an input is wrapped in `Guarded`, and
