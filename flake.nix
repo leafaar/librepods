@@ -74,7 +74,7 @@
             fileset = lib.fileset.unions [
               # Default files from crane (Rust and cargo files)
               (craneLib.fileset.commonCargoSources unfilteredRoot)
-              # The window icon is embedded with include_bytes!.
+              # The desktop entry and the app icon, installed under share/.
               ./linux-rust/assets
               ./linux-rust/clippy.toml
               ./linux-rust/deny.toml
@@ -96,6 +96,21 @@
               inherit cargoArtifacts;
 
               doCheck = false;
+
+              # The window and the desktop entry name the icon by the app id, and
+              # StartupWMClass matches the program name main sets.
+              postInstall = ''
+                install -Dm644 assets/me.kavishdevar.librepods.desktop \
+                  $out/share/applications/me.kavishdevar.librepods.desktop
+                install -Dm644 assets/icon.png \
+                  $out/share/icons/hicolor/256x256/apps/me.kavishdevar.librepods.png
+              '';
+              # The symbolic icons the UI uses (bluetooth, headphones, batteries),
+              # for sessions without an icon theme of their own. Appended, so the
+              # session's theme still wins.
+              preFixup = ''
+                gappsWrapperArgs+=(--suffix XDG_DATA_DIRS : "${pkgs.adwaita-icon-theme}/share")
+              '';
 
               meta = {
                 description = "AirPods liberated from Apple's ecosystem";
