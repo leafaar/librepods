@@ -52,7 +52,7 @@
               gtk4
               libadwaita
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
               pkgs.libiconv
             ];
 
@@ -134,6 +134,7 @@
           apps.default = {
             type = "app";
             program = lib.getExe librepods;
+            meta.description = librepods.meta.description;
           };
 
           devShells.default = craneLib.devShell {
@@ -151,8 +152,7 @@
           };
 
           treefmt = {
-            programs.nixfmt.enable = pkgs.lib.meta.availableOn pkgs.stdenv.buildPlatform pkgs.nixfmt-rfc-style.compiler;
-            programs.nixfmt.package = pkgs.nixfmt-rfc-style;
+            programs.nixfmt.enable = pkgs.lib.meta.availableOn pkgs.stdenv.buildPlatform pkgs.nixfmt.compiler;
           };
         };
     };
