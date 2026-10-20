@@ -221,7 +221,7 @@ impl DeviceRow {
                             .build(),
                     );
                     if level.stale {
-                        part.add_css_class("dim-label");
+                        part.add_css_class("dimmed");
                         part.set_tooltip_text(Some("Last known case level"));
                     }
                     self.status.append(&part);
@@ -236,7 +236,7 @@ fn dim_caption(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .xalign(0.0)
-        .css_classes(["caption", "dim-label"])
+        .css_classes(["caption", "dimmed"])
         .build()
 }
 

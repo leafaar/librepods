@@ -15,7 +15,7 @@ use {
 
 pub(crate) struct EqualizerSection {
     group: adw::PreferencesGroup,
-    enabled: Guarded<gtk::Switch>,
+    enabled: Guarded<adw::SwitchRow>,
     reset: gtk::Button,
     /// One row and slider per band, in `EqBand::ALL` order.
     bands: Vec<(adw::ActionRow, Guarded<gtk::Scale>)>,
@@ -23,7 +23,7 @@ pub(crate) struct EqualizerSection {
 
 impl EqualizerSection {
     pub(crate) fn new(cx: &SectionContext<'_>) -> Self {
-        let (enabled_row, enabled) = {
+        let enabled = {
             let dispatch = cx.dispatch.clone();
             let mac = cx.mac.clone();
             switch_row(
@@ -51,7 +51,7 @@ impl EqualizerSection {
             .title("Equalizer")
             .header_suffix(&reset)
             .build();
-        group.add(&enabled_row);
+        group.add(enabled.widget());
         let bands = EqBand::ALL
             .into_iter()
             .map(|band| {

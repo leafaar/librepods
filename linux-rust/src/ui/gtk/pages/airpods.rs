@@ -165,7 +165,7 @@ fn battery_card(caption: &str) -> gtk::Box {
     card.append(
         &gtk::Label::builder()
             .label(caption)
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["caption", "dimmed"])
             .build(),
     );
     card
@@ -185,9 +185,9 @@ fn update_battery_card(card: &gtk::Widget, level: Level) {
     // A remembered case level is drawn dimmed.
     for widget in [icon.upcast_ref::<gtk::Widget>(), percent.upcast_ref()] {
         if level.stale {
-            widget.add_css_class("dim-label");
+            widget.add_css_class("dimmed");
         } else {
-            widget.remove_css_class("dim-label");
+            widget.remove_css_class("dimmed");
         }
     }
     card.set_tooltip_text(level.stale.then_some("Last known level"));
@@ -238,40 +238,35 @@ impl Section for RestartSection {
     }
 }
 
-/// Name field, renamed on Enter.
+/// Name field, renamed on Enter. The hint for the draft shows as the group
+/// description, an entry row has no subtitle.
 struct NameSection {
     group: adw::PreferencesGroup,
-    row: adw::ActionRow,
-    entry: Guarded<gtk::Entry>,
+    row: Guarded<adw::EntryRow>,
 }
 
 impl NameSection {
     fn new(cx: &SectionContext<'_>) -> Self {
-        let entry = gtk::Entry::builder()
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .build();
-        let entry = {
+        let row = adw::EntryRow::builder().title("Name").build();
+        let row = {
             let dispatch = cx.dispatch.clone();
             let mac = cx.mac.clone();
-            Guarded::new(entry, move |e| {
-                e.connect_changed(move |e| {
-                    dispatch.send(Input::NameEdited(mac.get(), e.text().to_string()));
+            Guarded::new(row, move |r| {
+                r.connect_changed(move |r| {
+                    dispatch.send(Input::NameEdited(mac.get(), r.text().to_string()));
                 })
             })
         };
         {
             let dispatch = cx.dispatch.clone();
             let mac = cx.mac.clone();
-            entry.widget().connect_activate(move |e| {
-                dispatch.send(Input::Rename(mac.get(), e.text().to_string()));
+            row.widget().connect_entry_activated(move |r| {
+                dispatch.send(Input::Rename(mac.get(), r.text().to_string()));
             });
         }
-        let row = adw::ActionRow::builder().title("Name").build();
-        row.add_suffix(entry.widget());
         let group = adw::PreferencesGroup::new();
-        group.add(&row);
-        Self { group, row, entry }
+        group.add(row.widget());
+        Self { group, row }
     }
 }
 
@@ -282,15 +277,19 @@ impl Section for NameSection {
 
     fn render(&self, mac: &str, airpods: &AirPods, model: &Model) {
         let hint = model.name_hint(mac);
+        let row = self.row.widget();
         // While the user edits, the field keeps the draft.
-        if hint.is_none() && self.entry.widget().text() != airpods.name {
-            self.entry.set(|e| e.set_text(&airpods.name));
+        if hint.is_none() && row.text() != airpods.name {
+            self.row.set(|r| r.set_text(&airpods.name));
         }
-        self.row.set_subtitle(hint.map_or("", NameHint::text));
+        let description = hint.map(NameHint::text);
+        if self.group.description().as_deref() != description {
+            self.group.set_description(description);
+        }
         if matches!(hint, Some(NameHint::Invalid(_))) {
-            self.entry.widget().add_css_class("error");
+            row.add_css_class("error");
         } else {
-            self.entry.widget().remove_css_class("error");
+            row.remove_css_class("error");
         }
     }
 }
@@ -301,10 +300,9 @@ struct NoiseControlSection {
     listening_mode: Guarded<adw::ComboRow>,
     /// Mode bytes in the order the combo row lists them.
     modes: Rc<RefCell<Vec<u8>>>,
-    conversation_row: adw::ActionRow,
-    conversation_awareness: Guarded<gtk::Switch>,
-    personalized_volume: Guarded<gtk::Switch>,
-    allow_off: Guarded<gtk::Switch>,
+    conversation_awareness: Guarded<adw::SwitchRow>,
+    personalized_volume: Guarded<adw::SwitchRow>,
+    allow_off: Guarded<adw::SwitchRow>,
 }
 
 impl NoiseControlSection {
@@ -328,17 +326,17 @@ impl NoiseControlSection {
             let mac = cx.mac.clone();
             move |on| dispatch.send(input(mac.get(), on))
         };
-        let (conversation_row, conversation_awareness) = switch_row(
+        let conversation_awareness = switch_row(
             "Conversation Awareness",
             Some("Lowers the volume of your audio when it detects that you are speaking."),
             toggle(Input::SetConversationAwareness),
         );
-        let (volume_row, personalized_volume) = switch_row(
+        let personalized_volume = switch_row(
             "Personalized Volume",
             Some("Adjusts the volume in response to your environment."),
             toggle(Input::SetPersonalizedVolume),
         );
-        let (off_row, allow_off) = switch_row(
+        let allow_off = switch_row(
             "Off Listening Mode",
             Some(
                 "When this is on, AirPods listening modes will include an Off option. Loud \
@@ -350,14 +348,13 @@ impl NoiseControlSection {
             .title("Noise Control")
             .build();
         group.add(listening_mode.widget());
-        group.add(&conversation_row);
-        group.add(&volume_row);
-        group.add(&off_row);
+        group.add(conversation_awareness.widget());
+        group.add(personalized_volume.widget());
+        group.add(allow_off.widget());
         Self {
             group,
             listening_mode,
             modes,
-            conversation_row,
             conversation_awareness,
             personalized_volume,
             allow_off,
@@ -389,7 +386,8 @@ impl Section for NoiseControlSection {
         self.conversation_awareness
             .set_active(airpods.conversation_awareness);
         // Locked while a hi-res capture turns conversation awareness off.
-        self.conversation_row
+        self.conversation_awareness
+            .widget()
             .set_sensitive(!model.conversation_awareness_locked(mac));
         self.personalized_volume
             .set_active(airpods.personalized_volume);

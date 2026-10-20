@@ -55,7 +55,7 @@ impl<W: IsA<glib::Object>> Guarded<W> {
     }
 }
 
-impl Guarded<gtk::Switch> {
+impl Guarded<adw::SwitchRow> {
     pub(crate) fn set_active(&self, active: bool) {
         if self.widget.is_active() != active {
             self.set(|w| w.set_active(active));
@@ -92,24 +92,20 @@ impl CurrentDevice {
     }
 }
 
-/// A row with a title, an optional subtitle and a switch that reports each
-/// user toggle to `on_toggle`.
+/// A switch row with a title and an optional subtitle that reports each user
+/// toggle to `on_toggle`.
 pub(crate) fn switch_row(
     title: &str,
     subtitle: Option<&str>,
     on_toggle: impl Fn(bool) + 'static,
-) -> (adw::ActionRow, Guarded<gtk::Switch>) {
-    let row = adw::ActionRow::builder().title(title).build();
+) -> Guarded<adw::SwitchRow> {
+    let row = adw::SwitchRow::builder().title(title).build();
     if let Some(subtitle) = subtitle {
         row.set_subtitle(subtitle);
     }
-    let switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
-    row.add_suffix(&switch);
-    row.set_activatable_widget(Some(&switch));
-    let switch = Guarded::new(switch, |s| {
-        s.connect_active_notify(move |s| on_toggle(s.is_active()))
-    });
-    (row, switch)
+    Guarded::new(row, |r| {
+        r.connect_active_notify(move |r| on_toggle(r.is_active()))
+    })
 }
 
 /// A combo row over fixed labels that reports the index the user picks.
@@ -139,7 +135,7 @@ pub(crate) fn value_row(title: &str) -> (adw::ActionRow, gtk::Label) {
     let label = gtk::Label::builder()
         .selectable(true)
         .valign(gtk::Align::Center)
-        .css_classes(["dim-label"])
+        .css_classes(["dimmed"])
         .build();
     row.add_suffix(&label);
     (row, label)

@@ -14,13 +14,13 @@ use {
 pub(crate) struct SettingsPage {
     page: adw::PreferencesPage,
     theme: Guarded<adw::ComboRow>,
-    tray_text_mode: Guarded<gtk::Switch>,
+    tray_text_mode: Guarded<adw::SwitchRow>,
     codec: Guarded<adw::ComboRow>,
-    auto_switch: Guarded<gtk::Switch>,
-    a2dp_reset: Guarded<gtk::Switch>,
-    hires_mic_agc: Guarded<gtk::Switch>,
-    hires_mic_pause_convo: Guarded<gtk::Switch>,
-    stem_control: Guarded<gtk::Switch>,
+    auto_switch: Guarded<adw::SwitchRow>,
+    a2dp_reset: Guarded<adw::SwitchRow>,
+    hires_mic_agc: Guarded<adw::SwitchRow>,
+    hires_mic_pause_convo: Guarded<adw::SwitchRow>,
+    stem_control: Guarded<adw::SwitchRow>,
 }
 
 impl SettingsPage {
@@ -40,14 +40,17 @@ impl SettingsPage {
             ToString::to_string,
             SettingChange::Theme,
         );
-        let (tray_row, tray_text_mode) = switch(
+        let tray_text_mode = switch(
             "Use text in tray",
             "Use text for battery status in tray instead of a progress bar.",
             SettingChange::TrayTextMode,
         );
         let appearance = group(
             "Appearance",
-            &[theme.widget().upcast_ref(), tray_row.upcast_ref()],
+            &[
+                theme.widget().upcast_ref(),
+                tray_text_mode.widget().upcast_ref(),
+            ],
         );
 
         let codec = choice_row(
@@ -61,13 +64,13 @@ impl SettingsPage {
             ToString::to_string,
             SettingChange::PreferredCodec,
         );
-        let (auto_switch_row, auto_switch) = switch(
+        let auto_switch = switch(
             "Switch to this PC on playback",
             "When media starts playing here and the AirPods are on another device, connect them \
              to this PC. They leave the other device, even mid-call.",
             SettingChange::AutoSwitchOnPlayback,
         );
-        let (a2dp_row, a2dp_reset) = switch(
+        let a2dp_reset = switch(
             "Reset A2DP transport",
             "Briefly suspends and resumes A2DP after the hi-res mic starts or stops. Only turn \
              on if playback stays on one AirPod after capture ends: some setups lose the audio \
@@ -78,18 +81,18 @@ impl SettingsPage {
             "Audio",
             &[
                 codec.widget().upcast_ref(),
-                auto_switch_row.upcast_ref(),
-                a2dp_row.upcast_ref(),
+                auto_switch.widget().upcast_ref(),
+                a2dp_reset.widget().upcast_ref(),
             ],
         );
 
-        let (agc_row, hires_mic_agc) = switch(
+        let hires_mic_agc = switch(
             "Hi-res mic auto gain",
             "Automatically normalizes the hi-res microphone level. For most uses this should \
              remain on. Disable for a raw, unprocessed capture.",
             SettingChange::HiResMicAgc,
         );
-        let (pause_row, hires_mic_pause_convo) = switch(
+        let hires_mic_pause_convo = switch(
             "Pause conversation awareness during capture",
             "Turns off conversation awareness while the hi-res microphone is capturing, then \
              restores it afterwards.",
@@ -97,16 +100,19 @@ impl SettingsPage {
         );
         let microphone = group(
             "Hi-Res Microphone",
-            &[agc_row.upcast_ref(), pause_row.upcast_ref()],
+            &[
+                hires_mic_agc.widget().upcast_ref(),
+                hires_mic_pause_convo.widget().upcast_ref(),
+            ],
         );
 
-        let (stem_row, stem_control) = switch(
+        let stem_control = switch(
             "Stem press track control",
             "Double press = next track, triple press = previous track. Disable if your \
              environment handles AirPods AVRCP commands natively.",
             SettingChange::StemControl,
         );
-        let controls = group("Controls", &[stem_row.upcast_ref()]);
+        let controls = group("Controls", &[stem_control.widget().upcast_ref()]);
 
         let page = adw::PreferencesPage::new();
         for group in [appearance, audio, microphone, controls] {

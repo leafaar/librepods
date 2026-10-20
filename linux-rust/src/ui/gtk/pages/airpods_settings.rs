@@ -285,8 +285,7 @@ impl<V: ControlValue, T: PartialEq> ControlRow for ChoiceRow<V, T> {
 
 /// An on/off setting.
 struct ToggleRow {
-    row: adw::ActionRow,
-    switch: Guarded<gtk::Switch>,
+    row: Guarded<adw::SwitchRow>,
     id: Id,
 }
 
@@ -298,21 +297,21 @@ impl ToggleRow {
         id: Id,
         change: fn(bool) -> ControlChange,
     ) -> Self {
-        let (row, switch) = switch_row(title, subtitle, sender(cx, change));
-        Self { row, switch, id }
+        let row = switch_row(title, subtitle, sender(cx, change));
+        Self { row, id }
     }
 }
 
 impl ControlRow for ToggleRow {
     fn widget(&self) -> &gtk::Widget {
-        self.row.upcast_ref()
+        self.row.widget().upcast_ref()
     }
 
     fn render(&self, airpods: &AirPods) -> bool {
         let Some(on) = airpods.toggle(self.id) else {
             return false;
         };
-        self.switch.set_active(on);
+        self.row.set_active(on);
         true
     }
 }
@@ -386,7 +385,7 @@ impl SliderRow {
         let caption = |text: &str| {
             gtk::Label::builder()
                 .label(text)
-                .css_classes(["caption", "dim-label"])
+                .css_classes(["caption", "dimmed"])
                 .build()
         };
         let slider = gtk::Box::builder().spacing(12).build();
@@ -407,7 +406,7 @@ impl SliderRow {
                 .label(description)
                 .xalign(0.0)
                 .wrap(true)
-                .css_classes(["caption", "dim-label"])
+                .css_classes(["caption", "dimmed"])
                 .build(),
         );
         content.append(&slider);
@@ -446,7 +445,7 @@ impl ControlRow for SliderRow {
 /// an expander row.
 struct CycleRows {
     expander: adw::ExpanderRow,
-    modes: Vec<(adw::ActionRow, Guarded<gtk::Switch>)>,
+    modes: Vec<Guarded<adw::SwitchRow>>,
 }
 
 impl CycleRows {
@@ -459,9 +458,9 @@ impl CycleRows {
             .iter()
             .map(|&mode| {
                 let send = sender(cx, move |on| ControlChange::CycleMode(mode, on));
-                let (row, switch) = switch_row(mode.label(), Some(mode.description()), send);
-                expander.add_row(&row);
-                (row, switch)
+                let row = switch_row(mode.label(), Some(mode.description()), send);
+                expander.add_row(row.widget());
+                row
             })
             .collect();
         Self { expander, modes }
@@ -477,10 +476,10 @@ impl ControlRow for CycleRows {
         let Some(rows) = cycle_rows(airpods) else {
             return false;
         };
-        for ((row, switch), shown) in self.modes.iter().zip(rows) {
-            row.set_visible(shown.shown);
-            row.set_sensitive(!shown.locked);
-            switch.set_active(shown.on);
+        for (row, shown) in self.modes.iter().zip(rows) {
+            row.widget().set_visible(shown.shown);
+            row.widget().set_sensitive(!shown.locked);
+            row.set_active(shown.on);
         }
         true
     }

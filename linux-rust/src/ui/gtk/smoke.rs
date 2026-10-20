@@ -32,6 +32,7 @@ use {
     adw::prelude::*,
     gtk::gio,
     std::{collections::HashMap, time::Duration},
+    tokio::sync::mpsc::UnboundedReceiver,
 };
 
 #[test]
@@ -119,6 +120,13 @@ fn render_builds_widgets_and_sends_nothing() {
     }
     assert!(queued.is_empty(), "render sent inputs: {queued:?}");
 
+    check_navigation(&window, &model, &mac, &mut rx);
+    check_row_handlers(&window, &mut rx);
+}
+
+/// The split view titles the content pane, and in a collapsed window a
+/// device row selects its device and shows its page.
+fn check_navigation(window: &Window, model: &Model, mac: &str, rx: &mut UnboundedReceiver<Input>) {
     let split = window
         .root()
         .content()
@@ -127,8 +135,7 @@ fn render_builds_widgets_and_sends_nothing() {
         .and_downcast::<adw::NavigationSplitView>()
         .expect("the window holds a split view");
     let content = split.content().expect("the split view has a content pane");
-    assert_eq!(content.title(), model.title(&mac));
-    // Collapsed, as in a narrow window: activating a device shows its page.
+    assert_eq!(content.title(), model.title(mac));
     split.set_collapsed(true);
     assert!(!split.shows_content());
     window
@@ -138,6 +145,60 @@ fn render_builds_widgets_and_sends_nothing() {
         .expect("a device row")
         .activate();
     assert!(split.shows_content());
+    let queued = rx.try_recv();
+    assert!(
+        matches!(queued, Ok(Input::Select(Selection::Device(_)))),
+        "{queued:?}"
+    );
+}
+
+/// User changes on the libadwaita rows reach their handlers.
+fn check_row_handlers(window: &Window, rx: &mut UnboundedReceiver<Input>) {
+    let root = window.root().upcast_ref::<gtk::Widget>().clone();
+    let tray = descendants::<adw::SwitchRow>(&root)
+        .into_iter()
+        .find(|row| row.title() == "Use text in tray")
+        .expect("the tray text switch row");
+    tray.set_active(!tray.is_active());
+    let queued = rx.try_recv();
+    assert!(
+        matches!(queued, Ok(Input::Setting(SettingChange::TrayTextMode(_)))),
+        "{queued:?}"
+    );
+    let name = descendants::<adw::EntryRow>(&root)
+        .into_iter()
+        .find(|row| row.title() == "Name")
+        .expect("the name entry row");
+    // Setting the text clears the field first, which is an edit of its own.
+    name.set_text("Pods 2");
+    let mut queued = Vec::new();
+    while let Ok(input) = rx.try_recv() {
+        queued.push(input);
+    }
+    assert!(
+        matches!(queued.last(), Some(Input::NameEdited(_, text)) if text == "Pods 2"),
+        "{queued:?}"
+    );
+    name.emit_by_name::<()>("entry-activated", &[]);
+    let queued = rx.try_recv();
+    assert!(
+        matches!(&queued, Ok(Input::Rename(_, text)) if text == "Pods 2"),
+        "{queued:?}"
+    );
+}
+
+/// Every widget of type `T` under `root`, in tree order.
+fn descendants<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Vec<T> {
+    let mut found = Vec::new();
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(typed) = widget.downcast_ref::<T>() {
+            found.push(typed.clone());
+        }
+        found.extend(descendants(&widget));
+        child = widget.next_sibling();
+    }
+    found
 }
 
 /// Report every setting of the AirPods settings sections, some with values

@@ -16,7 +16,7 @@ const SEEK_STEP: f64 = 0.1;
 
 pub(crate) struct MicrophoneSection {
     group: adw::PreferencesGroup,
-    hires: Guarded<gtk::Switch>,
+    hires: Guarded<adw::SwitchRow>,
     level_row: adw::ActionRow,
     level: gtk::LevelBar,
     test: TestRow,
@@ -25,7 +25,7 @@ pub(crate) struct MicrophoneSection {
 
 impl MicrophoneSection {
     pub(crate) fn new(cx: &SectionContext<'_>) -> Self {
-        let (hires_row, hires) = {
+        let hires = {
             let dispatch = cx.dispatch.clone();
             let mac = cx.mac.clone();
             switch_row(
@@ -55,7 +55,7 @@ impl MicrophoneSection {
         let playback = PlaybackRows::new(cx.dispatch);
 
         let group = adw::PreferencesGroup::builder().title("Microphone").build();
-        group.add(&hires_row);
+        group.add(hires.widget());
         group.add(&level_row);
         group.add(&test.row);
         group.add(&playback.seek_row);
@@ -172,7 +172,7 @@ impl PlaybackRows {
             })
         };
         let position = gtk::Label::builder()
-            .css_classes(["dim-label", "numeric"])
+            .css_classes(["dimmed", "numeric"])
             .build();
         let seek_box = row_box(12);
         seek_box.append(seek.widget());
