@@ -266,7 +266,22 @@ pub async fn start_le_monitor(
         content: vec![0x4C, 0x00], // Apple manufacturer ID (76) in LE
     };
 
-    let mm = adapter.monitor().await?;
+    // BlueZ only offers advertisement monitors with its experimental
+    // interfaces on, and 5.86 refuses RegisterMonitor otherwise. Everything
+    // else works without them, so this is a warning and not an error.
+    let mm = match adapter.monitor().await {
+        Ok(mm) => mm,
+        Err(e) => {
+            warn!(
+                "BlueZ did not accept the LE advertisement monitor ({e}), so battery levels \
+                 from advertisements and auto-connect are off. To turn them on, set \
+                 Experimental = true in the [General] section of /etc/bluetooth/main.conf \
+                 (NixOS: hardware.bluetooth.settings.General.Experimental = true) and restart \
+                 bluetoothd."
+            );
+            return Ok(());
+        },
+    };
     let mut monitor_handle = mm
         .register(Monitor {
             monitor_type: bluer::monitor::Type::OrPatterns,
