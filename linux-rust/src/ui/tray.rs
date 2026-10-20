@@ -31,6 +31,10 @@ pub struct MyTray {
 }
 
 impl ksni::Tray for MyTray {
+    // A left click opens the menu (listening modes, battery, Open Window)
+    // instead of the window, which stays one click away in the menu.
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         env!("CARGO_PKG_NAME").into()
     }
@@ -57,9 +61,6 @@ impl ksni::Tray for MyTray {
             title: "Battery Status".to_string(),
             description: self.battery_description(),
         }
-    }
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.open_window();
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let allow_off = self.allow_off_option == Some(0x01);
@@ -265,7 +266,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tray_activation_opens_window() {
+    fn tray_click_opens_the_menu_and_the_menu_opens_the_window() {
+        const { assert!(<MyTray as ksni::Tray>::MENU_ON_ACTIVATE) };
+
         let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tray = MyTray {
             conversation_detect_enabled: None,
@@ -285,16 +288,21 @@ mod tests {
             shutdown_tx: None,
         };
 
-        <MyTray as ksni::Tray>::activate(&mut tray, TRAY_ACTIVATION_X, TRAY_ACTIVATION_Y);
+        let menu = <MyTray as ksni::Tray>::menu(&tray);
+        let open = menu
+            .into_iter()
+            .find_map(|item| match item {
+                ksni::MenuItem::Standard(item) if item.label == "Open Window" => Some(item),
+                _ => None,
+            })
+            .expect("the tray menu has an Open Window item");
+        (open.activate)(&mut tray);
 
         assert!(matches!(
             ui_rx.try_recv(),
             Ok(BluetoothUIMessage::OpenWindow)
         ));
     }
-
-    const TRAY_ACTIVATION_X: i32 = 0;
-    const TRAY_ACTIVATION_Y: i32 = 0;
 
     fn empty_tray() -> MyTray {
         MyTray {
