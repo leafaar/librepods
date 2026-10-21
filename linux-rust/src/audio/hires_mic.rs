@@ -431,7 +431,6 @@ async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Op
         aacp.clear_audio_channel().await;
         return None;
     }
-    info!("[aacp] microphone stream started");
 
     let start_reset_cancel = Arc::new(AtomicBool::new(false));
     let start_reset = tokio::spawn({

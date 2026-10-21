@@ -32,6 +32,7 @@ use {
         Message,
         arg::{RefArg, Variant},
         blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
+        channel::MatchingReceiver,
         message::{MatchRule, MessageType},
     },
     gtk::glib,
@@ -463,17 +464,24 @@ struct ConnectionWatcher {
 /// Process BlueZ signals until the system bus fails.
 fn watch_connections(mut watcher: ConnectionWatcher) -> anyhow::Result<()> {
     let conn = Connection::new_system().context("cannot connect to the D-Bus system bus")?;
+    // Subscribe before listing BlueZ's objects: signals sent meanwhile wait in
+    // the connection's queue until the loop below handles them, so no change
+    // falls between the list and the first signal.
+    for rule in bluez_watch::MATCH_RULES {
+        conn.add_match_no_cb(rule)
+            .context("cannot watch BlueZ device changes")?;
+    }
     watcher.bluez.seed_from_bus(&conn, Instant::now());
-    // Every signal BlueZ sends: PropertiesChanged for devices and transports,
-    // and the ObjectManager signals that announce transports coming and going.
-    let rule = MatchRule::new()
-        .with_type(MessageType::Signal)
-        .with_sender("org.bluez");
-    conn.add_match(rule, move |(): (), conn, msg| {
-        watcher.on_signal(conn, msg);
-        true
-    })
-    .context("cannot watch BlueZ device changes")?;
+    // The bus sends this connection only the signals subscribed above, plus
+    // its own name announcements that the watcher ignores, so one callback
+    // takes them all.
+    conn.start_receive(
+        MatchRule::new().with_type(MessageType::Signal),
+        Box::new(move |msg, conn| {
+            watcher.on_signal(conn, &msg);
+            true
+        }),
+    );
 
     info!("Listening for Bluetooth connections via D-Bus...");
     loop {

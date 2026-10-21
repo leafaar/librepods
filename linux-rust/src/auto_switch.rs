@@ -357,10 +357,15 @@ fn finish_connect(
 ) -> Result<(), ConnectError> {
     match &result {
         Ok(()) => info!("[switch] connected {addr} (source: {source})"),
-        Err(e) => {
-            warn!("[switch] could not connect {addr} (source: {source}): {e}");
-            takeovers.clear(&addr.to_string());
+        // BlueZ is already bringing the link up, so there is nothing to warn
+        // about, but this request did not connect and its takeover goes too.
+        Err(ConnectError::InProgress) => {
+            info!("[switch] {addr} is already connecting (source: {source})");
         },
+        Err(e) => warn!("[switch] could not connect {addr} (source: {source}): {e}"),
+    }
+    if result.is_err() {
+        takeovers.clear(&addr.to_string());
     }
     result
 }
@@ -474,6 +479,22 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert!(!takeovers.has(MAC));
+    }
+
+    #[tokio::test]
+    async fn a_connect_already_in_progress_clears_the_takeover_request() {
+        let takeovers = TakeoverRequests::default();
+        takeovers.request(MAC);
+
+        let result = finish_connect(
+            &takeovers,
+            addr(),
+            ConnectSource::Button,
+            Err(ConnectError::InProgress),
+        );
+
+        assert!(matches!(result, Err(ConnectError::InProgress)));
         assert!(!takeovers.has(MAC));
     }
 

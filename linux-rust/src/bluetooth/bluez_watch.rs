@@ -25,11 +25,23 @@ use {
 
 /// The AACP service UUID that AirPods list among their services.
 const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
+const BLUEZ_NAME: &str = "org.bluez";
+const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const DEVICE_IFACE: &str = "org.bluez.Device1";
 const TRANSPORT_IFACE: &str = "org.bluez.MediaTransport1";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 const OBJECT_MANAGER_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The bus subscriptions `BluezWatch::on_signal` needs: every signal BlueZ
+/// sends (PropertiesChanged for devices and transports, and the ObjectManager
+/// signals that announce transports coming and going), and the bus reporting
+/// that org.bluez changed owner, which means bluetoothd stopped or started.
+pub(crate) const MATCH_RULES: [&str; 2] = [
+    "type='signal',sender='org.bluez'",
+    "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',\
+     member='NameOwnerChanged',arg0='org.bluez'",
+];
 
 /// Whether a device's service list has the AirPods' AACP service. BlueZ
 /// reports UUIDs in lowercase, but nothing guarantees it.
@@ -220,7 +232,8 @@ fn mac_of(device_path: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Transport {
     pub(crate) path: String,
-    pub(crate) state: TransportState,
+    /// None until a signal carried the state.
+    pub(crate) state: Option<TransportState>,
     pub(crate) codec: Option<Codec>,
     /// When `state` was entered, or when this process first saw it.
     pub(crate) since: Instant,
@@ -252,7 +265,7 @@ impl TransportStates {
     fn update(&self, mac: &str, path: &str, props: &TransportProps, now: Instant) {
         let fresh = || Transport {
             path: path.to_string(),
-            state: TransportState::Idle,
+            state: None,
             codec: None,
             since: now,
         };
@@ -261,10 +274,8 @@ impl TransportStates {
         if entry.path != path {
             *entry = fresh();
         }
-        if let Some(state) = &props.state
-            && *state != entry.state
-        {
-            entry.state = state.clone();
+        if props.state.is_some() && props.state != entry.state {
+            entry.state.clone_from(&props.state);
             entry.since = now;
         }
         if props.codec.is_some() {
@@ -281,6 +292,10 @@ impl TransportStates {
 
     fn remove_device(&self, mac: &str) {
         self.lock().remove(mac);
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
     }
 }
 
@@ -373,8 +388,25 @@ impl BluezWatch {
                     self.transport_removed(&object);
                 }
             },
+            (DBUS_IFACE, "NameOwnerChanged") => {
+                if let Ok((name, _, new_owner)) = msg.read3::<&str, &str, &str>()
+                    && name == BLUEZ_NAME
+                {
+                    self.bluez_restarted(new_owner.is_empty());
+                }
+            },
             _ => {},
         }
+    }
+
+    /// bluetoothd stopped or started. Every object it reported is gone, and
+    /// the next one reports the same paths afresh, so whether a path is
+    /// AirPods is asked again and transports come back with its signals.
+    fn bluez_restarted(&mut self, stopped: bool) {
+        let what = if stopped { "stopped" } else { "started" };
+        info!("[bluez] bluetoothd {what}, forgetting its devices and transports");
+        self.airpods.clear();
+        self.transports.clear();
     }
 
     fn properties_changed(
@@ -390,6 +422,12 @@ impl BluezWatch {
                 let props = DeviceProps::parse(changed);
                 if props.is_empty() {
                     return;
+                }
+                // A device paired for the first time lists its services only
+                // once they are resolved, so a "not AirPods" answer from
+                // before is asked again.
+                if props.services_resolved == Some(true) && self.airpods.get(path) == Some(&false) {
+                    self.airpods.remove(path);
                 }
                 let airpods = self.is_airpods(path, is_airpods);
                 if airpods {
@@ -603,7 +641,7 @@ mod tests {
             transports.get(MAC),
             Some(Transport {
                 path: TRANSPORT.to_string(),
-                state: TransportState::Active,
+                state: Some(TransportState::Active),
                 codec: Some(Codec(0x02)),
                 since: t1,
             })
@@ -709,6 +747,101 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_state_stays_unknown_until_a_signal_carries_it() {
+        let transports = TransportStates::default();
+        let mut watch = BluezWatch::new(transports.clone());
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(2);
+
+        let codec = props(vec![("Codec", Box::new(0x02_u8))]);
+        watch.on_signal(&interfaces_added(TRANSPORT, codec), t0, |_| Some(true));
+        assert_eq!(transports.get(MAC).map(|t| t.state), Some(None));
+
+        watch.on_signal(
+            &properties_changed(TRANSPORT, TRANSPORT_IFACE, state("pending")),
+            t1,
+            |_| None,
+        );
+        let transport = transports.get(MAC).unwrap();
+        assert_eq!(transport.state, Some(TransportState::Pending));
+        assert_eq!(transport.since, t1);
+    }
+
+    #[test]
+    fn a_device_is_asked_about_again_once_its_services_are_resolved() {
+        let transports = TransportStates::default();
+        let mut watch = BluezWatch::new(transports.clone());
+        let mut lookups = 0;
+        // A first pairing: the device connects before its services are known.
+        watch.on_signal(
+            &properties_changed(
+                DEVICE,
+                DEVICE_IFACE,
+                props(vec![("Connected", Box::new(true))]),
+            ),
+            Instant::now(),
+            |_| {
+                lookups += 1;
+                Some(false)
+            },
+        );
+        watch.on_signal(
+            &properties_changed(
+                DEVICE,
+                DEVICE_IFACE,
+                props(vec![("ServicesResolved", Box::new(true))]),
+            ),
+            Instant::now(),
+            |_| {
+                lookups += 1;
+                Some(true)
+            },
+        );
+        watch.on_signal(
+            &interfaces_added(TRANSPORT, state("idle")),
+            Instant::now(),
+            |_| panic!("the device is known as AirPods by now"),
+        );
+
+        assert_eq!(lookups, 2);
+        assert_eq!(
+            transports.get(MAC).and_then(|t| t.state),
+            Some(TransportState::Idle)
+        );
+    }
+
+    #[test]
+    fn a_bluetoothd_restart_forgets_devices_and_transports() {
+        let name_owner_changed = |name: &str, old: &str, new: &str| {
+            Message::new_signal("/org/freedesktop/DBus", DBUS_IFACE, "NameOwnerChanged")
+                .unwrap()
+                .append3(name, old, new)
+        };
+        let transports = TransportStates::default();
+        let mut watch = BluezWatch::new(transports.clone());
+        watch.on_signal(
+            &interfaces_added(TRANSPORT, state("active")),
+            Instant::now(),
+            |_| Some(true),
+        );
+
+        watch.on_signal(
+            &name_owner_changed("org.freedesktop.Notifications", ":1.7", ""),
+            Instant::now(),
+            |_| None,
+        );
+        assert!(transports.get(MAC).is_some());
+
+        watch.on_signal(
+            &name_owner_changed(BLUEZ_NAME, ":1.5", ""),
+            Instant::now(),
+            |_| None,
+        );
+        assert_eq!(transports.get(MAC), None);
+        assert!(watch.airpods.is_empty());
+    }
+
+    #[test]
     fn startup_seed_tracks_transports_of_airpods_only() {
         let transports = TransportStates::default();
         let mut watch = BluezWatch::new(transports.clone());
@@ -740,7 +873,7 @@ mod tests {
         watch.seed(&objects, now);
 
         assert_eq!(
-            transports.get(MAC).map(|t| t.state),
+            transports.get(MAC).and_then(|t| t.state),
             Some(TransportState::Active)
         );
         assert_eq!(transports.get("11:22:33:44:55:66"), None);

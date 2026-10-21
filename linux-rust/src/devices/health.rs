@@ -1,8 +1,8 @@
 //! A one-line summary of the AirPods' audio every `INTERVAL` while they are
-//! connected, at debug, or at info when something looks wrong. It reads only
-//! what the app already tracks (the BlueZ transport, the AACP state, the
-//! playback listener's last poll, the microphone stream counters), so it costs
-//! no extra calls to the sound server or BlueZ.
+//! connected, at debug, or at info when the problems it finds change. It
+//! reads only what the app already tracks (the BlueZ transport, the AACP
+//! state, the playback listener's last poll, the microphone stream counters),
+//! so it costs no extra calls to the sound server or BlueZ.
 
 use {
     crate::{
@@ -28,7 +28,8 @@ const OUTPUT_GRACE: Duration = Duration::from_secs(5);
 /// The A2DP transport as the summary shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransportView {
-    state: TransportState,
+    /// None until BlueZ reported a state for this transport.
+    state: Option<TransportState>,
     codec: Option<Codec>,
     /// How long the transport has been in `state`.
     age: Duration,
@@ -90,6 +91,58 @@ impl fmt::Display for Problem {
     }
 }
 
+impl Problem {
+    fn kind(&self) -> ProblemKind {
+        match self {
+            Self::OutputNotStreaming { why, .. } => ProblemKind::OutputNotStreaming(why),
+            Self::MicSilent => ProblemKind::MicSilent,
+            Self::SdusDropped(_) => ProblemKind::SdusDropped,
+        }
+    }
+}
+
+/// A problem without the numbers that move every summary (how long, how
+/// many), so a problem that persists is the same kind from one summary to the
+/// next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProblemKind {
+    OutputNotStreaming(&'static str),
+    MicSilent,
+    SdusDropped,
+}
+
+/// How the problems of one summary compare with the previous summary's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Same,
+    /// Problems appeared, went or were replaced by others, and some remain.
+    Changed,
+    /// The previous summary had problems and this one has none.
+    Cleared,
+}
+
+/// Remembers the problem kinds of the last summary, so a problem is logged at
+/// info when it appears or clears and not again every INTERVAL while it lasts.
+#[derive(Debug, Default)]
+struct ProblemLog {
+    last: Vec<ProblemKind>,
+}
+
+impl ProblemLog {
+    fn update(&mut self, problems: &[Problem]) -> Change {
+        let kinds: Vec<ProblemKind> = problems.iter().map(Problem::kind).collect();
+        if kinds == self.last {
+            return Change::Same;
+        }
+        self.last = kinds;
+        if self.last.is_empty() {
+            Change::Cleared
+        } else {
+            Change::Changed
+        }
+    }
+}
+
 impl Health {
     fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
@@ -104,11 +157,24 @@ impl Health {
         };
         if let Some(why) = output_needed {
             match &self.transport {
-                Some(t) if t.state.is_active() || t.age < OUTPUT_GRACE => {},
-                transport => problems.push(Problem::OutputNotStreaming {
+                None => problems.push(Problem::OutputNotStreaming {
                     why,
-                    transport: transport.as_ref().map(|t| (t.state.clone(), t.age)),
+                    transport: None,
                 }),
+                Some(TransportView {
+                    state: Some(state),
+                    age,
+                    ..
+                }) if !state.is_active() && *age >= OUTPUT_GRACE => {
+                    problems.push(Problem::OutputNotStreaming {
+                        why,
+                        transport: Some((state.clone(), *age)),
+                    });
+                },
+                // Streaming, still within the grace, or a state BlueZ never
+                // reported: an unknown state may well be streaming, so only
+                // a known one is held against the transport.
+                Some(_) => {},
             }
         }
         if self.mic_capture.is_some() && self.sdus.received == 0 {
@@ -126,7 +192,10 @@ impl fmt::Display for Health {
         let yes_no = |b: bool| if b { "yes" } else { "no" };
         match &self.transport {
             Some(t) => {
-                write!(f, "transport={}", t.state)?;
+                match &t.state {
+                    Some(state) => write!(f, "transport={state}")?,
+                    None => f.write_str("transport=unknown")?,
+                }
                 if let Some(codec) = t.codec {
                     write!(f, " {codec}")?;
                 }
@@ -168,17 +237,20 @@ pub(crate) async fn run(
     transports: TransportStates,
 ) {
     let mut last = aacp.sdu_counts();
+    let mut log = ProblemLog::default();
     loop {
         tokio::time::sleep(INTERVAL).await;
         let counts = aacp.sdu_counts();
         let health = read(&mac, &aacp, &media, &transports, counts.since(last)).await;
         last = counts;
         let problems = health.problems();
-        if problems.is_empty() {
-            debug!("[health] {mac}: {health}");
-        } else {
-            let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
-            info!("[health] {mac}: {health}; {}", problems.join("; "));
+        let change = log.update(&problems);
+        let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        match change {
+            Change::Cleared => info!("[health] {mac}: {health}; ok again"),
+            Change::Changed => info!("[health] {mac}: {health}; {}", problems.join("; ")),
+            Change::Same if problems.is_empty() => debug!("[health] {mac}: {health}"),
+            Change::Same => debug!("[health] {mac}: {health}; {}", problems.join("; ")),
         }
     }
 }
@@ -224,7 +296,7 @@ mod tests {
 
     fn transport(state: TransportState, secs: u64) -> TransportView {
         TransportView {
-            state,
+            state: Some(state),
             codec: Some(Codec(0x02)),
             age: Duration::from_secs(secs),
         }
@@ -357,6 +429,51 @@ mod tests {
                 "7 microphone SDUs dropped",
             ]
         );
+    }
+
+    #[test]
+    fn a_transport_with_an_unknown_state_is_not_reported() {
+        let unknown = Health {
+            transport: Some(TransportView {
+                state: None,
+                codec: None,
+                age: Duration::from_secs(30),
+            }),
+            ..healthy()
+        };
+        assert_eq!(unknown.problems(), []);
+        assert!(
+            unknown
+                .to_string()
+                .starts_with("transport=unknown for 30s owns=yes")
+        );
+    }
+
+    #[test]
+    fn problems_are_logged_when_they_change_not_while_they_last() {
+        let idle = |secs| {
+            Health {
+                transport: Some(transport(TransportState::Idle, secs)),
+                ..healthy()
+            }
+            .problems()
+        };
+        let with_drops = |n| {
+            let mut problems = idle(30);
+            problems.push(Problem::SdusDropped(n));
+            problems
+        };
+        let mut log = ProblemLog::default();
+
+        assert_eq!(log.update(&[]), Change::Same);
+        assert_eq!(log.update(&idle(10)), Change::Changed);
+        // The transport stays idle; only its age moved.
+        assert_eq!(log.update(&idle(20)), Change::Same);
+        assert_eq!(log.update(&with_drops(3)), Change::Changed);
+        assert_eq!(log.update(&with_drops(9)), Change::Same);
+        assert_eq!(log.update(&idle(40)), Change::Changed);
+        assert_eq!(log.update(&[]), Change::Cleared);
+        assert_eq!(log.update(&[]), Change::Same);
     }
 
     #[test]
