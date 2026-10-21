@@ -2,14 +2,17 @@ mod audio;
 mod auto_switch;
 mod bluetooth;
 mod devices;
+#[cfg(test)]
+mod log_capture;
 mod media_controller;
 mod ui;
 mod utils;
 
 use {
     crate::{
-        auto_switch::AutoSwitchDeps,
+        auto_switch::{AutoSwitchDeps, ConnectSource},
         bluetooth::{
+            bluez_watch::{self, BluezWatch, TransportStates},
             discovery::{find_connected_airpods, find_other_managed_devices},
             le::start_le_monitor,
             managers::DeviceManagers,
@@ -29,15 +32,16 @@ use {
         Message,
         arg::{RefArg, Variant},
         blocking::{Connection, stdintf::org_freedesktop_dbus::Properties},
-        message::MatchRule,
+        message::{MatchRule, MessageType},
     },
     gtk::glib,
     ksni::{Handle, TrayMethods},
     std::{
         collections::{HashMap, HashSet},
         env,
+        io::IsTerminal,
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::sync::{
         RwLock,
@@ -45,8 +49,6 @@ use {
     },
     tracing::{debug, error, info, warn},
 };
-
-const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
 type Managers = Arc<RwLock<HashMap<String, DeviceManagers>>>;
 
@@ -189,11 +191,13 @@ async fn async_main(
 
     info!("Listening for new connections.");
     info!("Checking for connected devices...");
+    let transports = TransportStates::default();
     let airpods_setup = AirPodsSetup {
         adapter: adapter.clone(),
         tray_handle: tray_handle.clone(),
         ui_tx: ui_tx.clone(),
         device_managers: device_managers.clone(),
+        transports: transports.clone(),
         in_progress: Arc::default(),
     };
     set_up_connected_airpods(&adapter, &airpods_setup).await;
@@ -213,6 +217,7 @@ async fn async_main(
         devices_list,
         device_managers,
         airpods_setup,
+        bluez: BluezWatch::new(transports),
     };
     let result = watch_connections(watcher);
     drop(shutdown_tx);
@@ -298,6 +303,7 @@ struct AirPodsSetup {
     tray_handle: Option<Handle<MyTray>>,
     ui_tx: UnboundedSender<BluetoothUIMessage>,
     device_managers: Managers,
+    transports: TransportStates,
     /// AirPods with a setup running, so a second connect signal during the
     /// retries does not start another one.
     in_progress: Arc<Mutex<HashSet<Address>>>,
@@ -334,24 +340,40 @@ impl AirPodsSetup {
     }
 
     async fn connect(&self, addr: Address) -> Option<AirPodsDevice> {
-        let mut first_failure = true;
+        let mut attempt: u32 = 1;
         loop {
-            match AirPodsDevice::new(addr, self.tray_handle.clone(), self.ui_tx.clone()).await {
-                Ok(device) => return Some(device),
-                Err(e) if first_failure => {
-                    warn!(
-                        "Could not set up AirPods {addr}: {e}. They may be in use by another \
-                         device; retrying while they stay connected"
+            let device = AirPodsDevice::new(
+                addr,
+                self.tray_handle.clone(),
+                self.ui_tx.clone(),
+                self.transports.clone(),
+            )
+            .await;
+            match device {
+                Ok(device) if attempt > 1 => {
+                    info!(
+                        "AirPods {addr} set up on attempt {attempt} (source: {})",
+                        ConnectSource::SetupRetry
                     );
-                    first_failure = false;
+                    return Some(device);
                 },
-                Err(e) => debug!("Could not set up AirPods {addr}: {e}"),
+                Ok(device) => return Some(device),
+                Err(e) if attempt == 1 => warn!(
+                    "Could not set up AirPods {addr}: {e}. They may be in use by another \
+                     device; retrying while they stay connected"
+                ),
+                Err(e) => debug!("Could not set up AirPods {addr} on attempt {attempt}: {e}"),
             }
             tokio::time::sleep(SETUP_RETRY_INTERVAL).await;
             if !self.is_connected(addr).await {
                 info!("AirPods {addr} disconnected, stopping setup");
                 return None;
             }
+            attempt = attempt.saturating_add(1);
+            debug!(
+                "Retrying AirPods {addr} setup, attempt {attempt} (source: {})",
+                ConnectSource::SetupRetry
+            );
         }
     }
 
@@ -435,14 +457,20 @@ struct ConnectionWatcher {
     devices_list: HashMap<String, DeviceData>,
     device_managers: Managers,
     airpods_setup: AirPodsSetup,
+    bluez: BluezWatch,
 }
 
-/// Process BlueZ PropertiesChanged signals until the system bus fails.
-fn watch_connections(watcher: ConnectionWatcher) -> anyhow::Result<()> {
+/// Process BlueZ signals until the system bus fails.
+fn watch_connections(mut watcher: ConnectionWatcher) -> anyhow::Result<()> {
     let conn = Connection::new_system().context("cannot connect to the D-Bus system bus")?;
-    let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
+    watcher.bluez.seed_from_bus(&conn, Instant::now());
+    // Every signal BlueZ sends: PropertiesChanged for devices and transports,
+    // and the ObjectManager signals that announce transports coming and going.
+    let rule = MatchRule::new()
+        .with_type(MessageType::Signal)
+        .with_sender("org.bluez");
     conn.add_match(rule, move |(): (), conn, msg| {
-        watcher.on_properties_changed(conn, msg);
+        watcher.on_signal(conn, msg);
         true
     })
     .context("cannot watch BlueZ device changes")?;
@@ -455,6 +483,15 @@ fn watch_connections(watcher: ConnectionWatcher) -> anyhow::Result<()> {
 }
 
 impl ConnectionWatcher {
+    fn on_signal(&mut self, conn: &Connection, msg: &Message) {
+        self.bluez.on_signal(msg, Instant::now(), |device_path| {
+            bluez_watch::has_airpods_uuid(conn, device_path)
+        });
+        if msg.member().as_deref() == Some("PropertiesChanged") {
+            self.on_properties_changed(conn, msg);
+        }
+    }
+
     fn on_properties_changed(&self, conn: &Connection, msg: &Message) {
         let Some(path) = msg.path() else {
             return;
@@ -477,8 +514,7 @@ impl ConnectionWatcher {
         let Ok(uuids) = proxy.get::<Vec<String>>("org.bluez.Device1", "UUIDs") else {
             return;
         };
-        // BlueZ reports UUIDs in lowercase, but nothing guarantees it.
-        let is_airpods = uuids.iter().any(|u| u.eq_ignore_ascii_case(AIRPODS_UUID));
+        let is_airpods = bluez_watch::airpods_uuid_in(&uuids);
 
         let Ok(addr_str) = proxy.get::<String>("org.bluez.Device1", "Address") else {
             return;
@@ -618,13 +654,60 @@ fn spawn_shutdown_handler(device_managers: Managers, mut shutdown_rx: UnboundedR
     });
 }
 
-/// Log to stderr through tracing. RUST_LOG overrides the defaults; libraries that
-/// use the `log` crate (bluer) are bridged into the same subscriber.
+/// Log to stderr through tracing; libraries that use the `log` crate (bluer)
+/// are bridged into the same subscriber. Colours only on a terminal: under
+/// systemd stderr goes to the journal, where escape codes are noise.
 fn init_tracing(debug: bool, le_debug: bool) {
+    let rust_log = env::var("RUST_LOG").ok();
+    let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(log_filter(
+        debug,
+        le_debug,
+        rust_log.as_deref(),
+    ));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+}
+
+/// The log filter directives: the defaults from the flags, then RUST_LOG.
+/// RUST_LOG adds to the defaults instead of replacing them, and a directive
+/// for the same target replaces the default one, so `RUST_LOG=librepods=debug`
+/// turns on the app's debug lines and leaves the rest of the defaults alone.
+fn log_filter(debug: bool, le_debug: bool, rust_log: Option<&str>) -> String {
     let level = if debug { "debug" } else { "info" };
     let le_level = if le_debug { "debug" } else { "info" };
-    let default_filter = format!("{level},zbus=warn,librepods::bluetooth::le={le_level}");
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let defaults = format!("{level},zbus=warn,librepods::bluetooth::le={le_level}");
+    match rust_log.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(rust_log) => format!("{defaults},{rust_log}"),
+        None => defaults,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::log_filter, tracing_subscriber::EnvFilter};
+
+    #[test]
+    fn log_filter_defaults_follow_the_flags() {
+        assert_eq!(
+            log_filter(false, false, None),
+            "info,zbus=warn,librepods::bluetooth::le=info"
+        );
+        assert_eq!(
+            log_filter(true, true, Some("  ")),
+            "debug,zbus=warn,librepods::bluetooth::le=debug"
+        );
+    }
+
+    #[test]
+    fn rust_log_is_added_after_the_defaults() {
+        let filter = log_filter(false, false, Some("librepods=debug"));
+        assert_eq!(
+            filter,
+            "info,zbus=warn,librepods::bluetooth::le=info,librepods=debug"
+        );
+        assert!(EnvFilter::builder().parse(&filter).is_ok());
+    }
 }

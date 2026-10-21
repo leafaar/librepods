@@ -1,5 +1,6 @@
 use {
     crate::{
+        auto_switch::ConnectSource,
         bluetooth::aacp::{AACPEvent, BatteryComponent, BatteryInfo, BatteryStatus},
         devices::enums::{DeviceData, DeviceInformation, DeviceType},
         ui::{messages::BluetoothUIMessage, tray::MyTray},
@@ -152,8 +153,8 @@ async fn connect_airpods(attempts: &ConnectAttempts, airpods_mac: &str) {
         return;
     };
     info!(
-        "AirPods are disconnected, attempting to connect to {}",
-        airpods_mac
+        "AirPods are disconnected, attempting to connect to {airpods_mac} (source: {})",
+        ConnectSource::LeAutoConnect
     );
     // bluer's Device::connect does not bring the AirPods up here, bluetoothctl does.
     let output = tokio::process::Command::new("bluetoothctl")

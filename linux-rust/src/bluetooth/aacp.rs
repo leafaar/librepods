@@ -16,10 +16,10 @@ use {
     serde_json,
     std::{
         collections::HashMap,
-        io,
+        fmt, io,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::Duration,
     },
@@ -355,6 +355,12 @@ pub struct AudioSource {
     pub r#type: AudioSourceType,
 }
 
+impl fmt::Display for AudioSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({:?})", self.mac, self.r#type)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatteryInfo {
     pub component: BatteryComponent,
@@ -368,6 +374,42 @@ pub struct ConnectedDevice {
     pub info1: u8,
     pub info2: u8,
     pub r#type: Option<String>,
+}
+
+/// The devices as one log field: `MAC (info1/info2), ...`, or `none`.
+fn devices_text(devices: &[ConnectedDevice]) -> String {
+    if devices.is_empty() {
+        return "none".to_string();
+    }
+    devices
+        .iter()
+        .map(|d| format!("{} ({}/{})", d.mac, d.info1, d.info2))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Audio SDUs of the 0x58 microphone stream counted by the receive loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SduCounts {
+    pub received: u64,
+    /// Received but not handed to the decoder, because it was behind or gone.
+    pub dropped: u64,
+}
+
+impl SduCounts {
+    /// The SDUs counted after `earlier` was read.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            received: self.received.saturating_sub(earlier.received),
+            dropped: self.dropped.saturating_sub(earlier.dropped),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SduCounters {
+    received: AtomicU64,
+    dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -829,18 +871,38 @@ impl AACPManagerState {
             Incoming::Information(info) => return self.apply_information(*info),
             Incoming::ProximityKeys(keys) => return self.apply_proximity_keys(&keys),
             Incoming::StemPress(press, bud) => self.emit(AACPEvent::StemPress(press, bud)),
+            // The AirPods repeat the audio source, the connected devices and
+            // the ear status on every notification request and whenever
+            // another device connects, so only a change is worth an info line.
             Incoming::AudioSource(audio_source) => {
+                match &self.audio_source {
+                    Some(old) if *old == audio_source => {
+                        debug!("[aacp] audio source unchanged: {audio_source}");
+                    },
+                    Some(old) => info!("[aacp] audio source: {audio_source} (was {old})"),
+                    None => info!("[aacp] audio source: {audio_source}"),
+                }
                 self.audio_source = Some(audio_source);
-                info!("Received Audio Source: {:?}", self.audio_source);
             },
             Incoming::ConnectedDevices(devices) => {
+                if devices == self.connected_devices {
+                    debug!(
+                        "[aacp] connected devices unchanged: {}",
+                        devices_text(&devices)
+                    );
+                } else {
+                    info!(
+                        "[aacp] connected devices: {} (was {})",
+                        devices_text(&devices),
+                        devices_text(&self.connected_devices)
+                    );
+                }
                 self.old_connected_devices =
                     std::mem::replace(&mut self.connected_devices, devices.clone());
                 self.emit(AACPEvent::ConnectedDevices(
                     self.old_connected_devices.clone(),
                     devices,
                 ));
-                info!("Received Connected Devices: {:?}", self.connected_devices);
             },
             Incoming::OwnershipToFalse => self.emit(AACPEvent::OwnershipToFalseRequest),
             Incoming::CustomEq(custom_eq) => {
@@ -888,10 +950,17 @@ impl AACPManagerState {
                 statuses,
             ));
         }
-        info!(
-            "Received Ear Detection Status: {:?}",
-            self.ear_detection_status
-        );
+        if self.ear_detection_status == self.old_ear_detection_status {
+            debug!(
+                "[aacp] ear detection unchanged: {:?}",
+                self.ear_detection_status
+            );
+        } else {
+            info!(
+                "[aacp] ear detection: {:?} (was {:?})",
+                self.ear_detection_status, self.old_ear_detection_status
+            );
+        }
     }
 
     /// Store the information in the record of the connected AirPods, if it
@@ -985,6 +1054,7 @@ pub struct AACPManager {
     /// toggled, instead of waiting out the poll interval.
     hires_wake: Arc<Notify>,
     mic_status: MicStatus,
+    sdus: Arc<SduCounters>,
     /// Handle to the long-lived backend runtime, so the hi-res monitor task
     /// survives even when armed from a throwaway runtime (the UI toggle thread).
     runtime: tokio::runtime::Handle,
@@ -1010,6 +1080,7 @@ impl AACPManager {
             hires_mic: Arc::new(Mutex::new(None)),
             hires_wake: Arc::new(Notify::new()),
             mic_status: MicStatus::new(),
+            sdus: Arc::default(),
             runtime: tokio::runtime::Handle::current(),
         }
     }
@@ -1065,6 +1136,14 @@ impl AACPManager {
 
     pub fn mic_app(&self) -> Option<String> {
         self.mic_status.app()
+    }
+
+    /// Microphone stream SDUs counted since this manager was created.
+    pub fn sdu_counts(&self) -> SduCounts {
+        SduCounts {
+            received: self.sdus.received.load(Ordering::Relaxed),
+            dropped: self.sdus.dropped.load(Ordering::Relaxed),
+        }
     }
 
     /// Spawn a task that lives as long as this connection.
@@ -1203,6 +1282,22 @@ impl AACPManager {
         self.send_packet(&packet).await
     }
 
+    /// Send a packet that moves the audio or the microphone, logged by name,
+    /// so a takeover or a microphone start can be followed in the log. The
+    /// caller logs a failure, with what it was trying to do.
+    async fn send_named(&self, what: &str, packet: &[u8]) -> Result<(), AacpError> {
+        debug!("[aacp] {what}: {}", hex::encode(packet));
+        self.send_packet(packet).await?;
+        info!("[aacp] sent {what}");
+        Ok(())
+    }
+
+    /// `send_named` for a packet without the header.
+    async fn send_named_data(&self, what: &str, data: &[u8]) -> Result<(), AacpError> {
+        let packet = [HEADER_BYTES.as_slice(), data].concat();
+        self.send_named(what, &packet).await
+    }
+
     pub async fn set_event_channel(&self, tx: mpsc::UnboundedSender<AACPEvent>) {
         let mut state = self.state.lock().await;
         state.event_tx = Some(tx);
@@ -1270,12 +1365,14 @@ impl AACPManager {
 
     /// Start the proprietary hi-res microphone stream (0x58 START).
     pub async fn send_start_audio(&self) -> Result<(), AacpError> {
-        self.send_packet(&AACP_START_AUDIO).await
+        self.send_named("microphone stream START (0x58)", &AACP_START_AUDIO)
+            .await
     }
 
     /// Stop the proprietary hi-res microphone stream (0x58 STOP).
     pub async fn send_stop_audio(&self) -> Result<(), AacpError> {
-        self.send_packet(&AACP_STOP_AUDIO).await
+        self.send_named("microphone stream STOP (0x58)", &AACP_STOP_AUDIO)
+            .await
     }
 
     pub async fn send_custom_eq(&self, custom_eq: &CustomEq) -> Result<(), AacpError> {
@@ -1326,7 +1423,8 @@ impl AACPManager {
     ) -> Result<(), AacpError> {
         let mut packet = vec![opcodes::CONTROL_COMMAND, 0x00, identifier as u8];
         packet.extend((0..4).map(|i| value.get(i).copied().unwrap_or(0)));
-        self.send_data_packet(&packet).await
+        let what = format!("control command {identifier:?} = {}", hex::encode(value));
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_media_information_new_device(
@@ -1361,7 +1459,8 @@ impl AACPManager {
         buffer.extend_from_slice(&[0x30, 0x64]);
 
         let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        let what = format!("new device media information for {target_mac_address}");
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_hijack_request(&self, target_mac_address: &str) -> Result<(), AacpError> {
@@ -1391,7 +1490,8 @@ impl AACPManager {
         }
 
         let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        let what = format!("hijack request to {target_mac_address}");
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_media_information(
@@ -1402,7 +1502,9 @@ impl AACPManager {
     ) -> Result<(), AacpError> {
         let packet =
             media_information_payload(self_mac_address, target_mac_address, streaming_state)?;
-        self.send_data_packet(&packet).await
+        let what =
+            format!("media information to {target_mac_address} (streaming: {streaming_state})");
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_smart_routing_show_ui(
@@ -1437,7 +1539,8 @@ impl AACPManager {
         }
 
         let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        let what = format!("smart routing show UI to {target_mac_address}");
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_add_tipi_device(
@@ -1467,7 +1570,8 @@ impl AACPManager {
         buffer.push(0x0E);
 
         let packet = [opcode.as_slice(), buffer.as_slice()].concat();
-        self.send_data_packet(&packet).await
+        let what = format!("add Tipi device {target_mac_address}");
+        self.send_named_data(&what, &packet).await
     }
 
     pub async fn send_some_packet(&self) -> Result<(), AacpError> {
@@ -1478,11 +1582,13 @@ impl AACPManager {
 
 async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     let mut buf = vec![0u8; RECV_BUF_LEN];
+    let addr = manager.state.lock().await.airpods_mac;
+    let addr = addr.map_or_else(|| "?".to_string(), |a| a.to_string());
     manager.arm_hires_mic().await;
     loop {
         match sp.recv(&mut buf).await {
             Ok(0) => {
-                info!("Remote closed the connection.");
+                info!("[aacp] {addr} closed the AACP channel");
                 break;
             },
             Ok(n) => {
@@ -1492,9 +1598,12 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 if crate::bluetooth::aacp_audio::is_audio(data) {
                     // Device-level liveness for the hi-res stall watchdog.
                     manager.mic_status.mark_sdu();
+                    manager.sdus.received.fetch_add(1, Ordering::Relaxed);
                     let audio_tx = manager.state.lock().await.audio_tx.clone();
-                    if let Some(tx) = audio_tx {
-                        let _ = tx.try_send(data.to_vec());
+                    if let Some(tx) = audio_tx
+                        && tx.try_send(data.to_vec()).is_err()
+                    {
+                        manager.sdus.dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -1503,7 +1612,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 manager.receive_packet(data).await;
             },
             Err(e) => {
-                info!("Read error, the AirPods probably disconnected: {e}");
+                info!("[aacp] reading from {addr} failed, the AirPods probably disconnected: {e}");
                 break;
             },
         }
@@ -1665,7 +1774,9 @@ mod tests {
             testing::{MemoryStore, connected_manager},
             *,
         },
+        crate::log_capture::LogCapture,
         proptest::prelude::*,
+        tracing::Level,
     };
 
     #[test]
@@ -2349,6 +2460,119 @@ mod tests {
         .await;
 
         h.assert_no_event();
+    }
+
+    // What reaches the log at the default level
+
+    const MEDIA_SOURCE: [u8; 9] = [0x0E, 0x00, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x02];
+    const CALL_SOURCE: [u8; 9] = [0x0E, 0x00, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x01];
+    const ONE_DEVICE: [u8; 13] = [
+        0x2E, 0x00, 0x01, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x02,
+    ];
+
+    #[tokio::test]
+    async fn a_repeated_audio_source_is_logged_once() {
+        let (log, _guard) = LogCapture::start(Level::INFO);
+        let h = Harness::new().await;
+
+        h.receive(&MEDIA_SOURCE).await;
+        h.receive(&MEDIA_SOURCE).await;
+        h.receive(&CALL_SOURCE).await;
+        h.receive(&CALL_SOURCE).await;
+
+        let lines = log.lines_with("audio source");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].ends_with("[aacp] audio source: 11:22:33:44:55:66 (Media)"));
+        assert!(lines[1].ends_with(
+            "[aacp] audio source: 11:22:33:44:55:66 (Call) (was 11:22:33:44:55:66 (Media))"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_audio_source_still_shows_at_debug() {
+        let (log, _guard) = LogCapture::start(Level::DEBUG);
+        let h = Harness::new().await;
+
+        h.receive(&MEDIA_SOURCE).await;
+        h.receive(&MEDIA_SOURCE).await;
+
+        assert_eq!(log.lines_with("audio source unchanged").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_connected_devices_are_logged_once_but_still_emitted() {
+        let (log, _guard) = LogCapture::start(Level::INFO);
+        let mut h = Harness::new().await;
+
+        h.receive(&ONE_DEVICE).await;
+        h.receive(&ONE_DEVICE).await;
+        h.receive(&[0x2E, 0x00, 0x00, 0x00, 0x00]).await;
+
+        let lines = log.lines_with("connected devices");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].ends_with("[aacp] connected devices: 11:22:33:44:55:66 (1/2) (was none)"));
+        assert!(lines[1].ends_with("[aacp] connected devices: none (was 11:22:33:44:55:66 (1/2))"));
+        for _ in 0..3 {
+            assert!(matches!(h.next_event(), AACPEvent::ConnectedDevices(..)));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_ear_detection_is_logged_once() {
+        let (log, _guard) = LogCapture::start(Level::INFO);
+        let h = Harness::new().await;
+
+        h.receive(&[0x06, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x06, 0x00, 0x00, 0x00]).await;
+        h.receive(&[0x06, 0x00, 0x00, 0x01]).await;
+
+        let lines = log.lines_with("ear detection");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].ends_with("[aacp] ear detection: [InEar, InEar] (was [])"));
+        assert!(lines[1].ends_with("[aacp] ear detection: [InEar, OutOfEar] (was [InEar, InEar])"));
+    }
+
+    #[tokio::test]
+    async fn routing_and_microphone_packets_are_logged_by_name_with_hex_at_debug() {
+        let (log, _guard) = LogCapture::start(Level::DEBUG);
+        let mut h = Harness::new().await;
+
+        h.manager.send_hijack_request(AIRPODS_MAC).await.unwrap();
+        h.manager.send_start_audio().await.unwrap();
+        h.manager
+            .send_control_command(ControlCommandIdentifiers::OwnsConnection, &[0x01])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            log.lines_with("INFO")
+                .iter()
+                .filter_map(|l| l.split_once("[aacp] ").map(|(_, msg)| msg.to_string()))
+                .collect::<Vec<_>>(),
+            [
+                "sent hijack request to AA:BB:CC:DD:EE:FF",
+                "sent microphone stream START (0x58)",
+                "sent control command OwnsConnection = 01",
+            ]
+        );
+        let start = log.lines_with("DEBUG");
+        assert!(
+            start
+                .iter()
+                .any(|l| l.ends_with(&hex::encode(AACP_START_AUDIO))),
+            "{start:#?}"
+        );
+        let _ = (h.next_sent(), h.next_sent(), h.next_sent());
+    }
+
+    #[tokio::test]
+    async fn a_packet_that_was_not_sent_is_not_logged_as_sent() {
+        let (log, _guard) = LogCapture::start(Level::INFO);
+        let manager = AACPManager::with_deps(Arc::new(MemoryStore::default()), false);
+
+        assert!(manager.send_stop_audio().await.is_err());
+
+        assert!(log.lines_with("sent microphone").is_empty());
     }
 
     // Smart routing response (0x11)

@@ -143,7 +143,31 @@ librepods [OPTIONS]
   ```
 
   Do not run `mpris-proxy` together with WirePlumber.
-- **Logs.** `librepods -d`, or `RUST_LOG=librepods=debug librepods`.
+- **Logs.** `librepods -d`, or `RUST_LOG=librepods=debug librepods`. `RUST_LOG` is added to
+  the default filter, so naming a target only changes that target. At the default level the
+  log already shows the BlueZ audio transport (idle, pending, active) and link, where the
+  AirPods route their audio, and what asked for each connect or restart. Debug adds a short
+  audio health line every 10 seconds and the bytes of each AACP packet.
+
+  When LibrePods runs as a systemd user service, turn on debug logs with a drop-in:
+
+  ```bash
+  systemctl --user edit librepods
+  ```
+
+  ```ini
+  [Service]
+  Environment=RUST_LOG=librepods=debug
+  ```
+
+  Then restart it and follow the log:
+
+  ```bash
+  systemctl --user restart librepods
+  journalctl --user -u librepods -f
+  ```
+
+  `systemctl --user revert librepods` removes the drop-in again.
 
 ## Development
 

@@ -3,6 +3,7 @@
 
 use {
     crate::{
+        auto_switch::ConnectSource,
         bluetooth::{aacp::AACPManager, att::ATTHandles, managers::DeviceManagers},
         devices::enums::DeviceData,
         ui::{
@@ -195,10 +196,10 @@ impl Controller {
     }
 
     /// Reconnect the AirPods off the GTK thread and report how it went.
-    fn restart_audio(&self, mac: String, address: bluer::Address) {
+    fn restart_audio(&self, mac: String, address: bluer::Address, source: ConnectSource) {
         let task = self
             .backend
-            .spawn(crate::auto_switch::restart_airpods(address));
+            .spawn(crate::auto_switch::restart_airpods(address, source));
         let dispatch = self.dispatch.clone();
         glib::MainContext::default().spawn_local(async move {
             let result = match task.await {
@@ -231,10 +232,11 @@ impl Controller {
                 mac,
                 address,
                 attempt,
+                source,
             } => {
                 let task = self
                     .backend
-                    .spawn(crate::auto_switch::connect_airpods(address));
+                    .spawn(crate::auto_switch::connect_airpods(address, source));
                 let dispatch = self.dispatch.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let result = match task.await {
@@ -248,7 +250,11 @@ impl Controller {
                     });
                 });
             },
-            Effect::RestartAudio { mac, address } => self.restart_audio(mac, address),
+            Effect::RestartAudio {
+                mac,
+                address,
+                source,
+            } => self.restart_audio(mac, address, source),
             Effect::SetupTimeout { mac, attempt } => {
                 let dispatch = self.dispatch.clone();
                 glib::MainContext::default().spawn_local(async move {

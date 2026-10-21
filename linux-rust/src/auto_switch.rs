@@ -15,6 +15,7 @@ use {
     bluer::{Adapter, Address},
     std::{
         collections::{HashMap, HashSet},
+        fmt,
         str::FromStr,
         sync::{Arc, LazyLock, Mutex, PoisonError},
         time::Duration,
@@ -40,6 +41,34 @@ const RESTART_SETTLE: Duration = Duration::from_secs(2);
 /// link is then waited for this often, this many times.
 const RESTART_WAIT_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_WAIT_ATTEMPTS: u32 = 20;
+
+/// What started a connect, a restart or a setup attempt, so the log says who
+/// asked for each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectSource {
+    /// A button in the window.
+    Button,
+    /// An item of the tray menu.
+    Tray,
+    /// Media started playing on this PC (`run`).
+    AutoSwitch,
+    /// The AACP setup of a connected device, tried again until it works.
+    SetupRetry,
+    /// The AirPods' BLE advertisement showed them out of the case.
+    LeAutoConnect,
+}
+
+impl fmt::Display for ConnectSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Button => "button",
+            Self::Tray => "tray",
+            Self::AutoSwitch => "auto-switch",
+            Self::SetupRetry => "setup retry",
+            Self::LeAutoConnect => "LE auto-connect",
+        })
+    }
+}
 
 /// Why connecting the AirPods failed. The UI shows the message as is, so it is
 /// a sentence for the user, not a BlueZ code.
@@ -242,7 +271,7 @@ fn known_airpods_in(devices: &DevicesStore) -> Vec<Address> {
 }
 
 /// Connect `addr` to this PC on request (UI button, tray item).
-pub async fn connect_airpods(addr: Address) -> Result<(), ConnectError> {
+pub async fn connect_airpods(addr: Address, source: ConnectSource) -> Result<(), ConnectError> {
     let session = bluer::Session::new()
         .await
         .map_err(ConnectError::BluetoothUnavailable)?;
@@ -250,14 +279,14 @@ pub async fn connect_airpods(addr: Address) -> Result<(), ConnectError> {
         .default_adapter()
         .await
         .map_err(ConnectError::NoAdapter)?;
-    info!("[switch] connect requested for AirPods {}", addr);
-    connect_device(&adapter, addr, &TakeoverRequests::shared()).await
+    info!("[switch] connect requested for AirPods {addr} (source: {source})");
+    connect_device(&adapter, addr, &TakeoverRequests::shared(), source).await
 }
 
 /// Disconnect `addr` and connect it again (UI button, tray item). This resets
 /// an audio transport that BlueZ reports as running but that no longer
 /// carries sound, which only a new connection clears.
-pub async fn restart_airpods(addr: Address) -> Result<(), ConnectError> {
+pub async fn restart_airpods(addr: Address, source: ConnectSource) -> Result<(), ConnectError> {
     let session = bluer::Session::new()
         .await
         .map_err(ConnectError::BluetoothUnavailable)?;
@@ -268,15 +297,19 @@ pub async fn restart_airpods(addr: Address) -> Result<(), ConnectError> {
     let device = adapter
         .device(addr)
         .map_err(|err| ConnectError::UnknownDevice { addr, err })?;
-    info!("[switch] restarting the connection to AirPods {}", addr);
+    info!("[switch] restarting the connection to AirPods {addr} (source: {source})");
     if let Err(e) = device.disconnect().await {
         debug!("[switch] disconnect before restart: {}", e);
     }
     tokio::time::sleep(RESTART_SETTLE).await;
-    match connect_device(&adapter, addr, &TakeoverRequests::shared()).await {
+    match connect_device(&adapter, addr, &TakeoverRequests::shared(), source).await {
         // BlueZ or the AirPods can bring the link back on their own while
         // this connect is on its way.
-        Err(ConnectError::InProgress) => wait_connected(&device).await,
+        Err(ConnectError::InProgress) => {
+            info!("[switch] AirPods {addr} are already reconnecting, waiting for the link");
+            let result = wait_connected(&device).await;
+            finish_connect(&TakeoverRequests::shared(), addr, source, result)
+        },
         result => result,
     }
 }
@@ -295,21 +328,22 @@ async fn connect_device(
     adapter: &Adapter,
     addr: Address,
     takeovers: &TakeoverRequests,
+    source: ConnectSource,
 ) -> Result<(), ConnectError> {
     let device = adapter
         .device(addr)
         .map_err(|err| ConnectError::UnknownDevice { addr, err })?;
     if device.is_connected().await.unwrap_or(false) {
+        info!("[switch] AirPods {addr} are already connected (source: {source})");
         return Ok(());
     }
-    let mac = addr.to_string();
-    takeovers.request(&mac);
+    takeovers.request(&addr.to_string());
     let result = match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(ConnectError::from_connect(e)),
         Err(_) => Err(ConnectError::NotAnswering),
     };
-    finish_connect(takeovers, &mac, result)
+    finish_connect(takeovers, addr, source, result)
 }
 
 /// Log the outcome of a requested connect. A failed one drops the takeover
@@ -317,14 +351,15 @@ async fn connect_device(
 /// take the audio.
 fn finish_connect(
     takeovers: &TakeoverRequests,
-    mac: &str,
+    addr: Address,
+    source: ConnectSource,
     result: Result<(), ConnectError>,
 ) -> Result<(), ConnectError> {
     match &result {
-        Ok(()) => info!("[switch] connected {}", mac),
+        Ok(()) => info!("[switch] connected {addr} (source: {source})"),
         Err(e) => {
-            warn!("[switch] could not connect {}: {}", mac, e);
-            takeovers.clear(mac);
+            warn!("[switch] could not connect {addr} (source: {source}): {e}");
+            takeovers.clear(&addr.to_string());
         },
     }
     result
@@ -342,10 +377,10 @@ async fn connect_if_away(adapter: &Adapter, addr: Address, takeovers: &TakeoverR
     }
 
     info!(
-        "[switch] media started on this PC, connecting AirPods {}",
-        addr
+        "[switch] media started on this PC, connecting AirPods {addr} (source: {})",
+        ConnectSource::AutoSwitch
     );
-    let _ = connect_device(adapter, addr, takeovers).await;
+    let _ = connect_device(adapter, addr, takeovers, ConnectSource::AutoSwitch).await;
     true
 }
 
@@ -354,6 +389,10 @@ mod tests {
     use {super::*, crate::devices::enums::DeviceData, bluer::ErrorKind, tempfile::TempDir};
 
     const MAC: &str = "AA:BB:CC:DD:EE:FF";
+
+    fn addr() -> Address {
+        Address::from_str(MAC).unwrap()
+    }
 
     fn set(names: &[&str]) -> HashSet<String> {
         names.iter().map(ToString::to_string).collect()
@@ -427,7 +466,12 @@ mod tests {
         let takeovers = TakeoverRequests::default();
         takeovers.request(MAC);
 
-        let result = finish_connect(&takeovers, MAC, Err(ConnectError::NotAnswering));
+        let result = finish_connect(
+            &takeovers,
+            addr(),
+            ConnectSource::Button,
+            Err(ConnectError::NotAnswering),
+        );
 
         assert!(result.is_err());
         assert!(!takeovers.has(MAC));
@@ -438,9 +482,33 @@ mod tests {
         let takeovers = TakeoverRequests::default();
         takeovers.request(MAC);
 
-        finish_connect(&takeovers, MAC, Ok(())).unwrap();
+        finish_connect(&takeovers, addr(), ConnectSource::Tray, Ok(())).unwrap();
 
         assert!(takeovers.has(MAC));
+    }
+
+    #[test]
+    fn connect_sources_read_as_their_trigger() {
+        let names: Vec<String> = [
+            ConnectSource::Button,
+            ConnectSource::Tray,
+            ConnectSource::AutoSwitch,
+            ConnectSource::SetupRetry,
+            ConnectSource::LeAutoConnect,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "button",
+                "tray",
+                "auto-switch",
+                "setup retry",
+                "LE auto-connect"
+            ]
+        );
     }
 
     #[test]

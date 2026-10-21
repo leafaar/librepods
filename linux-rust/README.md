@@ -25,6 +25,7 @@ shows that window and exits, before a second backend could compete for the AirPo
 | BLE advertisements (battery, auto-connect) | `bluetooth/le.rs` |
 | Nothing earbuds (ATT) | `bluetooth/att.rs`, `devices/nothing.rs` |
 | Per-connection setup and event routing | `devices/airpods.rs` |
+| BlueZ transport and link log, audio health summary | `bluetooth/bluez_watch.rs`, `devices/health.rs` |
 | A2DP profile, ear detection pause/resume, takeover | `media_controller.rs` |
 | Sound server and media players | `audio/pulse.rs`, `audio/mpris.rs` |
 | Hi-res microphone and its test | `audio/hires_mic.rs`, `audio/eld.rs`, `audio/agc.rs`, `audio/output.rs`, `audio/mic_test.rs` |
@@ -87,6 +88,9 @@ G_DEBUG=fatal-criticals cargo test smoke -- --ignored --test-threads=1   # needs
 ## Conventions
 
 - Errors are `thiserror` types, one per domain; `anyhow` only in `main.rs`.
-- Logging goes through `tracing`; `RUST_LOG` overrides the defaults.
+- Logging goes through `tracing`; `RUST_LOG` directives are added to the defaults, so
+  `RUST_LOG=librepods=debug` only raises the app's own level. Log lines that a failure
+  report needs (BlueZ transport and link changes, AACP routing, connect and restart with
+  their source) are at info; repeats and packet bytes are at debug, nothing per audio frame.
 - Commits are signed and follow `feat|fix|refactor|chore(scope): title`, with one bullet
   per change in the body.

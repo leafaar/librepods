@@ -5,8 +5,10 @@ use {
                 AACPEvent, AACPManager, AirPodsLEKeys, BatteryComponent, BatteryInfo,
                 ConnectedDevice, ControlCommandIdentifiers, ProximityKeyType, StemPressType,
             },
+            bluez_watch::TransportStates,
             l2cap::ConnectError,
         },
+        devices::health,
         media_controller::MediaController,
         ui::{messages::BluetoothUIMessage, tray::MyTray},
         utils::AppSettings,
@@ -338,6 +340,7 @@ impl AirPodsDevice {
         mac_address: Address,
         tray_handle: Option<Handle<MyTray>>,
         ui_tx: UnboundedSender<BluetoothUIMessage>,
+        transports: TransportStates,
     ) -> Result<Self, AirPodsSetupError> {
         info!("Creating new AirPodsDevice for {mac_address}");
         let mut aacp_manager = AACPManager::new();
@@ -396,6 +399,13 @@ impl AirPodsDevice {
         aacp_manager.track_connection_task(listener);
 
         Self::spawn_subscribers(&aacp_manager, &media_controller, tray_handle.clone()).await;
+
+        aacp_manager.spawn_connection_task(health::run(
+            mac_address.to_string(),
+            aacp_manager.clone(),
+            media_controller.clone(),
+            transports,
+        ));
 
         let handler = EventHandler {
             mac_address,

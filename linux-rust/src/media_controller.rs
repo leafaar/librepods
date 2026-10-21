@@ -259,6 +259,12 @@ impl MediaController {
         }
     }
 
+    /// Whether a local player was playing at the playback listener's last
+    /// poll, without asking the players again.
+    pub async fn is_playing(&self) -> bool {
+        self.state.lock().await.is_playing
+    }
+
     async fn any_player_playing(&self) -> bool {
         self.players(|p| p.players())
             .await
@@ -352,7 +358,7 @@ impl MediaController {
             self.deactivate_a2dp_profile().await;
         }
 
-        info!(
+        debug!(
             "Ear Detection - old_in_ear_data: {:?}, new_in_ear_data: {:?}",
             old_in_ear, new_in_ear
         );

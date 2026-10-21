@@ -8,6 +8,7 @@
 
 use {
     crate::{
+        auto_switch::ConnectSource,
         bluetooth::{
             aacp::{AACPEvent, BatteryInfo, ControlCommandIdentifiers, ControlCommandStatus},
             eq::CustomEq,
@@ -111,11 +112,13 @@ pub(crate) enum Effect {
         mac: String,
         address: Address,
         attempt: u64,
+        source: ConnectSource,
     },
     /// Reconnect the AirPods and come back with `Input::RestartAudioFinished`.
     RestartAudio {
         mac: String,
         address: Address,
+        source: ConnectSource,
     },
     /// Come back with `Input::ConnectSetupTimedOut` after CONNECT_SETUP_TIMEOUT.
     SetupTimeout {
@@ -416,8 +419,14 @@ impl Model {
                 self.name_hint = None;
                 Vec::new()
             },
-            Input::Connect(mac) => self.start_connect(mac).into_iter().collect(),
-            Input::RestartAudio(mac) => self.start_restart(mac).into_iter().collect(),
+            Input::Connect(mac) => self
+                .start_connect(mac, ConnectSource::Button)
+                .into_iter()
+                .collect(),
+            Input::RestartAudio(mac) => self
+                .start_restart(mac, ConnectSource::Button)
+                .into_iter()
+                .collect(),
             Input::RestartAudioFinished { mac, result } => self.restart_finished(&mac, result),
             Input::ConnectFinished {
                 mac,
@@ -501,7 +510,7 @@ impl Model {
                     .collect();
                 connected
                     .into_iter()
-                    .filter_map(|mac| self.start_restart(mac))
+                    .filter_map(|mac| self.start_restart(mac, ConnectSource::Tray))
                     .collect()
             },
             BluetoothUIMessage::ConnectAirPods => {
@@ -511,7 +520,7 @@ impl Model {
                     .cloned()
                     .collect();
                 away.into_iter()
-                    .filter_map(|mac| self.start_connect(mac))
+                    .filter_map(|mac| self.start_connect(mac, ConnectSource::Tray))
                     .collect()
             },
             BluetoothUIMessage::DeviceConnected(mac) => {
@@ -606,7 +615,7 @@ impl Model {
         }
     }
 
-    fn start_connect(&mut self, mac: String) -> Option<Effect> {
+    fn start_connect(&mut self, mac: String, source: ConnectSource) -> Option<Effect> {
         if self.connects.in_progress(&mac) {
             return None;
         }
@@ -619,17 +628,22 @@ impl Model {
             mac,
             address,
             attempt,
+            source,
         })
     }
 
-    fn start_restart(&mut self, mac: String) -> Option<Effect> {
+    fn start_restart(&mut self, mac: String, source: ConnectSource) -> Option<Effect> {
         let Ok(address) = mac.parse::<Address>() else {
             error!("Cannot restart, invalid address {}", mac);
             return None;
         };
         self.restarting
             .insert(mac.clone())
-            .then_some(Effect::RestartAudio { mac, address })
+            .then_some(Effect::RestartAudio {
+                mac,
+                address,
+                source,
+            })
     }
 
     fn restart_finished(&mut self, mac: &str, result: Result<(), String>) -> Vec<Effect> {
@@ -1282,7 +1296,14 @@ pub(super) mod tests {
     fn connect_flow_success() {
         let mut model = model();
         let effects = model.update(Input::Connect(PODS.to_string()));
-        let [Effect::Connect { attempt, .. }] = effects.as_slice() else {
+        let [
+            Effect::Connect {
+                attempt,
+                source: ConnectSource::Button,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
             panic!("connect expected, got {effects:?}");
         };
         let attempt = *attempt;
@@ -1367,7 +1388,7 @@ pub(super) mod tests {
         let effects = model.update(Input::RestartAudio(PODS.to_string()));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::RestartAudio { mac, .. }] if mac == PODS
+            [Effect::RestartAudio { mac, source: ConnectSource::Button, .. }] if mac == PODS
         ));
         assert!(model.is_restarting(PODS));
         assert!(
@@ -1399,7 +1420,11 @@ pub(super) mod tests {
         let macs: Vec<&str> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::RestartAudio { mac, .. } => Some(mac.as_str()),
+                Effect::RestartAudio {
+                    mac,
+                    source: ConnectSource::Tray,
+                    ..
+                } => Some(mac.as_str()),
                 _ => None,
             })
             .collect();
@@ -1416,7 +1441,11 @@ pub(super) mod tests {
         let macs: Vec<&str> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Connect { mac, .. } => Some(mac.as_str()),
+                Effect::Connect {
+                    mac,
+                    source: ConnectSource::Tray,
+                    ..
+                } => Some(mac.as_str()),
                 _ => None,
             })
             .collect();
