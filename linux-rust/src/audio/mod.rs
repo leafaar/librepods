@@ -5,3 +5,4 @@ pub mod mic_test;
 pub mod mpris;
 pub mod output;
 pub mod pulse;
+pub mod source_watch;

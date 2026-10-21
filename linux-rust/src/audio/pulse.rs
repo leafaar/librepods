@@ -40,6 +40,10 @@ pub enum SoundServerError {
     OperationTimeout,
     #[error("the sound server request was cancelled or the connection dropped")]
     OperationCancelled,
+    #[error("the connection to the sound server dropped")]
+    ConnectionLost,
+    #[error("the sound server refused to report changes")]
+    SubscribeFailed,
     #[error("no sound card for {0}")]
     CardNotFound(String),
     #[error("no sink for {0}")]

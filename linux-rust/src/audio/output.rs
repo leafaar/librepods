@@ -204,14 +204,8 @@ pub struct SourceConsumers {
     pub present: bool,
 }
 
-pub fn source_consumers(name: &str) -> Result<SourceConsumers, SoundServerError> {
-    let (mut mainloop, context) = connect()?;
-    let result = source_consumers_on(&mut mainloop, &context, name);
-    mainloop.quit(Retval(0));
-    result
-}
-
-fn source_consumers_on(
+/// Who records from the source `name`, asked over an open connection.
+pub(crate) fn source_consumers_on(
     mainloop: &mut Mainloop,
     context: &Context,
     name: &str,

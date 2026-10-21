@@ -6,6 +6,7 @@ use {
         audio::{
             eld::{ELD_CHANNELS, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, EldDecoder},
             output::{self, Output, SourceConsumers, VirtualMic},
+            source_watch::SourceWatch,
         },
         bluetooth::{aacp::AACPManager, aacp_audio},
     },
@@ -21,12 +22,13 @@ use {
         sync::{Notify, mpsc},
         task::JoinHandle as TokioHandle,
     },
-    tracing::{debug, error, info, warn},
+    tracing::{error, info, warn},
 };
 
 /// Delay after sending 0x58 START before resetting the A2DP transport
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
-/// How often the monitor polls the virtual source for activity
+/// How often the monitor re-checks its grace periods and the stall timeout
+/// when no recorder changed in between
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// If no audio SDUs arrive for this long while a capture is active, the stream
 /// is considered stalled and the capture is torn down and restarted.
@@ -130,6 +132,14 @@ impl HiResMic {
                 return None;
             },
         };
+        let recorders = match SourceWatch::start(output::SOURCE_NAME) {
+            Ok(recorders) => recorders,
+            Err(e) => {
+                warn!("could not start watching for hi-res mic recorders: {}", e);
+                vmic.close().await;
+                return None;
+            },
+        };
         let stop = Arc::new(Notify::new());
         let wake = aacp.hires_wake();
         // Spawn on the backend runtime, not the caller's (the UI toggle uses a
@@ -141,6 +151,7 @@ impl HiResMic {
             stop.clone(),
             wake,
             vmic,
+            recorders,
         ));
         Some(HiResMic {
             stop,
@@ -270,23 +281,6 @@ fn capture_failed(retry: &mut CaptureRetry, what: &str) {
     }
 }
 
-/// Ask the sound server who records from the virtual source. A failed check
-/// keeps the last answer: one missed reading must not look like the recorder
-/// leaving.
-async fn refresh_consumers(consumers: &mut SourceConsumers) {
-    if let Some(seen) =
-        tokio::task::spawn_blocking(|| output::source_consumers(output::SOURCE_NAME))
-            .await
-            .ok()
-            .and_then(|seen| {
-                seen.inspect_err(|e| debug!("[hires] could not check for recorders: {}", e))
-                    .ok()
-            })
-    {
-        *consumers = seen;
-    }
-}
-
 async fn monitor_loop(
     aacp: AACPManager,
     addr: String,
@@ -294,11 +288,11 @@ async fn monitor_loop(
     stop: Arc<Notify>,
     wake: Arc<Notify>,
     vmic: VirtualMic,
+    mut recorders: SourceWatch,
 ) {
     let mut capture: Option<Capture> = None;
     let mut retry = CaptureRetry::default();
     let mut gate = CaptureGate::default();
-    let mut consumers = SourceConsumers::default();
     // Conversation detection value saved while we override it off for capture.
     let mut old_convo_state: Option<bool> = None;
     info!(
@@ -310,10 +304,11 @@ async fn monitor_loop(
         tokio::select! {
             () = stop.notified() => break,
             () = wake.notified() => {}
+            () = recorders.changed() => {}
             () = tokio::time::sleep(POLL_INTERVAL) => {}
         }
 
-        refresh_consumers(&mut consumers).await;
+        let consumers = recorders.consumers();
         let now = Instant::now();
         gate.observe(now, &consumers);
         let enabled = aacp.hires_mic_enabled();
@@ -409,7 +404,7 @@ async fn monitor_loop(
         aacp.set_conversation_detection(prev).await;
     }
     status.reset();
-    vmic.close().await;
+    tokio::join!(recorders.close(), vmic.close());
 }
 
 async fn start_capture(aacp: &AACPManager, addr: &str, status: &MicStatus) -> Option<Capture> {
